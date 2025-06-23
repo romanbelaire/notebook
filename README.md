@@ -4,18 +4,12 @@ A local-first workflow for organizing research papers and chatting with their co
 
 ## 1. Architecture Overview
 
-| Layer | What it Does |
-| ----- | ------------- |
-| **PDF Repository** | Put every PDF you care about in `data/papers/`. |
-| **Ingestion Pipeline** (`app/ingest.py`) | • Extracts text from PDFs (PyPDF2).  
-• Splits text into overlapping chunks (RecursiveCharacterTextSplitter).  
-• Embeds each chunk (Sentence-Transformers `all-MiniLM-L6-v2`).  
-• Builds a FAISS vector index + `docs.pkl` with text + metadata. |
-| **RAG Layer** (`app/rag_chat.py`) | • Loads the FAISS index and calls a Hugging Face Inference API model.  
-• Retrieves top-k chunks for each query, builds a prompt, and streams a response. |
-| **Streamlit UI** (`app/app.py`) | • Sidebar button to ingest PDFs.  
-• Main pane is a chat interface.  
-• Chat history stored in session-state so reloads are safe. |
+| Layer                                      | What it Does                                                                                                    |
+|--------------------------------------------|-----------------------------------------------------------------------------------------------------------------|
+| **PDF Repository**                         | Put every PDF you care about in `data/papers/`.                                                                 |
+| **Ingestion Pipeline** (`app/ingest.py`)   | • Extracts text from PDFs (PyPDF2).<br/>• Splits text into overlapping chunks (`RecursiveCharacterTextSplitter`).<br/>• Embeds each chunk (Sentence-Transformers `all-MiniLM-L6-v2`).<br/>• Builds a FAISS vector index + `docs.pkl` with text + metadata. |
+| **RAG Layer** (`app/rag_chat.py`)          | • Loads the FAISS index and calls a Hugging Face Inference API model.<br/>• Retrieves top-k chunks for each query, builds a prompt, and streams a response. |
+| **Streamlit UI** (`app/app.py`)            | • Sidebar button to ingest PDFs.<br/>• Main pane is a chat interface.<br/>• Chat history stored in session-state so reloads are safe. |
 
 ## 2. Setup
 
@@ -51,7 +45,7 @@ streamlit run run_app.py
 1. Click **Ingest PDFs** once.
 2. Ask questions in the chat box. Answers are grounded in retrieved context from your papers.
 
-## 4. Extending the System
+## 4. TODO
 
 * Add **watchdog** to monitor `data/papers/` and auto-trigger ingestion.
 * Swap in another embedding model or adjust chunk size in `app/ingest.py`.
