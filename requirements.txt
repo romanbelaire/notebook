@@ -8,4 +8,7 @@ langchain==0.1.7
 watchdog==3.0.0
 python-dotenv==1.0.0
 Pillow==10.3.0
-transformers==4.43.1 
+transformers==4.43.1
+PyMuPDF==1.24.2
+streamlit-quill==0.0.7
+markdownify==0.11.6 

@@ -92,6 +92,9 @@ class RAGChat:
         # Vector store
         self._load_vector_store()
 
+        # Allowed set of source filenames; None means all.
+        self.allowed_sources: Optional[set[str]] = None
+
     # ---------------------------------------------------------------------
     # Vector store helpers
     # ---------------------------------------------------------------------
@@ -109,24 +112,118 @@ class RAGChat:
         self.texts: List[str] = store["texts"]
         self.metadatas: List[dict] = store["metadatas"]
 
-    def _retrieve(self, query: str, k: int = 4) -> List[str]:
+        # Ensure lengths align with FAISS index count
+        num_vecs = self.index.ntotal
+        if len(self.texts) != num_vecs or len(self.metadatas) != num_vecs:
+            # ------------------------------------------------------------------
+            # TODO(Review): The truncation + index rebuild below keeps the vector
+            # store consistent when docs.pkl and index.faiss diverge (e.g., after
+            # interrupted ingestion). Verify long-term that we are not silently
+            # discarding desired vectors. Consider a full re-ingest instead.
+            # ------------------------------------------------------------------
+            min_len = min(num_vecs, len(self.texts), len(self.metadatas))
+            self.texts = self.texts[:min_len]
+            self.metadatas = self.metadatas[:min_len]
+            # If FAISS has more vectors than docs, rebuild truncated index to stay consistent
+            if self.index.ntotal != min_len:
+                ids_to_keep = list(range(min_len))
+                vectors = self.index.reconstruct_n(0, min_len)
+                dim = vectors.shape[1]
+                new_index = faiss.IndexFlatL2(dim)
+                new_index.add(vectors)
+                self.index = new_index
+
+    def _ensure_sync(self):
+        """Reload vector store if index and docs length diverge."""
+        if hasattr(self, "index") and self.index.ntotal != len(self.texts):
+            # Underlying DB changed – reload from disk
+            self._load_vector_store()
+
+    def _retrieve(self, query: str, k: int = 4):
+        """Return list of (text, metadata) for top-k chunks."""
         query_emb = self.embedding_model.encode(query)
-        D, I = self.index.search(np.array([query_emb]).astype("float32"), k)
-        return [self.texts[i] for i in I[0] if i != -1]
+
+        # If filtering by allowed_sources, search with an expanded pool to
+        # compensate for discarded results.
+        multiplier = 3 if self.allowed_sources else 1
+        search_k = k * multiplier
+        search_k = min(search_k, self.index.ntotal)
+
+        D, I = self.index.search(np.array([query_emb]).astype("float32"), search_k)
+
+        results = []
+        for idx in I[0]:
+            if idx == -1:
+                continue
+            meta = self.metadatas[idx]
+            if self.allowed_sources is not None:
+                if meta.get("source") not in self.allowed_sources:
+                    continue
+            results.append((self.texts[idx], meta))
+            if len(results) >= k:
+                break
+        return results
 
     # ---------------------------------------------------------------------
     # Public interface
     # ---------------------------------------------------------------------
-    def chat(self, query: str, history: List[dict]) -> str:
-        """Return an answer to *query* grounded in retrieved context using HF text-generation endpoint."""
-        contexts = self._retrieve(query, k=4)
-        context_block = "\n---\n".join(contexts)
+    def chat(self, query: str, history: List[dict], *, window_size: int = 6) -> str:
+        """Answer *query* using retrieved context plus a sliding window of past contexts.
 
-        # Build messages ----------------------------------------------------------
+        1. Collect contexts attached to the last *window_size* messages in *history*.
+        2. Retrieve fresh chunks for *query*.
+        3. Deduplicate so no context appears twice.
+        """
+
+        # ------------------------------------------------------------------
+        # 1. Gather recent contexts from conversation history
+        # ------------------------------------------------------------------
+        recent_contexts: list[str] = []
+        recent_meta: list[dict] = []
+
+        for msg in reversed(history[:-1]):  # exclude the just-submitted query
+            if "contexts" in msg and "citations" in msg:
+                for ctext, cmeta in zip(msg["contexts"], msg["citations"]):
+                    if ctext not in recent_contexts:
+                        recent_contexts.append(ctext)
+                        recent_meta.append(cmeta)
+                if len(recent_contexts) >= window_size:
+                    break
+
+        # Keep chronological order (oldest first) for clarity
+        recent_contexts = recent_contexts[::-1]
+        recent_meta = recent_meta[::-1]
+
+        # ------------------------------------------------------------------
+        # 2. Retrieve new context for the current query
+        # ------------------------------------------------------------------
+        retrieved = self._retrieve(query, k=4)
+
+        combined_contexts: list[str] = list(recent_contexts)
+        combined_meta: list[dict] = list(recent_meta)
+
+        existing_set = set(combined_contexts)
+        for text, meta in retrieved:
+            if text in existing_set:
+                continue  # skip duplicates to avoid double-counting
+            combined_contexts.append(text)
+            combined_meta.append(meta)
+            existing_set.add(text)
+
+        # Expose for UI consumption
+        self.last_contexts = combined_contexts  # type: ignore[attr-defined]
+        self.last_citation_meta = combined_meta  # type: ignore[attr-defined]
+
+        context_block = "\n---\n".join(combined_contexts)
+
+        # ------------------------------------------------------------------
+        # Build LLM prompt including conversation summary window (optional)
+        # ------------------------------------------------------------------
         system_prompt = (
             "You are an expert research assistant. "
             "Answer the user based solely on the given context."
         )
+
         user_prompt = (
             f"Context:\n{context_block}\n\n"
             f"Question:\n{query}\nAnswer with technical precision."
@@ -153,4 +250,15 @@ class RAGChat:
             repetition_penalty=1.1,
             return_full_text=False,      # we only want the answer, not the prompt
         )[0]["generated_text"]
-        return out.strip() 
+        return out.strip()
+
+    # -----------------------------------------------------------------
+    # Context pool control
+    # -----------------------------------------------------------------
+
+    def set_allowed_sources(self, sources: Optional[set[str]]):
+        """Restrict retrieval to chunks whose metadata 'source' is in *sources*.
+
+        Pass *None* to clear restriction (default).
+        """
+        self.allowed_sources = sources 
