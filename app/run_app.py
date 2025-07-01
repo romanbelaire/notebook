@@ -20,6 +20,7 @@ from app.metadata_db import (
 from importlib import import_module
 from sentence_transformers import SentenceTransformer
 from app.task_manager import submit as submit_task, status as task_status, exception as task_exception
+from app.formatter import format_markdown
 
 # -----------------------------------------------------------------------------
 # Helper: generate short title using the loaded LLM (defined early so it exists
@@ -355,6 +356,7 @@ if user_query:
                 st.session_state.rag.set_allowed_sources(None)
 
             assistant_reply = st.session_state.rag.chat(user_query, st.session_state.chat_history)
+            assistant_reply = format_markdown(assistant_reply)
             # Retrieve contexts from the RAG object if available
             contexts = getattr(st.session_state.rag, "last_contexts", [])
             citation_meta = getattr(st.session_state.rag, "last_citation_meta", [])

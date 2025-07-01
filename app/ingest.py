@@ -181,8 +181,6 @@ def ingest_pdfs(pdf_dir: str = "data/papers", db_dir: str = "db") -> None:
     conn = get_connection(db_dir=db_dir)
 
     for pdf in pdf_files:
-        raw_text = extract_text_from_pdf(pdf)
-
         # ------------------------  PDF metadata  ------------------------
         try:
             doc = fitz.open(pdf)
@@ -196,10 +194,28 @@ def ingest_pdfs(pdf_dir: str = "data/papers", db_dir: str = "db") -> None:
                 year_meta = year_meta[:4]
             else:
                 year_meta = None
+
+            # Extract simple TOC mapping page -> heading using PyMuPDF 1-based page numbers
+            toc_entries = doc.get_toc(simple=True)  # [[lvl, title, page], ...]
+            page_to_heading: dict[int, str] = {}
+            for lvl, title, page_num in toc_entries:
+                # Only take level 1 or 2 headings to avoid noisy subsubsections
+                if lvl <= 2:
+                    page_to_heading.setdefault(page_num, title.strip())
+            # Build cumulative mapping so each page inherits nearest previous heading
+            current_heading = None
+            heading_by_page: dict[int, str] = {}
+            for pnum in range(1, doc.page_count + 1):
+                if pnum in page_to_heading:
+                    current_heading = page_to_heading[pnum]
+                if current_heading:
+                    heading_by_page[pnum] = current_heading
         except Exception:
+            doc = None  # type: ignore[assignment]
             title_meta = ""
             author_meta = ""
             year_meta = None
+            heading_by_page = {}
 
         inferred_title = _infer_title_from_first_page(pdf)
         if inferred_title:
@@ -210,38 +226,51 @@ def ingest_pdfs(pdf_dir: str = "data/papers", db_dir: str = "db") -> None:
             paper_title = Path(pdf).stem.replace("_", " ")
         authors_field = author_meta if author_meta else None
 
-        # Combine title with body so title words appear in at least one chunk
-        combined_text = f"{paper_title}\n{raw_text}" if paper_title else raw_text
-
-        chunked_raw = chunk_text(combined_text)
-        chunked = []
-        for ch in chunked_raw:
-            if len(ch.strip()) == 0:
+        # -----------------------------  Chunk per page  -----------------------------
+        for page_idx in range(doc.page_count if doc else 0):
+            try:
+                page = doc.load_page(page_idx)  # type: ignore[union-attr]
+                page_text = page.get_text("text")
+            except Exception:
                 continue
-            digit_ratio = sum(c.isdigit() for c in ch) / len(ch)
-            if digit_ratio > NUMERIC_RATIO_THRESHOLD:
-                continue  # skip numeric-heavy chunks
-            chunked.append(ch)
+
+            # Optionally prepend page heading to bias retrieval
+            heading = heading_by_page.get(page_idx + 1)
+            if heading:
+                page_text = f"{heading}\n{page_text}"
+
+            for chunk in chunk_text(page_text):
+                if len(chunk.strip()) == 0:
+                    continue
+                digit_ratio = sum(c.isdigit() for c in chunk) / len(chunk)
+                if digit_ratio > NUMERIC_RATIO_THRESHOLD:
+                    continue
+
+                emb = model.encode(chunk)
+                vectors.append(emb)
+                metadatas.append({
+                    "source": Path(pdf).name,
+                    "title": paper_title,
+                    "authors": authors_field,
+                    "year": year_meta,
+                    "section": heading,
+                    "page": page_idx + 1,
+                })
+                chunks.append(chunk)
 
         # -----------------------  Whole-paper embedding  -----------------------
-        cleaned_text = _clean_text_for_embedding(raw_text)
-        paper_vector = model.encode(cleaned_text)
-
-        # ----------------------  Per-chunk embeddings  ------------------------
-        for chunk in chunked:
-            emb = model.encode(chunk)
-            vectors.append(emb)
-            metadatas.append({
-                "source": Path(pdf).name,
-                "title": paper_title,
-                "authors": authors_field,
-                "year": year_meta,
-            })
-            chunks.append(chunk)
+        raw_text_combined = "\n".join(chunks[-1:]) if chunks else ""
+        cleaned_text = _clean_text_for_embedding(raw_text_combined)
+        if cleaned_text:
+            paper_vector = model.encode(cleaned_text)
+        else:
+            paper_vector = model.encode(paper_title)
 
         # Record metadata
         paper_id = upsert_paper(conn, Path(pdf).name, title=paper_title, authors=authors_field, year=year_meta)
-        replace_chunks(conn, paper_id, chunked)
+        # store only text chunks belonging to current PDF
+        current_pdf_chunks = [ch for ch, meta in zip(chunks, metadatas) if meta["source"] == Path(pdf).name]
+        replace_chunks(conn, paper_id, current_pdf_chunks)
 
         # Store paper-level embedding
         upsert_paper_embedding(conn, paper_id, paper_vector)
