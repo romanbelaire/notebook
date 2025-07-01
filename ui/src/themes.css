@@ -1,0 +1,137 @@
+:root, .theme-standard {
+  /* Standard / Default theme variables */
+  --color-primary-bg: #142338;
+  --color-secondary-bg: #16263c;
+  --color-header-bg: #111c2d;
+  --color-trim: #182529aa;
+  --color-accent-text: #d48e33;
+  --color-button-bg: #40404f;
+  --color-insight-bg: #364966;
+  --color-bright-bg: #C0CAAD;
+  --color-chat-assistant-bg: #353f50;
+  --color-tertiary-text: #db363c;
+  --color-light-text: #ffffff;
+}
+
+/* ------------------------------------------------------------------ */
+/* Additional Themes (example palettes, adjust as needed)             */
+/* ------------------------------------------------------------------ */
+
+/* Light Theme */
+.theme-light {
+  --color-primary-bg: #def2ff;
+  --color-secondary-bg: #88d3ff;
+  --color-header-bg: #6dc0ff;
+  --color-trim: #c0c0c0;
+  --color-accent-text: #1b3b3b;
+  --color-button-bg: #7ca0e9;
+  --color-insight-bg: #ecf3ff;
+  --color-bright-bg: #334155;
+  --color-chat-assistant-bg: #91c8ff;
+  --color-tertiary-text: #db363c;
+  --color-light-text: #ffffff;
+  --color-defaultText: #000000;
+}
+
+/* High-Contrast Dark Theme */
+.theme-dark {
+  --color-primary-bg: #131922;
+  --color-secondary-bg: #16263d;
+  --color-header-bg: #000000;
+  --color-trim: #30363d;
+  --color-accent-text: #f6b70b;
+  --color-button-bg: #21262d;
+  --color-insight-bg: #172135;
+  --color-bright-bg: #9ca3af;
+  --color-chat-assistant-bg: #222b3a;
+  --color-tertiary-text: #f85149;
+  --color-light-text: #ffffff;
+  --color-defaultText: #ffffff;
+}
+
+/* Sakura Light Theme */
+.theme-sakura-light {
+  --color-primary-bg: #fce9ef;
+  --color-secondary-bg: #d2bee2;
+  --color-header-bg: #e6add0;
+  --color-trim: #f4c7d8;
+  --color-accent-text: #d53d8c;
+  --color-button-bg: #f0c9d7;
+  --color-insight-bg: #ffeaf1;
+  --color-bright-bg: #cfa6b8;
+  --color-chat-assistant-bg: #f8cadf;
+  --color-tertiary-text: #db5a74;
+  --color-light-text: #3b0d41;
+  --color-defaultText: #0c070f;
+}
+
+/* Springtime Light Theme (greens & browns) */
+.theme-springtime-light {
+  --color-primary-bg: #f4fff7;
+  --color-secondary-bg: #ffffff;
+  --color-header-bg: #7bb470;
+  --color-trim: #a6bfa3;
+  --color-accent-text: #4f8051;
+  --color-button-bg: #e2eadb;
+  --color-insight-bg: #e8f5e6;
+  --color-bright-bg: #cdae79;
+  --color-chat-assistant-bg: #eef8f0;
+  --color-tertiary-text: #8e6f27;
+  --color-light-text: #ffffff;
+  --color-defaultText: #070f09;
+}
+
+/* Forest Dark Theme */
+.theme-forest-dark {
+  --color-primary-bg: #0e1b12;
+  --color-secondary-bg: #274334;
+  --color-header-bg: #132b1f;
+  --color-trim: #274334;
+  --color-accent-text: #9acf8b;
+  --color-button-bg: #1b2f24;
+  --color-insight-bg: #1c3526;
+  --color-bright-bg: #5c7e67;
+  --color-chat-assistant-bg: #1b2e22;
+  --color-tertiary-text: #2e8b57;
+  --color-light-text: #ffffff;
+}
+
+/* Toadstool Light Theme (dark brown header, beige body) */
+.theme-toadstool-light {
+  --color-primary-bg: #dacfbe;
+  --color-secondary-bg: #c9a889;
+  --color-header-bg: #5a3e36;
+  --color-trim: #c8b5a4;
+  --color-accent-text: #b02a29;
+  --color-button-bg: #e9ddd1;
+  --color-insight-bg: #f7f2ea;
+  --color-bright-bg: #d8cabd;
+  --color-chat-assistant-bg: #faf7f2;
+  --color-tertiary-text: #b02a29;
+  --color-light-text: #ffffff;
+  --color-defaultText: #251804;
+}
+
+.theme-acorn-dark {
+  --color-primary-bg: #42312c;
+  --color-secondary-bg: #534233;
+  --color-header-bg: #3a2924;
+  --color-trim: #553d27;
+  --color-accent-text: #ffd09a;
+  --color-button-bg: #8a7152;
+  --color-insight-bg: #8b7056;
+  --color-bright-bg: #744c5b;
+  --color-chat-assistant-bg: #7a7168;
+  --color-tertiary-text: #005512;
+  --color-light-text: #b3a294;
+  --color-defaultText: #ffffff;
+}
+
+/* ------------------------------------------------------------------ */
+/* How to activate a theme                                             */
+/* ------------------------------------------------------------------ */
+/*
+  Add the corresponding theme class to your <html> or <body> element.
+  Example: <body class="theme-light"> ... </body>
+  If no theme class is present, ":root" (default) colors are used.
+*/ 
