@@ -1,0 +1,256 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Open Sans font is now loaded via <link> in index.html */
+
+:root {
+  /* Use Open Sans everywhere */
+  font-family: "Open Sans", system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+  line-height: 1.5;
+  word-spacing: 0.055em;
+
+  /* Custom color palette */
+  --color-defaultText: #cadde2;
+  color: var(--color-defaultText);
+  background-color: var(--color-primary-bg); /* main background */
+
+  /* CSS variables for reference in components if needed */
+  --color-primary-bg: #142338;
+  --color-secondary-bg: #16263c; /* updated sidebar color */
+  --color-header-bg: #111c2d; /* header bar */
+  --color-trim: #182529aa;
+  --color-accent-text: #d48e33; /* bold accent */
+  --color-button-bg: #40404f;
+  --color-insight-bg: #364966;
+  --color-bright-bg: #C0CAAD;
+  --color-chat-assistant-bg: #353f50;
+  --color-tertiary-text: #db363c; /* tertiary text color */
+  --color-light-text: #ffffff;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+a {
+  font-weight: 500;
+  color: var(--color-trim);
+  text-decoration: inherit;
+}
+a:hover {
+  color: #ffffff;
+}
+
+body {
+  margin: 0;
+  display: flex;
+  place-items: center;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+h1 {
+  font-size: 3.2em;
+  line-height: 1.1;
+}
+
+button {
+  border-radius: 8px;
+  border: 1px solid transparent;
+  padding: 0.6em 1.2em;
+  font-size: 1em;
+  font-weight: 500;
+  font-family: inherit;
+  background-color: var(--color-button-bg);
+  color: #ffeaec;
+  cursor: pointer;
+  transition: border-color 0.25s;
+}
+button:hover {
+  border-color: var(--color-trim);
+}
+button:focus,
+button:focus-visible {
+  outline: 4px auto -webkit-focus-ring-color;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color: #213547;
+    background-color: #ffffff;
+  }
+  a:hover {
+    color: #747bff;
+  }
+  button {
+    background-color: #f9f9f9;
+  }
+}
+
+/* Soft glow for bold text */
+strong, b, .font-bold, .font-semibold {
+  /* text-shadow: 0 0 2px var(--color-accent-text); */
+  color: var(--color-accent-text);
+  letter-spacing: 0.05em;
+}
+
+/* Bold style without extra kerning – use for buttons/compact text */
+.btn-bold {
+  font-weight: 600;
+  color: var(--color-accent-text);
+  /* text-shadow: 0 0 2px rgba(224, 127, 0, 0.6); */
+  letter-spacing: normal;
+}
+
+/* Stronger glow & monospace for main brand/title */
+.title-brand {
+  font-family: "Consolas", "Menlo", "Monaco", "Liberation Mono", "Courier New", monospace;
+  font-weight: 700;
+  color: var(--color-accent-text);
+  /* text-shadow: 0 0 2px rgba(224, 127, 0, 0.95); */
+  letter-spacing: 0.03em;
+  font-size: 2.5em;
+}
+
+/* Removed custom scrollbar styling – use standard OS scrollbars */
+
+/* Inner wrapper produced by Markdown is first child <div>. Apply spacing between its children. */
+.assistant-bubble > div > * + * {
+  margin-top: 1.5em;
+}
+
+/* Highlight term style */
+.highlight-term, mark.highlight-term {
+  background: none;
+  color: var(--color-tertiary-text);
+}
+
+/* Extra spacing between list items inside assistant messages */
+.assistant-bubble li + li {
+  margin-top: 0.75em;
+}
+
+/* ------------------------------------------------------------------ */
+/* Global scrollbar (transparent track, thin pill, no arrows)         */
+/* ------------------------------------------------------------------ */
+* {
+  scrollbar-width: thin;                    /* Firefox */
+  scrollbar-color: var(--color-trim) transparent;
+}
+
+/* WebKit (Chrome, Edge, Safari) */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background-color: var(--color-trim);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+/* ScratchPad (Quill editor) overrides */
+.ql-toolbar.ql-snow, .ql-container.ql-snow {
+  border: 2px solid var(--color-defaultText/80) !important;
+  background-color: var(--color-secondary-bg) !important;
+  color: inherit;
+}
+
+/* Override Quill toolbar button colors */
+.ql-toolbar.ql-snow .ql-formats button,
+.ql-toolbar.ql-snow .ql-formats span,
+.ql-toolbar.ql-snow .ql-formats svg,
+.ql-toolbar.ql-snow .ql-picker,
+.ql-toolbar.ql-snow .ql-picker-options,
+.ql-toolbar.ql-snow .ql-picker-item {
+  color: var(--color-defaultText) !important;
+  stroke: var(--color-defaultText) !important;
+  fill: var(--color-defaultText) !important;
+}
+
+/* Fix for specific SVG paths and strokes */
+.ql-toolbar.ql-snow .ql-stroke {
+  stroke: var(--color-defaultText) !important;
+  fill: none !important;
+}
+
+.ql-toolbar.ql-snow .ql-fill {
+  fill: var(--color-defaultText) !important;
+  stroke: none !important;
+}
+
+.ql-toolbar.ql-snow .ql-picker-label::before,
+.ql-toolbar.ql-snow .ql-color-label::before,
+.ql-toolbar.ql-snow .ql-background-label::before {
+  color: var(--color-defaultText) !important;
+}
+
+/* Active state for toolbar buttons */
+.ql-toolbar.ql-snow .ql-formats button.ql-active,
+.ql-toolbar.ql-snow .ql-formats .ql-picker-label.ql-active,
+.ql-toolbar.ql-snow .ql-formats .ql-picker-item.ql-selected {
+  color: var(--color-accent-text) !important;
+}
+
+.ql-toolbar.ql-snow .ql-formats button.ql-active .ql-stroke,
+.ql-toolbar.ql-snow .ql-formats .ql-picker-label.ql-active .ql-stroke {
+  stroke: var(--color-accent-text) !important;
+}
+
+.ql-toolbar.ql-snow .ql-formats button.ql-active .ql-fill,
+.ql-toolbar.ql-snow .ql-formats .ql-picker-label.ql-active .ql-fill {
+  fill: var(--color-accent-text) !important;
+}
+
+/* Dropdown arrows and labels */
+.ql-toolbar.ql-snow .ql-picker-label {
+  color: var(--color-defaultText) !important;
+}
+
+/* Dropdown options */
+.ql-toolbar.ql-snow .ql-picker-options {
+  background-color: var(--color-secondary-bg) !important;
+  border-color: var(--color-defaultText/80) !important;
+}
+
+.ql-toolbar.ql-snow .ql-picker-options .ql-picker-item:hover {
+  color: var(--color-accent-text) !important;
+  background-color: var(--color-primary-bg) !important;
+}
+
+.ql-toolbar.ql-snow {
+  border-top-left-radius: 0.5rem;
+  border-top-right-radius: 0.5rem;
+}
+.ql-container.ql-snow {
+  border-bottom-left-radius: 0.5rem;
+  border-bottom-right-radius: 0.5rem;
+}
+
+/* Ensure ScratchPad Quill editor fills available space */
+.scratchpad-quill {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+.scratchpad-quill .ql-container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+.scratchpad-quill .ql-editor {
+  flex: 1;
+  overflow-y: auto;
+}
