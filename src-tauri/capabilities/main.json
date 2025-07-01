@@ -1,0 +1,14 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Permissions for the main window – allow shell.open anywhere",
+  "windows": ["main"],
+  "permissions": [
+    {
+      "identifier": "shell:allow-open",
+      "allow": [
+        { "regex": ".*" }
+      ]
+    }
+  ]
+} 
