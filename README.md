@@ -1,6 +1,6 @@
-# Notebook — Production Desktop Edition
+# Notebook — Desktop Edition
 
-> Cross-platform, offline-first knowledge workspace for reading, chatting with, and organising research papers.
+> Offline-first knowledge workspace for reading, chatting with, and organising research papers.
 
 ---
 
@@ -118,20 +118,16 @@ Current viewer stack: **react-pdf 7.7.3 + pdfjs-dist 4.2.67**.
 This removes the CVE-2024-4367 exploit by disabling `eval` inside the
 worker, but `npm audit` may still flag the nested pdfjs-dist 3.x copy.
 
-> We plan to migrate to **react-pdf 9.x** (ESM-only & pdfjs-dist 4.3+) in
-a future sprint once the build pipeline is moved to native ESM.  See
-`ROADMAP.md` for the tracked task.
+> We plan to migrate to **react-pdf 9.x** (ESM-only & pdfjs-dist 4.3+) in a future sprint once the build pipeline is moved to native ESM.  See `ROADMAP.md` for the tracked task.
 
-The Quill XSS advisory is mitigated by DOMPurify; we'll revisit when
+> The Quill XSS advisory is mitigated by DOMPurify; we'll revisit when
 upgrading to react-quill 2.x.
 
-+ **Debug-only Clear-DB endpoint** — For local development there is a POST `/debug/clear_db` API (exposed via the "Clear Database" button in *Library View*).  It **deletes** the `db/metadata.db` file and recreates it empty on next access.
-
-This is strictly a convenience tool for debugging desktop/offline builds.  **Never enable it on deployments where the front-end speaks to a shared or remote server.**  In the long run we should either remove the endpoint entirely or scope it so it only affects files on the user's own machine.
+> **Debug-only Clear-DB endpoint** — For local development there is a POST `/debug/clear_db` API (exposed via the "Clear Database" button in *Library View*).  It **deletes** the `db/metadata.db` file and recreates it empty on next access. This is strictly a convenience tool for debugging desktop/offline builds.  **Never enable it on deployments where the front-end speaks to a shared or remote server.**  In the long run we should either remove the endpoint entirely or scope it so it only affects files on the user's own machine.
 
 ---
 
-This project exists to build useful tools that maintain ownership of your data. AI is a powerful productivity multiplier, and we should aim to arm users with the right to modify, repair, and understand the systems they use. 
+This project exists to build useful tools that maintain ownership of your data. AI is a powerful productivity multiplier, and we should arm users with the right to modify, repair, and understand the systems they use. 
 
 In an age of Everything-as-a-Service and proprietary black boxes, it's more important than ever to keep the software commons alive. This project is licensed under the **AGPLv3** to ensure that anyone who improves or deploys this code contributes back to the community.
 
