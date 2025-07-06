@@ -10,18 +10,25 @@ with the user's code-quality requirement.
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 import json
 import uuid
+import hashlib
+import base64
+import re
+from functools import lru_cache
+import numpy as np
+import glob
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, UploadFile, File, Body
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 from app.rag_chat import RAGChat
-from app.task_manager import submit as submit_task, status as task_status, result as task_result, exception as task_exception
-from app.ingest import ingest_pdfs
+from app.task_manager import submit as submit_task, status as task_status, result as task_result, exception as task_exception, get_progress as task_progress
+from app.ingest import ingest_pdfs, ingest_pdfs_with_progress
 from app.insights_store import InsightsStore
 from app.metadata_db import (
     get_connection,
@@ -33,11 +40,14 @@ from app.metadata_db import (
     upsert_paper,
     upsert_paper_embedding,
     get_filenames_for_collection,
+    rename_collection,
+    delete_collection,
+    remove_papers_from_collection,
+    list_papers_for_collection,
+    check_paper_by_sha256,
 )
 from datetime import datetime
-import re
-from functools import lru_cache
-import numpy as np
+import os
 
 __all__ = ["app"]  # uvicorn entry-point: ``rag_server.main:app``
 
@@ -119,6 +129,7 @@ class TaskStatusResponse(BaseModel):
     status: str
     result: Optional[Any] = None  # noqa: ANN401 – may be arbitrary JSON
     error: Optional[str] = None
+    progress: Optional[Dict[str, Any]] = None  # For tracking ingestion progress
 
 
 class InsightCreateRequest(BaseModel):
@@ -149,6 +160,7 @@ class Paper(BaseModel):
     title: Optional[str] = None
     authors: Optional[str] = None
     year: Optional[str] = None
+    sha256: Optional[str] = None
     added_at: str
 
 
@@ -156,6 +168,7 @@ class Collection(BaseModel):
     id: int
     name: str
     created_at: str
+    papers: Optional[List[Paper]] = None
 
 
 class CreateCollectionRequest(BaseModel):
@@ -163,6 +176,14 @@ class CreateCollectionRequest(BaseModel):
 
 
 class AddPapersRequest(BaseModel):
+    paper_ids: list[int]
+
+
+class RenameCollectionRequest(BaseModel):
+    name: str
+
+
+class RemovePapersRequest(BaseModel):
     paper_ids: list[int]
 
 
@@ -366,7 +387,7 @@ def chat(req: ChatRequest):
 def ingest(req: IngestRequest):
     """Schedule background ingestion of all PDFs in *req.pdf_dir*."""
     pdf_dir = Path(req.pdf_dir).expanduser().as_posix()
-    task_id = submit_task(ingest_pdfs, pdf_dir=pdf_dir)
+    task_id = submit_task(ingest_pdfs_with_progress, pdf_dir=pdf_dir)
     return IngestResponse(task_id=task_id)
 
 
@@ -377,8 +398,11 @@ def task_status_endpoint(task_id: str):
     if stat == "unknown":
         raise HTTPException(status_code=404, detail="Unknown task id")
 
+    # Get progress information for all statuses
+    progress = task_progress(task_id)
+
     if stat == "running" or stat == "pending":
-        return TaskStatusResponse(status=stat)
+        return TaskStatusResponse(status=stat, progress=progress)
 
     # finished – either success or error
     if stat == "done":
@@ -387,11 +411,11 @@ def task_status_endpoint(task_id: str):
         except Exception as exc:
             # Should not happen (*done* without result) – surface loudly.
             raise HTTPException(status_code=500, detail=str(exc)) from exc
-        return TaskStatusResponse(status=stat, result=res)
+        return TaskStatusResponse(status=stat, result=res, progress=progress)
 
     if stat == "error":
         err = task_exception(task_id)
-        return TaskStatusResponse(status=stat, error=str(err))
+        return TaskStatusResponse(status=stat, error=str(err), progress=progress)
 
     # Fallback – exhaustive above, but keep mypy happy.
     raise HTTPException(status_code=500, detail="Unhandled task status")
@@ -461,13 +485,131 @@ def get_papers():
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@app.get("/papers/check-hash/{sha256}")
+def check_paper_hash(sha256: str):
+    """Check if a paper with the given SHA256 hash already exists."""
+    try:
+        conn = get_connection()
+        existing_paper = check_paper_by_sha256(conn, sha256)
+        conn.close()
+        
+        if existing_paper:
+            return {"exists": True, "paper": existing_paper}
+        else:
+            return {"exists": False}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def extract_pdf_from_firefox_document(content: bytes) -> Union[bytes, None]:
+    """Extract PDF content from Firefox PDF document (HTML wrapper)."""
+    try:
+        text = content.decode('utf-8', errors='ignore')
+        
+        # Check if it's a Firefox PDF document
+        if '<!DOCTYPE html' not in text or 'pdf.js' not in text:
+            return None  # Not a Firefox PDF document
+        
+        # Look for the PDF data URL in the HTML
+        match = re.search(r'data:application/pdf;base64,([A-Za-z0-9+/=]+)', text)
+        if not match:
+            print('Firefox PDF document detected but no PDF data found')
+            return None
+        
+        # Decode the base64 PDF data
+        base64_data = match.group(1)
+        pdf_content = base64.b64decode(base64_data)
+        
+        return pdf_content
+    except Exception as e:
+        print(f'Error extracting PDF from Firefox document: {e}')
+        return None
+
+
+@app.post("/upload-paper", status_code=status.HTTP_201_CREATED)
+async def upload_paper(file: UploadFile = File(...)):
+    """Upload a PDF file to the papers directory for web mode."""
+    try:
+        # Validate file type
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="No filename provided")
+        
+        if not file.filename.lower().endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+        
+        # Read file content
+        content = await file.read()
+        
+        # Handle Firefox PDF documents by extracting actual PDF content
+        extracted_pdf = extract_pdf_from_firefox_document(content)
+        if extracted_pdf:
+            print(f"Extracted PDF content from Firefox document: {file.filename}")
+            final_content = extracted_pdf
+            # Ensure filename ends with .pdf
+            if not file.filename.lower().endswith('.pdf'):
+                file.filename = f"{file.filename}.pdf"
+        else:
+            final_content = content
+        
+        # Calculate SHA256 hash of the final content
+        sha256_hash = hashlib.sha256(final_content).hexdigest()
+        
+        # Check if file with this hash already exists
+        conn = get_connection()
+        existing_paper = check_paper_by_sha256(conn, sha256_hash)
+        
+        if existing_paper:
+            conn.close()
+            return {
+                "message": f"File {file.filename} already exists (duplicate detected)",
+                "duplicate": True,
+                "existing_paper": existing_paper
+            }
+        
+        # Ensure papers directory exists
+        papers_dir = Path("data") / "papers"
+        papers_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save file
+        file_path = papers_dir / file.filename
+        with open(file_path, "wb") as f:
+            f.write(final_content)
+        
+        # Store paper metadata with SHA256 hash
+        paper_id = upsert_paper(conn, filename=file.filename, sha256=sha256_hash)
+        conn.close()
+        
+        return {
+            "message": f"File {file.filename} uploaded successfully",
+            "duplicate": False,
+            "paper_id": paper_id,
+            "sha256": sha256_hash
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/collections", response_model=list[Collection])
 def get_collections():
     try:
         conn = get_connection()
-        rows = list_collections(conn)
+        collection_rows = list_collections(conn)
+        
+        # Populate papers for each collection
+        collections = []
+        for collection_data in collection_rows:
+            papers = list_papers_for_collection(conn, collection_data["id"])
+            collection_with_papers = {
+                **collection_data,
+                "papers": papers
+            }
+            collections.append(collection_with_papers)
+            
         conn.close()
-        return rows
+        return collections
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -493,6 +635,40 @@ def add_papers_to_collection_endpoint(collection_id: int, payload: AddPapersRequ
         conn = get_connection()
         add_papers_to_collection(conn, collection_id, payload.paper_ids)
         conn.close()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/collections/{collection_id}/remove", status_code=status.HTTP_204_NO_CONTENT)
+def remove_papers_from_collection_endpoint(collection_id: int, payload: RemovePapersRequest):
+    try:
+        conn = get_connection()
+        remove_papers_from_collection(conn, collection_id, payload.paper_ids)
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.put("/collections/{collection_id}", status_code=status.HTTP_204_NO_CONTENT)
+def rename_collection_endpoint(collection_id: int, payload: RenameCollectionRequest):
+    try:
+        conn = get_connection()
+        rename_collection(conn, collection_id, payload.name)
+        conn.close()
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/collections/{collection_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_collection_endpoint(collection_id: int):
+    try:
+        conn = get_connection()
+        delete_collection(conn, collection_id)
+        conn.close()
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -571,11 +747,6 @@ def set_context_pool(req: ContextPoolRequest):
 notes_static_dir = Path("notes")
 notes_static_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/notes", StaticFiles(directory=notes_static_dir), name="notes")
-
-# Serve ingested PDF files for browser build downloads / previews
-papers_dir = Path("data") / "papers"
-if papers_dir.exists():
-    app.mount("/papers", StaticFiles(directory=papers_dir), name="papers")
 
 # ---------------------------------------------------------------------------
 # Notes deletion endpoint (mirror front-end expectations)
@@ -660,6 +831,39 @@ def select_prompt_endpoint(payload: PromptSelectRequest):
     return
 
 
+# ---------------------------------------------------------------------------
+# Models endpoint (placeholder for settings compatibility)
+# ---------------------------------------------------------------------------
+
+@app.get("/models", response_model=list[str])
+def list_models_endpoint():
+    """Return available model IDs. Currently returns a default set."""
+    # This is a placeholder - you can expand this to return actual available models
+    return [
+        "meta-llama/Llama-3.2-1B-Instruct",
+        "microsoft/DialoGPT-medium", 
+        "facebook/blenderbot-400M-distill",
+        "gpt2"
+    ]
+
+
+@app.get("/models/check")
+def check_model_endpoint(name: str):
+    """Check if a model is available."""
+    # Simple placeholder implementation
+    available_models = [
+        "meta-llama/Llama-3.2-1B-Instruct",
+        "microsoft/DialoGPT-medium",
+        "facebook/blenderbot-400M-distill", 
+        "gpt2"
+    ]
+    
+    return {
+        "available": name in available_models,
+        "gated": False  # For now, assume no models are gated
+    }
+
+
 @app.delete("/prompts/{prompt_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_prompt_endpoint(prompt_id: str):
     data = _load_prompts()
@@ -690,4 +894,92 @@ def clear_database_endpoint():
         if db_path.exists():
             db_path.unlink()
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc 
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/pdf_dir")
+def get_pdf_dir():
+    config_path = Path("data/pdf_dir.txt")
+    if config_path.exists():
+        pdf_dir = config_path.read_text(encoding="utf-8").strip()
+        return {"pdf_dir": pdf_dir}
+    else:
+        raise HTTPException(status_code=404, detail="No pdf_dir configured")
+
+
+@app.post("/pdf_dir")
+def set_pdf_dir(payload: dict = Body(...)):
+    pdf_dir = payload.get("pdf_dir")
+    if not pdf_dir:
+        raise HTTPException(status_code=400, detail="Missing pdf_dir")
+    config_path = Path("data/pdf_dir.txt")
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(pdf_dir, encoding="utf-8")
+    return {"pdf_dir": pdf_dir}
+
+
+@app.get("/papers/{filename}")
+async def serve_paper(filename: str):
+    """Serve a PDF file by filename. Only serves from the configured pdf_dir."""
+    print(f"*** SERVE_PAPER FUNCTION CALLED WITH: {filename} ***")
+    try:
+        print(f"[PDF SERVE] Starting request for: {filename}")
+        
+        # Clean filename for security
+        if '..' in filename or '/' in filename or '\\' in filename:
+            print(f"[PDF SERVE] Invalid filename rejected: {filename}")
+            raise HTTPException(status_code=400, detail="Invalid filename")
+        if not filename.lower().endswith('.pdf'):
+            print(f"[PDF SERVE] Non-PDF filename rejected: {filename}")
+            raise HTTPException(status_code=400, detail="Only PDF files allowed")
+        
+        print(f"[PDF SERVE] Reading config file...")
+        config_path = Path("data/pdf_dir.txt")
+        if not config_path.exists():
+            print(f"[PDF SERVE] Config file not found: {config_path}")
+            raise HTTPException(status_code=404, detail="No pdf_dir configured")
+        
+        pdf_dir = config_path.read_text(encoding="utf-8").strip()
+        print(f"[PDF SERVE] PDF directory from config: {pdf_dir}")
+        
+        file_path = Path(pdf_dir) / filename
+        print(f"[PDF SERVE] Checking: {file_path}")
+        
+        if file_path.exists() and file_path.is_file():
+            print(f"[PDF SERVE] File exists, checking if it's a PDF...")
+            with open(file_path, 'rb') as f:
+                header = f.read(4)
+                if header != b'%PDF':
+                    print(f"  ✗ File exists but is not a valid PDF: {file_path}")
+                    raise HTTPException(status_code=415, detail="File is not a valid PDF")
+            
+            print(f"[PDF SERVE] File is valid PDF, creating FileResponse...")
+            return FileResponse(
+                path=str(file_path),
+                media_type="application/pdf",
+                filename=filename,
+                headers={"Cache-Control": "public, max-age=3600"}
+            )
+        else:
+            print(f"  ✗ Not found: {file_path}")
+            raise HTTPException(status_code=404, detail=f"PDF file '{filename}' not found in configured directory '{pdf_dir}'")
+    except HTTPException:
+        print(f"[PDF SERVE] HTTPException raised for {filename}")
+        raise
+    except Exception as exc:
+        print(f"Error serving {filename}: {exc}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# Debug: Print all registered routes on startup
+if __name__ == "__main__":
+    print("=== REGISTERED ROUTES ===")
+    for route in app.routes:
+        print(f"Route: {route}")
+        if hasattr(route, 'path'):
+            print(f"  Path: {route.path}")
+        if hasattr(route, 'methods'):
+            print(f"  Methods: {route.methods}")
+    print("=========================") 

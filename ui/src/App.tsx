@@ -9,6 +9,7 @@ import InsightModal from "./components/InsightModal";
 import ChevronLeftIcon from "./assets/chevron-left.svg?react";
 import ChevronRightIcon from "./assets/chevron-right.svg?react";
 import GearIcon from "./assets/gear.svg?react";
+import WindowControls from "./components/WindowControls";
 import { mkdir, writeFile, BaseDirectory } from "@tauri-apps/plugin-fs";
 import type { DragEvent as ReactDragEvent } from "react";
 import { DndContext, useSensor, useSensors, PointerSensor } from "@dnd-kit/core";
@@ -84,14 +85,36 @@ function App() {
     e.stopPropagation();
 
     try {
-      // Ensure 'papers' directory exists under the app data dir
-      await mkdir("papers", { recursive: true, baseDir: BaseDirectory.Data });
+      // Detect if we're running in Tauri or web mode
+      const w = window as any;
+      const isTauri =
+        Boolean(w?.__TAURI__) ||
+        Boolean(w?.__TAURI_INTERNALS__) ||
+        Boolean(w?.isTauri) ||
+        navigator.userAgent.includes("Tauri");
 
-      // Persist the file bytes
-      const buf = await pdf.arrayBuffer();
-      await writeFile(`papers/${pdf.name}`, new Uint8Array(buf), {
-        baseDir: BaseDirectory.Data,
-      });
+      if (isTauri) {
+        // Tauri mode: Use Tauri file system API
+        await mkdir("papers", { recursive: true, baseDir: BaseDirectory.Data });
+
+        const buf = await pdf.arrayBuffer();
+        await writeFile(`papers/${pdf.name}`, new Uint8Array(buf), {
+          baseDir: BaseDirectory.Data,
+        });
+      } else {
+        // Web mode: Upload to backend server
+        const formData = new FormData();
+        formData.append('file', pdf);
+        
+        const response = await fetch('/upload-paper', {
+          method: 'POST',
+          body: formData,
+        });
+
+        if (!response.ok) {
+          throw new Error(`Failed to upload ${pdf.name}: ${response.statusText}`);
+        }
+      }
 
       // Switch to the Data tab for visual confirmation
       setActiveTab("Data");
@@ -99,7 +122,6 @@ function App() {
       // Optionally notify success
       toast(`📄 Added '${pdf.name}' to paper repository!`, "success");
     } catch (err) {
-      // Fail fast & loudly per project guidelines
       toast(`Failed to add PDF: ${String(err)}`, "error");
       throw err;
     }
@@ -110,10 +132,15 @@ function App() {
 
   return (
     <DndContext sensors={sensors}>
-    <div className="h-screen w-screen flex flex-col bg-primaryBg text-defaultText" onDragOver={handleRootDragOver} onDropCapture={handleRootDrop}>
-      <header className="p-4 border-b flex items-center justify-between bg-headerBg text-light border-primaryBg shadow">
+    <div className="app-frame relative h-screen w-screen flex flex-col bg-primaryBg text-defaultText" onDragOver={handleRootDragOver} onDropCapture={handleRootDrop}>
+
+      {/* top margin handled via pseudo-element */}
+
+      <header className="p-3 mt-5 border-b flex items-center justify-between bg-headerBg text-light border-primaryBg shadow app-drag select-none">
         <h1 className="title-brand text-2xl font-mono">Notebook</h1>
-        <nav className="flex items-center gap-4">
+        {/* Left side placeholder to allow drag area */}
+        <div className="flex-1" />
+        <nav className="flex items-center gap-4 no-drag">
           {/* Segmented control */}
           <div className="relative grid bg-secondaryBg/60 rounded-full overflow-hidden h-10 shadow-inner" style={{ gridTemplateColumns: `repeat(${tabs.length}, 1fr)` }}>
             {/* animated slider */}
@@ -140,6 +167,12 @@ function App() {
           </div>
         </nav>
       </header>
+
+      {/* Floating window-controls overlay – keeps them visible on narrow widths */}
+      <div className="no-drag absolute" style={{ top: '4px', right: '4px', zIndex: 100 }}>
+        <WindowControls />
+      </div>
+
       <div className="flex flex-1 overflow-hidden relative">
         <div
           className={
@@ -153,16 +186,16 @@ function App() {
         {/* Toggle button now external to sidebar for reliable hit area */}
         <button
           aria-label="Toggle sidebar"
-          className={`absolute top-2 w-10 h-10 p-0 transition-all duration-300 ease-in-out bg-transparent border-none flex items-center justify-center rounded-full transition-opacity z-40 text-defaultText focus:outline-none focus:ring-0 cursor-pointer ${arrowHover ? 'drop-shadow-[0_0_6px_rgba(255,255,255,0.8)]' : ''} ${sidebarOpen ? 'hover:opacity-100' : 'opacity-30 hover:opacity-100'}`}
+          className={`no-drag absolute top-2 w-10 h-10 p-0 transition-all duration-300 ease-in-out bg-transparent border-none flex items-center justify-center rounded-full transition-opacity z-40 text-defaultText focus:outline-none focus:ring-0 cursor-pointer ${arrowHover ? 'drop-shadow-[0_0_6px_rgba(255,255,255,0.8)]' : ''} ${sidebarOpen ? 'hover:opacity-100' : 'opacity-30 hover:opacity-100'}`}
           style={{ left: sidebarOpen ? `calc(${SIDEBAR_WIDTH} - ${TOGGLE_SIZE})` : '0.5rem' }}
           onMouseEnter={() => setArrowHover(true)}
           onMouseLeave={() => setArrowHover(false)}
           onClick={() => setSidebarOpen(!sidebarOpen)}
         >
           {sidebarOpen ? (
-            <ChevronLeftIcon className="w-8 h-8 pointer-events-none" />
+            <ChevronLeftIcon className="w-8 h-8 pointer-events-none text-accentText" />
           ) : (
-            <ChevronRightIcon className="w-8 h-8 pointer-events-none" />
+            <ChevronRightIcon className="w-8 h-8 pointer-events-none text-accentText" />
           )}
         </button>
 

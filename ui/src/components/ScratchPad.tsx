@@ -347,6 +347,19 @@ export default function ScratchPad() {
     })();
   }, [content, title, noteId]);
 
+  // ───────────────────────────────────────── Auto-focus on mount ──
+  useEffect(() => {
+    // Attempt to focus the Quill editor once it's available
+    const timer = setInterval(() => {
+      const quill = quillRef.current?.getEditor?.();
+      if (quill) {
+        quill.focus();
+        clearInterval(timer);
+      }
+    }, 100);
+    return () => clearInterval(timer);
+  }, []);
+
   return (
     <div
       className="m-6 p-8 flex flex-col gap-4 h-full rounded-lg bg-secondaryBg shadow-inner"

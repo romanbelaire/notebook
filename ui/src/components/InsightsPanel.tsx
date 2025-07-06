@@ -112,7 +112,7 @@ function InsightRow({ ins, deleteConfirmId, setDeleteConfirmId, setModalInsight,
           />
           {/* trash icon */}
           <button
-            className="w-4 h-4 ml-2 p-0 flex items-center justify-center bg-transparent border-0 opacity-0 group-hover:opacity-100 hover:bg-white/10 focus:outline-none"
+            className="w-4 h-4 ml-2 p-0 text-defaultText flex items-center justify-center bg-transparent border-0 opacity-0 group-hover:opacity-100 hover:bg-white/10 focus:outline-none"
             onClick={(e) => {
               e.stopPropagation();
               setDeleteConfirmId(ins.id);
