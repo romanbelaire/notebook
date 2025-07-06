@@ -134,4 +134,57 @@
   Add the corresponding theme class to your <html> or <body> element.
   Example: <body class="theme-light"> ... </body>
   If no theme class is present, ":root" (default) colors are used.
-*/ 
+*/
+
+/* ------------------------------------------------------------------ */
+/* Custom window frame (borderless Tauri decorations=false build)     */
+/* ------------------------------------------------------------------ */
+
+.app-frame {
+  /* Use header bg variable for all frame borders */
+  --frame-color: var(--color-header-bg);
+
+  border-left: 1px solid var(--frame-color);
+  border-right: 1px solid var(--frame-color);
+  border-bottom: 1px solid var(--frame-color);
+  border-top: 0px solid var(--frame-color);
+  border-radius: 2px;
+  box-sizing: border-box;
+  /* subtle outer drop-shadow */
+  box-shadow: 0 0 1px rgba(0, 0, 0, 0.7);
+  overflow: hidden;
+
+  position: relative;
+}
+
+.app-frame::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 20px; /* top margin */
+  background: var(--frame-color);
+  -webkit-app-region: drag;
+  z-index: 10; /* sits above content but below buttons overlay */
+}
+
+/* Make elements draggable / non-draggable for the OS */
+.app-drag {
+  -webkit-app-region: drag;
+}
+
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/* Remove default focus outline (black border) from interactive elements that carry .no-drag class (window controls) */
+.no-drag:focus,
+.no-drag:focus-visible {
+  outline: none !important;
+  box-shadow: none !important;
+}
+
+html, body {
+  background: transparent;
+} 

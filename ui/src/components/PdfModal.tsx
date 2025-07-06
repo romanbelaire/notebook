@@ -3,10 +3,16 @@ import { readFile, BaseDirectory } from "@tauri-apps/plugin-fs";
 // @ts-ignore – react-pdf may not ship bundled TS types; ignore during build
 // eslint-disable-next-line import/no-extraneous-dependencies
 import { Document, Page, pdfjs } from "react-pdf";
+// Import react-pdf CSS to fix TextLayer warning
+import "react-pdf/dist/Page/AnnotationLayer.css";
+import "react-pdf/dist/Page/TextLayer.css";
 import CloseIcon from "../assets/close.svg?react";
 
 // Configure pdf.js worker CDN (avoids extra bundling complexity)
 pdfjs.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.js`;
+
+// Base backend URL (same env var used in api.ts)
+const API_BASE = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 
 interface Props {
   /** Filename as stored in data/papers (e.g., "paper.pdf"). */
@@ -44,50 +50,104 @@ export default function PdfModal({ filename, onClose, initialPage = 1 }: Props) 
   useEffect(() => {
     async function load() {
       if (!filename) return;
+
       try {
-        // If running in Tauri (plugin available), load from app data; else fetch over HTTP
+        // Always try to fetch from the backend API first, which can search multiple locations
+        const pdfUrlBackend = `${API_BASE}/papers/${filename}`;
+        console.log(`[PDF] Attempting backend fetch: ${pdfUrlBackend}`);
+        const resp = await fetch(pdfUrlBackend, { mode: "cors" });
+        if (!resp.ok) {
+          throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+        }
+        
+        const contentType = resp.headers.get("content-type");
+        if (contentType !== "application/pdf") {
+          throw new Error(`Unexpected content-type ${contentType}. Expected application/pdf.`);
+        }
+        
+        const blob = await resp.blob();
+        const url = URL.createObjectURL(blob);
+        setPdfUrl(url);
+        
+        // Also read as array buffer for potential future context extraction
+        const arrayBuffer = await blob.arrayBuffer();
+        setPdfData(new Uint8Array(arrayBuffer));
+        
+      } catch (err) {
+        console.error(`Failed to load PDF: ${err}`);
+        
+        // Fallback: try Tauri file system if we're in Tauri mode
         const w = window as any;
         const isTauri =
           Boolean(w.__TAURI__) ||
           Boolean(w.__TAURI_INTERNALS__) ||
           Boolean(w.isTauri) ||
           navigator.userAgent.includes("Tauri");
+          
         if (isTauri) {
-          // 1) Load raw bytes
-          const bytes = await readFile(`papers/${filename}`, {
-            baseDir: BaseDirectory.Data,
-          });
+          try {
+            console.log("Trying Tauri fallback...");
 
-          // 2) Ensure Uint8Array (older runtimes may give number[])
-          const buffer = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes as number[]);
+            let bytes: Uint8Array | number[];
 
-          // Debug: inspect signature
-          console.log("First 5 ASCII chars of file:", new TextDecoder("ascii").decode(buffer.slice(0, 5)));
-          if (!looksLikePDF(buffer)) {
-            throw new Error("Loaded file is not a PDF – verify path/baseDir");
-          }
+            try {
+              // Prefer absolute path resolution via @tauri-apps/api/path to avoid
+              // ambiguities with BaseDirectory lookup precedence.
+              const { dataDir, join } = await import("@tauri-apps/api/path");
+              const base = await dataDir();
+              const papersDir = await join(base, "papers");
+              const absPath = await join(papersDir, filename);
+              try {
+                const tauriFs = await import("@tauri-apps/plugin-fs");
+                if ("readDir" in tauriFs) {
+                  // @ts-ignore – dynamic import property access
+                  const dirEntries = await tauriFs.readDir(papersDir);
+                  console.log(`[PDF] Absolute papers dir: ${papersDir} – contains ${dirEntries.length} entries`);
+                } else {
+                  console.log(`[PDF] readDir not available; skipping directory listing for ${papersDir}`);
+                }
+              } catch (dirErr) {
+                console.warn(`[PDF] Could not list directory ${papersDir}:`, dirErr);
+              }
+              console.log(`[PDF] Trying absolute path: ${absPath}`);
+              bytes = await readFile(absPath); // absolute read – no baseDir
+            } catch (absErr) {
+              // Fallback #2: try relative to Data base dir (legacy behaviour)
+              console.warn("[PDF] Absolute read failed, trying baseDir fallback", absErr);
+              try {
+                const tauriFs = await import("@tauri-apps/plugin-fs");
+                if ("readDir" in tauriFs) {
+                  // @ts-ignore
+                  const baseDirEntries = await tauriFs.readDir("papers", { baseDir: BaseDirectory.Data });
+                  console.log(`[PDF] BaseDirectory.Data papers dir contains ${baseDirEntries.length} entries`);
+                } else {
+                  console.log("[PDF] readDir not available in browser build; skipping directory listing");
+                }
+              } catch (dirErr2) {
+                console.warn("[PDF] Could not list BaseDirectory.Data papers dir:", dirErr2);
+              }
+              bytes = await readFile(`papers/${filename}`, {
+                baseDir: BaseDirectory.Data,
+              });
+            }
 
-          setPdfData(buffer); // keep for future context-extraction features
+            const buffer = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes as number[]);
 
-          // 3) Create a Blob URL for react-pdf
-          const blobUrl = URL.createObjectURL(
-            new Blob([buffer], { type: "application/pdf" })
-          );
-          setPdfUrl(blobUrl);
-        } else {
-          const resp = await fetch(`/papers/${filename}`);
-          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-          if (resp.headers.get("content-type") !== "application/pdf") {
-            throw new Error(
-              `Unexpected content-type ${resp.headers.get("content-type")}. Not a PDF.`
+            console.log("First 5 ASCII chars of file:", new TextDecoder("ascii").decode(buffer.slice(0, 5)));
+            if (!looksLikePDF(buffer)) {
+              throw new Error("Loaded file is not a PDF – verify path/baseDir");
+            }
+
+            setPdfData(buffer);
+
+            const blobUrl = URL.createObjectURL(
+              new Blob([buffer], { type: "application/pdf" })
             );
+            setPdfUrl(blobUrl);
+          } catch (tauriErr) {
+            console.error(`Tauri fallback also failed: ${tauriErr}`);
           }
-          const blob = await resp.blob();
-          const url = URL.createObjectURL(blob);
-          setPdfUrl(url);
         }
-      } catch (err) {
-        console.error(`Failed to load PDF: ${err}`);
       }
     }
     load();
@@ -121,31 +181,21 @@ export default function PdfModal({ filename, onClose, initialPage = 1 }: Props) 
               onLoadSuccess={({ numPages }: { numPages: number }) => setNumPages(numPages)}
               loading={<div className="p-4">Loading PDF…</div>}
             >
-              <Page pageNumber={page} width={Math.min(800, window.innerWidth * 0.75)} />
+              <div className="space-y-4">
+                {numPages && Array.from({ length: numPages }, (_, i) => (
+                  <Page 
+                    key={i + 1} 
+                    pageNumber={i + 1} 
+                    width={Math.min(800, window.innerWidth * 0.75)}
+                    className="shadow-lg"
+                  />
+                ))}
+              </div>
             </Document>
           ) : (
             <div className="p-4">Fetching PDF…</div>
           )}
         </div>
-        {numPages && (
-          <footer className="p-2 border-t border-gray-300 dark:border-gray-700 flex items-center gap-2 text-sm">
-            <button
-              className="px-2 py-0.5 border rounded disabled:opacity-40"
-              onClick={() => setPage((p) => Math.max(1, p - 1))}
-              disabled={page <= 1}
-            >
-              ◄
-            </button>
-            <span>{page} / {numPages}</span>
-            <button
-              className="px-2 py-0.5 border rounded disabled:opacity-40"
-              onClick={() => setPage((p) => Math.min(numPages, p + 1))}
-              disabled={page >= numPages}
-            >
-              ►
-            </button>
-          </footer>
-        )}
       </div>
     </div>
   );

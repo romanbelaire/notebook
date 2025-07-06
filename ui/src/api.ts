@@ -39,7 +39,17 @@ export async function ingestPdfs(pdfDir: string) {
 }
 
 export async function getTaskStatus(taskId: string) {
-  const { data } = await api.get<{ status: string; result?: unknown; error?: string }>(`/task/${taskId}`);
+  const { data } = await api.get<{ 
+    status: string; 
+    result?: unknown; 
+    error?: string; 
+    progress?: {
+      current: number;
+      total: number;
+      message: string;
+      percentage: number;
+    } 
+  }>(`/task/${taskId}`);
   return data;
 }
 
@@ -84,6 +94,7 @@ export interface Paper {
   title?: string;
   authors?: string;
   year?: string;
+  sha256?: string;
   added_at: string;
 }
 
@@ -96,6 +107,11 @@ export interface Collection {
 
 export async function listPapers() {
   const { data } = await api.get<Paper[]>("/papers");
+  return data;
+}
+
+export async function checkPaperHash(sha256: string) {
+  const { data } = await api.get<{ exists: boolean; paper?: Paper }>(`/papers/check-hash/${sha256}`);
   return data;
 }
 

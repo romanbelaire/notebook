@@ -1,17 +1,21 @@
 import os
 import glob
 import pickle
+import hashlib
+import base64
+import re
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import numpy as np
-import re
 import fitz  # PyMuPDF
 import faiss
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 
-from .metadata_db import get_connection, upsert_paper, replace_chunks, upsert_paper_embedding
+from .metadata_db import get_connection, upsert_paper, replace_chunks, upsert_paper_embedding, check_paper_by_sha256
+from .task_manager import set_progress
+import threading
 
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 CHUNK_SIZE = 1000
@@ -67,6 +71,12 @@ def chunk_text(text: str) -> List[str]:
 
 def build_faiss_index(embeddings: List[List[float]]):
     """Create a FAISS index from the provided embeddings."""
+    if not embeddings:
+        # Create an empty index with default dimension
+        dim = 384  # Default dimension for all-MiniLM-L6-v2
+        index = faiss.IndexFlatL2(dim)
+        return index
+    
     dim = len(embeddings[0])
     index = faiss.IndexFlatL2(dim)
     index.add(np.array(embeddings).astype("float32"))
@@ -158,7 +168,76 @@ def _clean_text_for_embedding(text: str) -> str:
     return " ".join(filtered)
 
 
-def ingest_pdfs(pdf_dir: str = "data/papers", db_dir: str = "db") -> None:
+def extract_pdf_from_firefox_document(file_path: str) -> Union[bytes, None]:
+    """Extract PDF content from Firefox PDF document (HTML wrapper)."""
+    try:
+        with open(file_path, 'rb') as f:
+            content = f.read()
+        
+        text = content.decode('utf-8', errors='ignore')
+        
+        # Debug: Check what we're looking at
+        print(f"[DEBUG] Checking file: {file_path}")
+        print(f"[DEBUG] First 100 chars: {text[:100]}")
+        
+        # Check if it's a Firefox PDF document
+        if '<!DOCTYPE html' not in text or 'pdf.js' not in text:
+            print(f"[DEBUG] Not a Firefox PDF document: {file_path}")
+            return None  # Not a Firefox PDF document
+        
+        print(f"[DEBUG] Detected Firefox PDF document: {file_path}")
+        
+        # Look for the PDF data URL in the HTML
+        match = re.search(r'data:application/pdf;base64,([A-Za-z0-9+/=]+)', text)
+        if not match:
+            print(f'Firefox PDF document detected but no PDF data found: {file_path}')
+            # Try alternative patterns
+            alt_match = re.search(r'data:application/pdf[^,]*,([A-Za-z0-9+/=\s]+)', text)
+            if alt_match:
+                print(f'[DEBUG] Found alternative PDF data pattern: {file_path}')
+                base64_data = alt_match.group(1).replace(' ', '').replace('\n', '')
+                pdf_content = base64.b64decode(base64_data)
+                return pdf_content
+            return None
+        
+        print(f"[DEBUG] Found PDF data, extracting: {file_path}")
+        # Decode the base64 PDF data
+        base64_data = match.group(1)
+        pdf_content = base64.b64decode(base64_data)
+        
+        return pdf_content
+    except Exception as e:
+        print(f'Error extracting PDF from Firefox document {file_path}: {e}')
+        return None
+
+
+def ingest_pdfs_with_progress(pdf_dir: str = "data/papers", db_dir: str = "db", task_id: str = None) -> None:
+    """Ingest PDFs with progress tracking."""
+    try:
+        # Count total PDFs first
+        Path(pdf_dir).mkdir(parents=True, exist_ok=True)
+        pdf_files = glob.glob(os.path.join(pdf_dir, "*.pdf"))
+        
+        if not pdf_files:
+            if task_id:
+                set_progress(task_id, 0, 0, "No PDF files found")
+            raise FileNotFoundError(f"No PDF files found in '{pdf_dir}'.")
+        
+        total_files = len(pdf_files)
+        if task_id:
+            set_progress(task_id, 0, total_files, f"Starting ingestion of {total_files} PDFs")
+        
+        # Call original function with progress tracking
+        ingest_pdfs_internal(pdf_dir, db_dir, task_id)
+        
+    except Exception as e:
+        if task_id:
+            set_progress(task_id, 0, 0, f"Ingestion failed: {str(e)}")
+        print(f"Ingestion error in task {task_id}: {e}")
+        raise  # Re-raise so the task manager can capture it
+
+
+def ingest_pdfs_internal(pdf_dir: str = "data/papers", db_dir: str = "db", task_id: str = None) -> None:
     """Ingest all PDFs in `pdf_dir` into a vector store under `db_dir`.
 
     If *pdf_dir* does not exist, it is created automatically so users can simply
@@ -180,7 +259,46 @@ def ingest_pdfs(pdf_dir: str = "data/papers", db_dir: str = "db") -> None:
     # SQLite connection for metadata tracking
     conn = get_connection(db_dir=db_dir)
 
+    total_files = len(pdf_files)
+    processed_files = 0
+    actually_processed = 0
+
     for pdf in pdf_files:
+        # Check if this is a Firefox PDF document and fix it first
+        extracted_pdf = extract_pdf_from_firefox_document(pdf)
+        if extracted_pdf:
+            print(f"Found Firefox PDF document, extracting actual PDF content: {pdf}")
+            try:
+                # Replace the HTML file with the extracted PDF content
+                with open(pdf, 'wb') as f:
+                    f.write(extracted_pdf)
+                print(f"Successfully extracted and replaced Firefox PDF document: {pdf}")
+            except Exception as e:
+                print(f"Error replacing Firefox PDF document {pdf}: {e}")
+                processed_files += 1
+                if task_id:
+                    set_progress(task_id, processed_files, total_files, f"Error processing {processed_files}/{total_files} PDFs")
+                continue
+        
+        # ------------------------  SHA256 duplicate check  ------------------------
+        # Calculate SHA256 hash of the PDF file
+        with open(pdf, 'rb') as f:
+            pdf_content = f.read()
+            sha256_hash = hashlib.sha256(pdf_content).hexdigest()
+        
+        # Check if a paper with this hash already exists
+        try:
+            existing_paper = check_paper_by_sha256(conn, sha256_hash)
+            if existing_paper:
+                print(f"Skipping {pdf} - already ingested (SHA256: {sha256_hash[:8]}...)")
+                processed_files += 1
+                if task_id:
+                    set_progress(task_id, processed_files, total_files, f"Skipped duplicate {processed_files}/{total_files} PDFs")
+                continue
+        except Exception as e:
+            print(f"Error checking duplicate for {pdf}: {e}")
+            # Continue processing this file if duplicate check fails
+        
         # ------------------------  PDF metadata  ------------------------
         try:
             doc = fitz.open(pdf)
@@ -259,7 +377,9 @@ def ingest_pdfs(pdf_dir: str = "data/papers", db_dir: str = "db") -> None:
                 chunks.append(chunk)
 
         # -----------------------  Whole-paper embedding  -----------------------
-        raw_text_combined = "\n".join(chunks[-1:]) if chunks else ""
+        # Get all chunks for the current PDF
+        current_pdf_chunks = [ch for ch, meta in zip(chunks, metadatas) if meta["source"] == Path(pdf).name]
+        raw_text_combined = "\n".join(current_pdf_chunks) if current_pdf_chunks else ""
         cleaned_text = _clean_text_for_embedding(raw_text_combined)
         if cleaned_text:
             paper_vector = model.encode(cleaned_text)
@@ -267,26 +387,59 @@ def ingest_pdfs(pdf_dir: str = "data/papers", db_dir: str = "db") -> None:
             paper_vector = model.encode(paper_title)
 
         # Record metadata
-        paper_id = upsert_paper(conn, Path(pdf).name, title=paper_title, authors=authors_field, year=year_meta)
-        # store only text chunks belonging to current PDF
-        current_pdf_chunks = [ch for ch, meta in zip(chunks, metadatas) if meta["source"] == Path(pdf).name]
-        replace_chunks(conn, paper_id, current_pdf_chunks)
+        try:
+            paper_id = upsert_paper(conn, Path(pdf).name, title=paper_title, authors=authors_field, year=year_meta, sha256=sha256_hash)
+            # store only text chunks belonging to current PDF (already calculated above)
+            replace_chunks(conn, paper_id, current_pdf_chunks)
 
-        # Store paper-level embedding
-        upsert_paper_embedding(conn, paper_id, paper_vector)
+            # Store paper-level embedding
+            upsert_paper_embedding(conn, paper_id, paper_vector)
+        except Exception as e:
+            print(f"Error storing metadata for {pdf}: {e}")
+            # Continue to next file if metadata storage fails
+            processed_files += 1
+            if task_id:
+                set_progress(task_id, processed_files, total_files, f"Error processing {processed_files}/{total_files} PDFs")
+            continue
 
-    index = build_faiss_index(vectors)
+        # Update progress
+        processed_files += 1
+        actually_processed += 1
+        if task_id:
+            set_progress(task_id, processed_files, total_files, f"Processed {actually_processed}/{total_files} PDFs")
 
-    os.makedirs(db_dir, exist_ok=True)
-    faiss.write_index(index, os.path.join(db_dir, "index.faiss"))
-    with open(os.path.join(db_dir, "docs.pkl"), "wb") as f:
-        pickle.dump({"texts": chunks, "metadatas": metadatas}, f)
+    # Build index only if we have vectors
+    if vectors:
+        index = build_faiss_index(vectors)
+        os.makedirs(db_dir, exist_ok=True)
+        faiss.write_index(index, os.path.join(db_dir, "index.faiss"))
+        with open(os.path.join(db_dir, "docs.pkl"), "wb") as f:
+            pickle.dump({"texts": chunks, "metadatas": metadatas}, f)
+    else:
+        # Create empty index and data files for consistency
+        os.makedirs(db_dir, exist_ok=True)
+        empty_index = build_faiss_index([])
+        faiss.write_index(empty_index, os.path.join(db_dir, "index.faiss"))
+        with open(os.path.join(db_dir, "docs.pkl"), "wb") as f:
+            pickle.dump({"texts": [], "metadatas": []}, f)
 
     conn.close()
 
+    # Final progress update
+    if task_id:
+        if actually_processed == 0:
+            set_progress(task_id, total_files, total_files, f"All {total_files} PDFs were duplicates - skipped")
+        else:
+            set_progress(task_id, total_files, total_files, f"Ingestion complete! Processed {actually_processed} PDFs with {len(chunks)} text chunks")
+
     print(
-        f"Ingested {len(pdf_files)} PDFs with {len(chunks)} text chunks into '{db_dir}'."
+        f"Ingested {actually_processed} new PDFs (skipped {len(pdf_files) - actually_processed} duplicates) with {len(chunks)} text chunks into '{db_dir}'."
     )
+
+
+def ingest_pdfs(pdf_dir: str = "data/papers", db_dir: str = "db") -> None:
+    """Backward compatibility wrapper for ingest_pdfs_internal."""
+    ingest_pdfs_internal(pdf_dir, db_dir, task_id=None)
 
 
 if __name__ == "__main__":

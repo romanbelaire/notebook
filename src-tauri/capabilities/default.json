@@ -7,6 +7,14 @@
   ],
   "permissions": [
     "core:default",
-    "dialog:allow-open"
+    "dialog:default",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "dialog:allow-message",
+    "dialog:allow-ask",
+    "dialog:allow-confirm",
+    "fs:default",
+    "core:event:allow-listen",
+    "opener:default"
   ]
 }

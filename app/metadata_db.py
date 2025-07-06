@@ -48,7 +48,7 @@ def _ensure_tables(conn: sqlite3.Connection) -> None:
     # Lightweight migration: add missing columns if DB pre-exists.
     # ------------------------------------------------------------------
     existing_cols = {row[1] for row in cur.execute("PRAGMA table_info(papers);")}
-    for col_name in ["authors", "year"]:
+    for col_name in ["authors", "year", "sha256"]:
         if col_name not in existing_cols:
             cur.execute(f"ALTER TABLE papers ADD COLUMN {col_name} TEXT;")
 
@@ -123,6 +123,7 @@ def upsert_paper(
     title: Optional[str] = None,
     authors: Optional[str] = None,
     year: Optional[str] = None,
+    sha256: Optional[str] = None,
 ) -> int:
     """Insert the paper if new, returning its id."""
     cur = conn.cursor()
@@ -132,12 +133,13 @@ def upsert_paper(
         paper_id = row["id"]
     else:
         cur.execute(
-            "INSERT INTO papers (filename, title, authors, year, added_at) VALUES (?,?,?,?,?)",
+            "INSERT INTO papers (filename, title, authors, year, sha256, added_at) VALUES (?,?,?,?,?,?)",
             (
                 filename,
                 title or filename,
                 authors,
                 year,
+                sha256,
                 datetime.utcnow().isoformat(),
             ),
         )
@@ -145,15 +147,16 @@ def upsert_paper(
         conn.commit()
 
     # If new metadata arrives later, update row.
-    cur.execute("SELECT title, authors, year FROM papers WHERE id = ?", (paper_id,))
+    cur.execute("SELECT title, authors, year, sha256 FROM papers WHERE id = ?", (paper_id,))
     current = cur.fetchone()
     updated_vals = {
         "title": title or current["title"],
         "authors": authors or current["authors"],
         "year": year or current["year"],
+        "sha256": sha256 or current["sha256"],
     }
     cur.execute(
-        "UPDATE papers SET title = :title, authors = :authors, year = :year WHERE id = :pid",
+        "UPDATE papers SET title = :title, authors = :authors, year = :year, sha256 = :sha256 WHERE id = :pid",
         {**updated_vals, "pid": paper_id},
     )
     conn.commit()
@@ -169,6 +172,14 @@ def replace_chunks(conn: sqlite3.Connection, paper_id: int, chunks: List[str]) -
         [(paper_id, i, chunk) for i, chunk in enumerate(chunks)],
     )
     conn.commit()
+
+
+def check_paper_by_sha256(conn: sqlite3.Connection, sha256: str) -> Optional[dict]:
+    """Check if a paper with the given SHA256 hash already exists."""
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM papers WHERE sha256 = ?", (sha256,))
+    row = cur.fetchone()
+    return dict(row) if row else None
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +241,34 @@ def get_filenames_for_collection(conn: sqlite3.Connection, collection_id: int):
         (collection_id,),
     )
     return {row[0] for row in cur.fetchall()}  # set of filenames
+
+
+def rename_collection(conn: sqlite3.Connection, collection_id: int, new_name: str) -> None:
+    """Rename a collection by ID."""
+    cur = conn.cursor()
+    cur.execute("UPDATE collections SET name = ? WHERE id = ?", (new_name, collection_id))
+    if cur.rowcount == 0:
+        raise ValueError(f"Collection with ID {collection_id} not found")
+    conn.commit()
+
+
+def delete_collection(conn: sqlite3.Connection, collection_id: int) -> None:
+    """Delete a collection by ID. Papers are removed from collection but not deleted."""
+    cur = conn.cursor()
+    cur.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
+    if cur.rowcount == 0:
+        raise ValueError(f"Collection with ID {collection_id} not found")
+    conn.commit()
+
+
+def remove_papers_from_collection(conn: sqlite3.Connection, collection_id: int, paper_ids: list[int]) -> None:
+    """Remove specific papers from a collection."""
+    cur = conn.cursor()
+    cur.executemany(
+        "DELETE FROM collection_papers WHERE collection_id = ? AND paper_id = ?",
+        [(collection_id, pid) for pid in paper_ids],
+    )
+    conn.commit()
 
 
 def upsert_paper_embedding(conn: sqlite3.Connection, paper_id: int, vector: "np.ndarray") -> None:  # type: ignore[name-defined]
