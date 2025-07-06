@@ -8,6 +8,61 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { useState, useEffect } from "react";
+import { Document, Page, pdfjs } from "react-pdf";
+// Import react-pdf CSS to fix TextLayer warning
+import "react-pdf/dist/Page/AnnotationLayer.css";
+import "react-pdf/dist/Page/TextLayer.css";
+
+// Configure pdf.js worker (same as PdfModal)
+pdfjs.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.js`;
+
+// Base backend URL for PDF serving
+const API_BASE = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
+
+// PDF Peek Component
+function PdfPeek({ source, page, onClose }: { source: string; page?: number; onClose: () => void }) {
+  const pdfUrl = `${API_BASE}/papers/${source}`;
+  
+  return (
+    <>
+      {/* Backdrop */}
+      <div 
+        className="fixed inset-0 z-40 bg-black/20"
+        onClick={onClose}
+      />
+      {/* PDF Preview */}
+      <div 
+        className="fixed z-50 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg shadow-xl p-4 max-w-md"
+        style={{ 
+          left: '50%', 
+          top: '50%', 
+          transform: 'translate(-50%, -50%)',
+          pointerEvents: 'auto'
+        }}
+        onMouseLeave={onClose}
+        onMouseEnter={(e) => e.stopPropagation()}
+      >
+        <div className="flex justify-between items-center mb-2">
+          <span className="text-sm font-medium truncate">{source}</span>
+          {page && <span className="text-xs text-gray-500 ml-2">p.{page}</span>}
+        </div>
+        <div className="w-64 h-80 overflow-hidden">
+          <Document
+            file={pdfUrl}
+            loading={<div className="p-4 text-sm">Loading PDF preview...</div>}
+            error={<div className="p-4 text-sm text-red-500">Failed to load PDF</div>}
+          >
+            <Page 
+              pageNumber={page || 1} 
+              width={256}
+              className="border"
+            />
+          </Document>
+        </div>
+      </div>
+    </>
+  );
+}
 
 export default function InsightModal() {
   const { modalInsight, setModalInsight, updateInsightTitle, updateInsightText } = useInsightsStore((s) => ({
@@ -25,6 +80,8 @@ export default function InsightModal() {
 
   const [isEditingText, setIsEditingText] = useState(false);
   const [draftText, setDraftText] = useState(modalInsight?.text ?? "");
+
+  const [pdfPeek, setPdfPeek] = useState<{ source: string; page?: number } | null>(null);
 
   // Place mutation hook before potential early return so the hooks order remains stable
   const deleteMutation = useMutation<void, Error, string>({
@@ -203,20 +260,45 @@ export default function InsightModal() {
               {sourceItems.map(({ cit: c, ctx }, idx) => {
                 return (
                   <div key={idx} className="space-y-1">
-                    <div className="flex items-center gap-1">
+                    <div className="flex items-center gap-1 relative">
                       <h4 className="text-sm font-medium truncate flex-1" title={formatCitation(c)}>
                         {formatCitation(c)}
                       </h4>
                       {(c as any).source && (
-                        <button
-                          className="inline-flex w-4 h-4 p-0 align-baseline items-center justify-center"
-                          onClick={() => {
-                            /* Could open PDF preview if desired */
-                          }}
-                          title="Preview"
-                        >
-                          <MagnifyIcon className="w-4 h-4" />
-                        </button>
+                        <div className="relative">
+                          <button
+                            className="inline-flex w-4 h-4 p-0 align-baseline items-center justify-center hover:bg-gray-200 dark:hover:bg-gray-600 rounded"
+                            onMouseEnter={(e) => {
+                              console.log('Mouse enter on magnify button for:', (c as any).source);
+                              setPdfPeek({ 
+                                source: (c as any).source, 
+                                page: (c as any).page 
+                              });
+                            }}
+                            onMouseLeave={(e) => {
+                              console.log('Mouse leave on magnify button');
+                              // Add a small delay to prevent flickering
+                              setTimeout(() => {
+                                if (pdfPeek && pdfPeek.source === (c as any).source) {
+                                  setPdfPeek(null);
+                                }
+                              }, 100);
+                            }}
+                            title="PDF Preview"
+                          >
+                            <MagnifyIcon className="w-4 h-4" />
+                          </button>
+                          {pdfPeek && pdfPeek.source === (c as any).source && (
+                            <PdfPeek 
+                              source={pdfPeek.source} 
+                              page={pdfPeek.page}
+                              onClose={() => {
+                                console.log('Closing PDF peek');
+                                setPdfPeek(null);
+                              }}
+                            />
+                          )}
+                        </div>
                       )}
                     </div>
                     {ctx && (

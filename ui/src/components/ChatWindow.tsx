@@ -27,6 +27,8 @@ import { useUIStore } from "../store/ui";
 
 export default function ChatWindow() {
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  // Ref for the chat input to allow auto-focus when the Chat tab becomes active
+  const inputRef = useRef<HTMLInputElement | null>(null);
   const {
     history,
     addMessage,
@@ -173,6 +175,8 @@ export default function ChatWindow() {
     addMessage({ role: "user", content: trimmed });
     scrollToBottom();
     setInput("");
+    // Return focus to the input so the user can continue typing seamlessly
+    inputRef.current?.focus();
     setSending(true);
 
     try {
@@ -193,6 +197,12 @@ export default function ChatWindow() {
       scrollToBottom();
     }
   };
+
+  // ───────────────────────────────────────── Auto-focus on mount ──
+  useEffect(() => {
+    // Focus the chat input once the component mounts / tab becomes active
+    inputRef.current?.focus();
+  }, []);
 
   // Helper: convert Markdown → safe HTML
   const toHtml = (md: string): string => {
@@ -492,6 +502,7 @@ export default function ChatWindow() {
             }
           }}
           disabled={isSending}
+          ref={inputRef}
         />
 
         <button
