@@ -167,7 +167,7 @@ class RAGChat:
     # ---------------------------------------------------------------------
     # Public interface
     # ---------------------------------------------------------------------
-    def chat(self, query: str, history: List[dict], *, window_size: int = 6) -> str:
+    def chat(self, query: str, history: List[dict], *, window_size: int = 6, system_prompt: Optional[str] = None) -> str:
         """Answer *query* using retrieved context plus a sliding window of past contexts.
 
         1. Collect contexts attached to the last *window_size* messages in *history*.
@@ -219,7 +219,8 @@ class RAGChat:
         # ------------------------------------------------------------------
         # Build LLM prompt including conversation summary window (optional)
         # ------------------------------------------------------------------
-        system_prompt = (
+        # Allow overriding the default system prompt supplied by callers (e.g. via UI settings).
+        system_prompt = system_prompt or (
             "You are an expert research assistant. "
             "Answer the user based solely on the given context."
         )
