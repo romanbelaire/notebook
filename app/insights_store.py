@@ -126,6 +126,47 @@ class InsightsStore:
 
         self._save()
 
+    def update_insight(
+        self,
+        insight_id: str,
+        text: Optional[str] = None,
+        contexts: Optional[List[str]] = None,
+        *,
+        title: Optional[str] = None,
+    ) -> None:
+        """Update text/title/contexts of an insight and rebuild index if text changed."""
+
+        idx = next((i for i, d in enumerate(self._insights) if d["id"] == insight_id), None)
+        if idx is None:
+            raise KeyError(f"Insight id '{insight_id}' not found.")
+
+        insight_dict = self._insights[idx]
+
+        changed_text = False
+
+        if text is not None and text.strip() and text.strip() != insight_dict["text"]:
+            insight_dict["text"] = text.strip()
+            changed_text = True
+
+        if title is not None and title.strip() and title.strip() != insight_dict["title"]:
+            insight_dict["title"] = title.strip()[:100]
+
+        if contexts is not None:
+            # Keep at most 2 contexts to stay consistent with add_insight
+            insight_dict["contexts"] = contexts[:2]
+
+        # Overwrite existing record
+        self._insights[idx] = insight_dict
+
+        # Rebuild FAISS index if text has changed to keep embeddings in sync
+        if changed_text and self._insights:
+            embs = np.array([self._embedding_model.encode(d["text"]) for d in self._insights]).astype("float32")
+            dim = embs.shape[1]
+            self._index = faiss.IndexFlatL2(dim)
+            self._index.add(embs)
+
+        self._save()
+
     def search(self, query: str, k: int = 5) -> List[Tuple[Dict[str, Any], float]]:
         """Return up to *k* insights most relevant to *query* along with their distances."""
         if self._index is None or not self._insights:

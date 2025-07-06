@@ -10,5 +10,7 @@ python-dotenv==1.0.0
 Pillow==10.3.0
 transformers==4.43.1
 PyMuPDF==1.24.2
-streamlit-quill==0.0.7
-markdownify==0.11.6 
+streamlit-quill==0.0.3
+markdownify==0.11.6
+fastapi==0.111.0
+uvicorn[standard]==0.29.0 
