@@ -9,17 +9,11 @@ const queryClient = new QueryClient()
 
 const root = createRoot(document.getElementById('root')!);
 
-// Poly-fill findDOMNode *after* createRoot (React 18 disables it during concurrent roots)
-if (!(ReactDOM as any).findDOMNode) {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (ReactDOM as any).findDOMNode = (inst: any) =>
-    inst && typeof inst === 'object' && 'current' in inst ? inst.current : inst;
-}
-
-// Ensure polyfill is present on possible nested default export used by some bundlers
-if ((ReactDOM as any).default && !(ReactDOM as any).default.findDOMNode) {
-  (ReactDOM as any).default.findDOMNode = (ReactDOM as any).findDOMNode;
-}
+// React 18 still exposes `findDOMNode`; if it is unavailable (e.g.
+// future React versions), third-party libraries that rely on it will break
+// at runtime. We no longer attempt to monkey-patch the import namespace because
+// ESBuild treats namespace objects as immutable. If a library strictly requires
+// `findDOMNode`, switch to a legacy root or upgrade the library.
 
 root.render(
   <QueryClientProvider client={queryClient}>

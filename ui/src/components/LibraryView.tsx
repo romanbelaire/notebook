@@ -11,7 +11,6 @@ import {
   removeFromCollection as apiRemoveFromCollection,
   renameCollection as apiRenameCollection,
   removeCollection as apiRemoveCollection,
-  clearDatabase,
 } from "../api";
 import type { Paper, Collection, Insight } from "../api";
 import PlusIcon from "../assets/plus.svg?react";
@@ -20,6 +19,7 @@ import CloseIcon from "../assets/close.svg?react";
 import MagnifyIcon from "../assets/magnify.svg?react";
 import BookIcon from "../assets/book.svg?react";
 import PencilIcon from "../assets/pencil.svg?react";
+import PdfModal from "./PdfModal";
 import { useUIStore } from "../store/ui";
 import { useInsightsStore } from "../store/insights";
 
@@ -34,32 +34,34 @@ export default function LibraryView() {
   // Local UI state
   const [selectedPapers, setSelectedPapers] = useState<Set<number>>(new Set());
   const [selectedInsights, setSelectedInsights] = useState<Set<string>>(new Set());
-  const [newCollName, setNewCollName] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedCollId, setSelectedCollId] = useState<number | null>(null);
-  const newCollInputRef = useRef<HTMLInputElement | null>(null);
   const [showCollDropdown, setShowCollDropdown] = useState(false);
   const [editingCollName, setEditingCollName] = useState(false);
   const [newCollectionName, setNewCollectionName] = useState("");
   const [deleteConfirmColl, setDeleteConfirmColl] = useState(false);
   const dropdownRef = useRef<HTMLDivElement | null>(null);
 
-  // Focus management: if ChatWindow requested focusing this input, do so
-  const focusNewCollection = useUIStore((s) => s.focusNewCollection);
-  const clearFocusNewCollection = useUIStore((s) => s.clearFocusNewCollection);
+  // Modal state for creating new collection
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [modalCollectionName, setModalCollectionName] = useState("");
 
   // Modal setter for insights
   const setModalInsight = useInsightsStore((s) => s.setModalInsight);
 
+  // PDF viewer state
+  const [pdfViewer, setPdfViewer] = useState<{ filename: string; page?: number } | null>(null);
+
+  // Focus management: if ChatWindow requested focusing this input, open modal instead
+  const focusNewCollection = useUIStore((s) => s.focusNewCollection);
+  const clearFocusNewCollection = useUIStore((s) => s.clearFocusNewCollection);
+
   useEffect(() => {
     if (focusNewCollection) {
-      // Give the DOM a tick to ensure the input is rendered
-      setTimeout(() => {
-        newCollInputRef.current?.focus();
-      }, 0);
+      setShowCreateModal(true);
       clearFocusNewCollection();
     }
-  }, [focusNewCollection]);
+  }, [focusNewCollection, clearFocusNewCollection]);
 
   // Close dropdown when clicking outside
   useEffect(() => {
@@ -100,13 +102,16 @@ export default function LibraryView() {
     ? new Set(currentCollection.papers.map((p) => p.id))
     : null;
 
-  // Apply collection and search filtering
+  // Get collection contents for dedicated section
+  const collectionPapers = currentCollection && currentCollection.papers ? currentCollection.papers : [];
+  const collectionPaperFiles = collectionPapers.filter((p) => !/\.(md|markdown|txt|docx)$/i.test(p.filename));
+  const collectionNoteFiles = collectionPapers.filter((p) => /\.(md|markdown|txt|docx)$/i.test(p.filename));
+
+  // Apply search filtering only (no collection filtering for main sections when collection is selected)
   const filteredPaperFiles = paperFiles
-    .filter(p => !collectionPaperIds || collectionPaperIds.has(p.id))
     .filter(p => matchesSearch(p.title) || matchesSearch(p.filename));
   
   const filteredNoteFiles = noteFiles
-    .filter(p => !collectionPaperIds || collectionPaperIds.has(p.id))
     .filter(p => matchesSearch(p.title) || matchesSearch(p.filename));
     
   const filteredInsights = (insights ?? []).filter((ins) => matchesSearch(ins.title) || matchesSearch(ins.text));
@@ -144,13 +149,31 @@ export default function LibraryView() {
     mutationFn: apiCreateCollection,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["collections"] });
-      setNewCollName("");
+    },
+  });
+
+  // Create collection and add selected papers
+  const createCollectionAndAddMut = useMutation<Collection, Error, string>({
+    mutationFn: apiCreateCollection,
+    onSuccess: (newCollection) => {
+      queryClient.invalidateQueries({ queryKey: ["collections"] });
+      setModalCollectionName("");
+      setShowCreateModal(false);
+      
+      // If there are selected papers, add them to the new collection
+      if (selectedPapers.size > 0) {
+        addMut.mutate({ 
+          collId: newCollection.id, 
+          paperIds: Array.from(selectedPapers) 
+        });
+      }
     },
   });
 
   const addMut = useMutation<void, Error, { collId: number; paperIds: number[] }>({
     mutationFn: ({ collId, paperIds }) => apiAddToCollection(collId, paperIds),
     onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["collections"] });
       setSelectedPapers(new Set());
     },
   });
@@ -214,24 +237,7 @@ export default function LibraryView() {
     }
   }, [anySelected]);
 
-  // ------------------------------------------------------------------
-  // Debug: Clear database (dangerous!)
-  // ------------------------------------------------------------------
 
-  const [clearDbConfirm, setClearDbConfirm] = useState(false);
-
-  const clearDbMutation = useMutation<void, Error, void>({
-    mutationFn: clearDatabase,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["papers"] });
-      queryClient.invalidateQueries({ queryKey: ["collections"] });
-      queryClient.invalidateQueries({ queryKey: ["insights"] });
-      setSelectedPapers(new Set());
-      setSelectedInsights(new Set());
-      setSelectedCollId(null);
-      setClearDbConfirm(false);
-    },
-  });
 
   return (
     <div className="p-8 overflow-y-auto">
@@ -301,14 +307,25 @@ export default function LibraryView() {
             <div className="relative">
                 <button
                   className="bg-buttonBg text-defaultText px-3 py-1 rounded disabled:opacity-50 "
-                  disabled={selectedPapers.size === 0 || addMut.isPending || !collections?.length}
+                  disabled={selectedPapers.size === 0 || addMut.isPending}
                   onClick={() => setShowAddMenu((prev) => !prev)}
                 >
                   <PlusIcon className="w-4 h-4" />
                 </button>
-                {showAddMenu && collections && (
+                {showAddMenu && (
                   <ul className="absolute mt-1 right-0 bg-primaryBg border border-trim/40 rounded shadow-lg z-30 min-w-[10rem]">
-                    {collections.map((c) => (
+                    <li key="add-new">
+                      <button
+                        className="w-full text-left px-3 py-1 hover:bg-trim/20 border-b border-trim/20"
+                        onClick={() => {
+                          setShowAddMenu(false);
+                          setShowCreateModal(true);
+                        }}
+                      >
+                        + Add New Collection
+                      </button>
+                    </li>
+                    {collections && collections.map((c) => (
                       <li key={c.id}>
                         <button
                           className="w-full text-left px-3 py-1 hover:bg-trim/20"
@@ -357,6 +374,36 @@ export default function LibraryView() {
                   <TrashIcon className="w-4 h-4" />
                 </button>
               )}
+
+              {/* PDF Viewer Button */}
+              <button
+                className="bg-buttonBg text-defaultText px-3 py-1 rounded disabled:opacity-50"
+                disabled={(() => {
+                  // Find first selected PDF
+                  const selectedPdfIds = Array.from(selectedPapers).filter(id => {
+                    const paper = paperFiles.find(p => p.id === id);
+                    return paper && paper.filename.toLowerCase().endsWith('.pdf');
+                  });
+                  return selectedPdfIds.length === 0;
+                })()}
+                onClick={() => {
+                  // Find first selected PDF and open it
+                  const selectedPdfIds = Array.from(selectedPapers).filter(id => {
+                    const paper = paperFiles.find(p => p.id === id);
+                    return paper && paper.filename.toLowerCase().endsWith('.pdf');
+                  });
+                  if (selectedPdfIds.length > 0) {
+                    const firstPdfId = selectedPdfIds[0];
+                    const paper = paperFiles.find(p => p.id === firstPdfId);
+                    if (paper) {
+                      setPdfViewer({ filename: paper.filename });
+                    }
+                  }
+                }}
+                title="View PDF"
+              >
+                <MagnifyIcon className="w-5 h-5" />
+              </button>
           </div>
 
           {/* Collection header is now rendered inside inner list below */}
@@ -450,20 +497,156 @@ export default function LibraryView() {
               </div>
             )}
 
-            {/* Papers Section */}
+            {/* Collection Contents Section - shown only when viewing a collection */}
+            {selectedCollId && currentCollection && (
+              <section>
+                <h3 className="font-medium mb-2 text-lg border-b border-trim/20 pb-1">
+                  Collection Contents ({collectionPapers.length} documents)
+                </h3>
+                {collectionPapers.length > 0 ? (
+                  <div className="space-y-3">
+                    {/* Papers in Collection */}
+                    {collectionPaperFiles.length > 0 && (
+                      <div>
+                        <h4 className="font-medium text-sm text-gray-400 mb-1">Papers ({collectionPaperFiles.length})</h4>
+                        <ul className="space-y-1 ml-2">
+                          {collectionPaperFiles.map((p) => (
+                            <li key={p.id} className="flex items-center gap-2">
+                              <input 
+                                type="checkbox" 
+                                checked={selectedPapers.has(p.id)} 
+                                onChange={() => {
+                                  // Unchecking removes from collection
+                                  if (selectedPapers.has(p.id)) {
+                                    removeFromCollMutation.mutate({ 
+                                      collId: selectedCollId, 
+                                      paperIds: [p.id] 
+                                    });
+                                  }
+                                  toggleSelectPaper(p.id);
+                                }} 
+                              />
+                              <span className="truncate" title={p.filename}>
+                                {p.title ? `${p.title} (${p.filename})` : p.filename}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    
+                    {/* Notes in Collection */}
+                    {collectionNoteFiles.length > 0 && (
+                      <div>
+                        <h4 className="font-medium text-sm text-gray-400 mb-1">Notes ({collectionNoteFiles.length})</h4>
+                        <ul className="space-y-1 ml-2">
+                          {collectionNoteFiles.map((p) => (
+                            <li key={p.id} className="flex items-center gap-2">
+                              <input 
+                                type="checkbox" 
+                                checked={selectedPapers.has(p.id)} 
+                                onChange={() => {
+                                  // Unchecking removes from collection
+                                  if (selectedPapers.has(p.id)) {
+                                    removeFromCollMutation.mutate({ 
+                                      collId: selectedCollId, 
+                                      paperIds: [p.id] 
+                                    });
+                                  }
+                                  toggleSelectPaper(p.id);
+                                }} 
+                              />
+                              <span className="truncate" title={p.filename}>
+                                {p.title ? `${p.title} (${p.filename})` : p.filename}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-sm text-gray-500">This collection is empty.</p>
+                )}
+              </section>
+            )}
+
+            {/* Select All Section */}
+            <section>
+              <div className="flex items-center gap-2 mb-4 pb-2 border-b border-trim/20">
+                <input
+                  type="checkbox"
+                  checked={(() => {
+                    const allVisibleDocuments = [
+                      ...filteredPaperFiles.map(p => p.id),
+                      ...filteredNoteFiles.map(p => p.id)
+                    ];
+                    const allVisibleInsights = filteredInsights.map(i => i.id);
+                    
+                    // If no documents to select, return false
+                    if (allVisibleDocuments.length === 0 && allVisibleInsights.length === 0) {
+                      return false;
+                    }
+                    
+                    // Check if all are selected
+                    const allPapersSelected = allVisibleDocuments.every(id => selectedPapers.has(id));
+                    const allInsightsSelected = allVisibleInsights.every(id => selectedInsights.has(id));
+                    
+                    return allPapersSelected && allInsightsSelected;
+                  })()}
+                  ref={(el) => {
+                    if (el) {
+                      const allVisibleDocuments = [
+                        ...filteredPaperFiles.map(p => p.id),
+                        ...filteredNoteFiles.map(p => p.id)
+                      ];
+                      const allVisibleInsights = filteredInsights.map(i => i.id);
+                      
+                      const selectedPaperCount = allVisibleDocuments.filter(id => selectedPapers.has(id)).length;
+                      const selectedInsightCount = allVisibleInsights.filter(id => selectedInsights.has(id)).length;
+                      const totalSelected = selectedPaperCount + selectedInsightCount;
+                      const totalVisible = allVisibleDocuments.length + allVisibleInsights.length;
+                      
+                      // Set indeterminate state if partially selected
+                      el.indeterminate = totalSelected > 0 && totalSelected < totalVisible;
+                    }
+                  }}
+                  onChange={() => {
+                    const allVisibleDocuments = [
+                      ...filteredPaperFiles.map(p => p.id),
+                      ...filteredNoteFiles.map(p => p.id)
+                    ];
+                    const allVisibleInsights = filteredInsights.map(i => i.id);
+                    
+                    // Check current state
+                    const allPapersSelected = allVisibleDocuments.every(id => selectedPapers.has(id));
+                    const allInsightsSelected = allVisibleInsights.every(id => selectedInsights.has(id));
+                    const allSelected = allPapersSelected && allInsightsSelected;
+                    
+                    if (allSelected) {
+                      // Unselect all
+                      setSelectedPapers(new Set());
+                      setSelectedInsights(new Set());
+                    } else {
+                      // Select all
+                      setSelectedPapers(new Set(allVisibleDocuments));
+                      setSelectedInsights(new Set(allVisibleInsights));
+                    }
+                  }}
+                />
+                <span className="font-medium text-sm">
+                  Select All ({filteredPaperFiles.length + filteredNoteFiles.length + filteredInsights.length} items)
+                </span>
+              </div>
+            </section>
+
+            {/* Papers Section - All Papers */}
             <section>
               <button
                 className="font-medium mb-2 flex items-center gap-1 bg-transparent border-0 p-0 hover:bg-transparent focus:outline-none"
                 onClick={() => toggleCollapse("papers")}
               >
-                <span>{collapsed.papers ? "▶" : "▼"}</span> Papers 
-                {currentCollection ? (
-                  <span className="text-gray-500 text-sm font-normal ml-1">
-                    ({filteredPaperFiles.length} in collection)
-                  </span>
-                ) : (
-                  <span>({filteredPaperFiles.length})</span>
-                )}
+                <span>{collapsed.papers ? "▶" : "▼"}</span> {selectedCollId ? "All Papers" : "Papers"} ({filteredPaperFiles.length})
               </button>
               {!collapsed.papers && (
                 filteredPaperFiles.length > 0 ? (
@@ -473,18 +656,7 @@ export default function LibraryView() {
                         <input 
                           type="checkbox" 
                           checked={selectedPapers.has(p.id)} 
-                          onChange={() => {
-                            if (selectedCollId) {
-                              // If viewing a collection, unchecking removes from collection
-                              if (selectedPapers.has(p.id)) {
-                                removeFromCollMutation.mutate({ 
-                                  collId: selectedCollId, 
-                                  paperIds: [p.id] 
-                                });
-                              }
-                            }
-                            toggleSelectPaper(p.id);
-                          }} 
+                          onChange={() => toggleSelectPaper(p.id)} 
                         />
                         <span className="truncate" title={p.filename}>
                           {p.title ? `${p.title} (${p.filename})` : p.filename}
@@ -498,20 +670,13 @@ export default function LibraryView() {
               )}
             </section>
 
-            {/* Notes Section */}
+            {/* Notes Section - All Notes */}
             <section>
               <button
                 className="font-medium mb-2 flex items-center gap-1 bg-transparent border-0 p-0 hover:bg-transparent focus:outline-none"
                 onClick={() => toggleCollapse("notes")}
               >
-                <span>{collapsed.notes ? "▶" : "▼"}</span> Notes 
-                {currentCollection ? (
-                  <span className="text-gray-500 text-sm font-normal ml-1">
-                    ({filteredNoteFiles.length} in collection)
-                  </span>
-                ) : (
-                  <span>({filteredNoteFiles.length})</span>
-                )}
+                <span>{collapsed.notes ? "▶" : "▼"}</span> {selectedCollId ? "All Notes" : "Notes"} ({filteredNoteFiles.length})
               </button>
               {!collapsed.notes && (
                 filteredNoteFiles.length > 0 ? (
@@ -521,18 +686,7 @@ export default function LibraryView() {
                         <input 
                           type="checkbox" 
                           checked={selectedPapers.has(p.id)} 
-                          onChange={() => {
-                            if (selectedCollId) {
-                              // If viewing a collection, unchecking removes from collection
-                              if (selectedPapers.has(p.id)) {
-                                removeFromCollMutation.mutate({ 
-                                  collId: selectedCollId, 
-                                  paperIds: [p.id] 
-                                });
-                              }
-                            }
-                            toggleSelectPaper(p.id);
-                          }}
+                          onChange={() => toggleSelectPaper(p.id)}
                         />
                         <span className="truncate" title={p.filename}>
                           {p.title ? `${p.title} (${p.filename})` : p.filename}
@@ -587,61 +741,64 @@ export default function LibraryView() {
             </section>
           </div>
         </div>
-
-        {/* Collection management */}
-        {/* Create collection */}
-        <section>
-          <h3 className="font-medium mb-1">Create Collection</h3>
-          <div className="flex gap-2">
-            <input
-              ref={newCollInputRef}
-              className="flex-1 border rounded px-2 py-1 bg-primaryBg text-defaultText border-primaryBg shadow-inner"
-              value={newCollName}
-              onChange={(e) => setNewCollName(e.target.value)}
-            />
-            <button
-              className="bg-buttonBg text-defaultText px-3 py-1 rounded disabled:opacity-50 border border-primaryBg"
-              disabled={!newCollName.trim() || createCollectionMut.isPending}
-              onClick={() => createCollectionMut.mutate(newCollName.trim())}
-            >
-              Create
-            </button>
-          </div>
-        </section>
       </div> {/* end background card */}
 
-      {/* ---------------------------------------------------------------- */}
-      {/* Debug utilities                                                */}
-      {/* ---------------------------------------------------------------- */}
+      {/* PDF Modal */}
+      {pdfViewer && (
+        <PdfModal
+          filename={pdfViewer.filename}
+          initialPage={pdfViewer.page}
+          onClose={() => setPdfViewer(null)}
+        />
+      )}
 
-      <div className="bg-secondaryBg rounded-lg p-8 mt-6 space-y-4">
-        <h3 className="font-medium">Debug</h3>
-        {clearDbConfirm ? (
-          <div className="flex items-center gap-2">
-            <button
-              className="px-3 py-1 rounded bg-[#db363c]/50 hover:bg-[#db363c] text-xs"
-              disabled={clearDbMutation.isPending}
-              onClick={() => clearDbMutation.mutate()}
-            >
-              Confirm Clear DB
-            </button>
-            <button
-              className="w-7 h-7 p-0 flex items-center justify-center rounded hover:bg-white/10"
-              onClick={() => setClearDbConfirm(false)}
-            >
-              <CloseIcon className="w-4 h-4" />
-            </button>
+      {/* Create Collection Modal */}
+      {showCreateModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-primaryBg rounded-lg p-6 w-96 max-w-[90vw]">
+            <h3 className="font-medium mb-4 text-lg">Create New Collection</h3>
+            <div className="space-y-4">
+              <input
+                type="text"
+                placeholder="Collection name..."
+                className="w-full border rounded px-3 py-2 bg-secondaryBg text-defaultText border-trim/40 focus:outline-none focus:border-trim"
+                value={modalCollectionName}
+                onChange={(e) => setModalCollectionName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && modalCollectionName.trim()) {
+                    createCollectionAndAddMut.mutate(modalCollectionName.trim());
+                  } else if (e.key === 'Escape') {
+                    setShowCreateModal(false);
+                    setModalCollectionName("");
+                  }
+                }}
+                autoFocus
+              />
+              <div className="flex gap-2 justify-end">
+                <button
+                  className="px-4 py-2 rounded bg-buttonBg text-defaultText hover:bg-buttonBg/80"
+                  onClick={() => {
+                    setShowCreateModal(false);
+                    setModalCollectionName("");
+                  }}
+                  disabled={createCollectionAndAddMut.isPending}
+                >
+                  Cancel
+                </button>
+                <button
+                  className="px-4 py-2 rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+                  disabled={!modalCollectionName.trim() || createCollectionAndAddMut.isPending}
+                  onClick={() => createCollectionAndAddMut.mutate(modalCollectionName.trim())}
+                >
+                  {createCollectionAndAddMut.isPending ? "Creating..." : "Create"}
+                </button>
+              </div>
+            </div>
           </div>
-        ) : (
-          <button
-            className="px-3 py-1 rounded bg-buttonBg text-defaultText disabled:opacity-50"
-            disabled={clearDbMutation.isPending}
-            onClick={() => setClearDbConfirm(true)}
-          >
-            Clear Database
-          </button>
-        )}
-      </div>
+        </div>
+      )}
+
+
     </div>
   );
 } 
