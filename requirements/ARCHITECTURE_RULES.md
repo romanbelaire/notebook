@@ -1,0 +1,501 @@
+# Architecture Rules for UI Development
+
+## Core Principle: Modular, Encapsulated, Plan for Unknowns
+
+### Rule 1: Component-Based Renderables
+
+**Every UI element must be a self-contained, composable renderable.**
+
+#### Definition
+A **Renderable** is a self-contained component that:
+- Knows how to render itself
+- Manages its own layout
+- Handles its own hit testing
+- Can contain other renderables (composition)
+- Is initialized with data, not hardcoded state
+
+#### Pattern
+
+```rust
+pub trait Renderable {
+    /// Render this component to vertices
+    fn render(&self, renderer: &mut Renderer, vertices: &mut Vec<Vertex>);
+    
+    /// Get the bounding rectangle of this component
+    fn bounds(&self) -> Rect;
+    
+    /// Handle hit testing
+    fn hit_test(&self, point: Vec2) -> Option<HitResult>;
+    
+    /// Update layout based on parent constraints
+    fn update_layout(&mut self, available_rect: Rect);
+}
+```
+
+#### Example: Bad (Non-Modular)
+
+```rust
+// BAD: Sidebar hardcodes all its content
+struct Sidebar {
+    pub conversations: Vec<Conversation>,
+    pub documents: Vec<Document>,
+    pub insights: Vec<Insight>,
+    // ... specific rendering logic for each
+}
+
+impl Sidebar {
+    fn render(&self) {
+        // Hardcoded Y positions
+        let y1 = 0.0;
+        let y2 = 300.0;
+        let y3 = 600.0;
+        
+        // Specific rendering for each type
+        render_conversations(&self.conversations, y1);
+        render_documents(&self.documents, y2);
+        render_insights(&self.insights, y3);
+    }
+}
+```
+
+**Problems:**
+- Can't add new sections without modifying Sidebar
+- Layout is hardcoded
+- Not reusable
+- Tightly coupled
+
+#### Example: Good (Modular)
+
+```rust
+// GOOD: Sidebar accepts any renderables
+struct Sidebar {
+    pub children: Vec<Box<dyn Renderable>>,
+    pub layout_direction: Direction,
+    pub spacing: f32,
+}
+
+impl Sidebar {
+    fn new(children: Vec<Box<dyn Renderable>>) -> Self {
+        Self {
+            children,
+            layout_direction: Direction::Vertical,
+            spacing: 16.0,
+        }
+    }
+    
+    fn render(&self, renderer: &mut Renderer, vertices: &mut Vec<Vertex>) {
+        for child in &self.children {
+            child.render(renderer, vertices);
+        }
+    }
+}
+
+// Initialize with composition
+let sidebar = Sidebar::new(vec![
+    Box::new(SectionTitle::new("Conversations")),
+    Box::new(ScrollableList::new(conversations)),
+    Box::new(SectionTitle::new("Documents")),
+    Box::new(ScrollableList::new(documents)),
+    Box::new(SectionTitle::new("Insights")),
+    Box::new(InsightsList::new(insights)),
+]);
+```
+
+**Benefits:**
+- Add new sections without changing Sidebar
+- Reusable components
+- Automatic layout
+- Loosely coupled
+- Easy to test
+
+### Rule 2: Composition Over Inheritance
+
+**Build complex UIs by composing simple, reusable components.**
+
+#### Container Components
+```rust
+// Vertical stack
+VStack {
+    spacing: 12.0,
+    children: vec![
+        Box::new(Title::new("Settings")),
+        Box::new(Button::new("Save")),
+        Box::new(Button::new("Cancel")),
+    ]
+}
+
+// Horizontal stack
+HStack {
+    spacing: 8.0,
+    alignment: Alignment::Center,
+    children: vec![
+        Box::new(Icon::new("user")),
+        Box::new(Text::new("Profile")),
+    ]
+}
+
+// Scrollable container
+ScrollView {
+    max_height: 300.0,
+    child: Box::new(VStack { /* ... */ })
+}
+```
+
+#### Leaf Components
+```rust
+// Self-contained components
+struct Button {
+    text: String,
+    rect: Rect,
+    on_click: Option<Box<dyn Fn()>>,
+}
+
+struct SectionTitle {
+    text: String,
+    rect: Rect,
+    font_size: f32,
+}
+
+struct ScrollableList<T> {
+    items: Vec<T>,
+    rect: Rect,
+    scroll_offset: f32,
+    render_item: Box<dyn Fn(&T, Rect) -> Box<dyn Renderable>>,
+}
+```
+
+### Rule 3: Data-Driven Initialization
+
+**Never hardcode UI structure. Always initialize from data.**
+
+#### Bad: Hardcoded Structure
+```rust
+struct ChatWindow {
+    // Hardcoded fields for specific UI elements
+    input_field: TextInput,
+    send_button: Button,
+    message_list: ScrollView,
+}
+
+impl ChatWindow {
+    fn new() -> Self {
+        // Hardcoded initialization
+        Self {
+            input_field: TextInput::new(/* hardcoded position */),
+            send_button: Button::new(/* hardcoded position */),
+            message_list: ScrollView::new(/* hardcoded position */),
+        }
+    }
+}
+```
+
+#### Good: Data-Driven Structure
+```rust
+struct Container {
+    children: Vec<Box<dyn Renderable>>,
+    layout: LayoutStrategy,
+}
+
+impl Container {
+    fn new(config: ContainerConfig) -> Self {
+        let mut children = vec![];
+        
+        // Build from configuration
+        for item in config.items {
+            match item {
+                ItemType::Text(text) => children.push(Box::new(Text::new(text))),
+                ItemType::Button(config) => children.push(Box::new(Button::from_config(config))),
+                ItemType::List(items) => children.push(Box::new(List::new(items))),
+            }
+        }
+        
+        Self {
+            children,
+            layout: config.layout_strategy,
+        }
+    }
+}
+
+// Initialize from data
+let chat = Container::new(ContainerConfig {
+    layout_strategy: LayoutStrategy::Vertical,
+    items: vec![
+        ItemType::List(messages),
+        ItemType::Button(ButtonConfig { text: "Send", ... }),
+    ],
+});
+```
+
+### Rule 4: Plan for Unknowns
+
+**Design components to handle unknown/future requirements.**
+
+#### Flexibility Checklist
+- ✅ Can add new component types without modifying existing code?
+- ✅ Can change layout without touching component logic?
+- ✅ Can nest components arbitrarily deep?
+- ✅ Can swap implementations easily?
+- ✅ Can test components in isolation?
+
+#### Extensibility Pattern
+```rust
+// Trait-based extension points
+pub trait Renderable {
+    fn render(&self, ctx: &mut RenderContext);
+}
+
+// Anyone can implement new renderables
+struct CustomWidget {
+    /* ... */
+}
+
+impl Renderable for CustomWidget {
+    fn render(&self, ctx: &mut RenderContext) {
+        // Custom rendering logic
+    }
+}
+
+// Container accepts any Renderable
+struct Container {
+    children: Vec<Box<dyn Renderable>>,
+}
+
+// Custom widget works automatically
+container.add_child(Box::new(CustomWidget { /* ... */ }));
+```
+
+### Rule 5: Encapsulation Boundaries
+
+**Each component manages its own:**
+- Layout
+- State
+- Rendering
+- Hit testing
+- Event handling
+
+**Components should NOT:**
+- Directly access parent state
+- Modify sibling components
+- Depend on global positioning
+- Know about specific ancestors/descendants
+
+#### Good Encapsulation
+```rust
+struct ScrollableList {
+    items: Vec<String>,
+    scroll_offset: f32,
+    rect: Rect,  // My bounds
+}
+
+impl ScrollableList {
+    fn render(&self, ctx: &mut RenderContext) {
+        // Render within my bounds
+        for (i, item) in self.items.iter().enumerate() {
+            let item_y = self.rect.y + (i as f32 * ITEM_HEIGHT) - self.scroll_offset;
+            
+            // Check visibility within MY bounds
+            if item_y >= self.rect.y && item_y <= self.rect.bottom() {
+                ctx.render_text(item, Vec2::new(self.rect.x, item_y));
+            }
+        }
+    }
+    
+    fn handle_scroll(&mut self, delta: f32) {
+        // Manage my own scroll state
+        self.scroll_offset += delta;
+        self.scroll_offset = self.scroll_offset.max(0.0);
+    }
+}
+```
+
+### Rule 6: Declarative Structure
+
+**Describe WHAT the UI should be, not HOW to build it.**
+
+#### Imperative (Bad)
+```rust
+let sidebar = Sidebar::new();
+sidebar.add_title("Conversations");
+let list1 = ScrollableList::new();
+for conv in conversations {
+    list1.add_item(conv);
+}
+sidebar.add_child(list1);
+sidebar.add_title("Documents");
+// ... more imperative steps
+```
+
+#### Declarative (Good)
+```rust
+let sidebar = Sidebar::new(vec![
+    section("Conversations", scrollable_list(conversations)),
+    section("Documents", scrollable_list(documents)),
+    section("Insights", insights_list(insights)),
+]);
+```
+
+Or even better with a builder:
+```rust
+let sidebar = Sidebar::builder()
+    .section("Conversations")
+        .scrollable_list(conversations)
+    .section("Documents")
+        .scrollable_list(documents)
+    .section("Insights")
+        .insights_list(insights)
+    .build();
+```
+
+### Rule 7: Type Safety
+
+**Use the type system to prevent errors at compile time.**
+
+```rust
+// Type-safe layout constraints
+pub struct LayoutConstraints {
+    pub min_width: Option<f32>,
+    pub max_width: Option<f32>,
+    pub min_height: Option<f32>,
+    pub max_height: Option<f32>,
+}
+
+// Type-safe component IDs
+pub struct ComponentId(usize);
+
+// Type-safe hit results
+pub enum HitResult {
+    Button(ComponentId),
+    ListItem(ComponentId, usize),
+    ScrollBar(ComponentId),
+    None,
+}
+```
+
+## Implementation Guidelines
+
+### Creating a New Component
+
+1. **Define the component struct**
+   ```rust
+   pub struct MyComponent {
+       data: ComponentData,
+       rect: Rect,
+       children: Vec<Box<dyn Renderable>>,
+   }
+   ```
+
+2. **Implement Renderable trait**
+   ```rust
+   impl Renderable for MyComponent {
+       fn render(&self, ctx: &mut RenderContext) { /* ... */ }
+       fn bounds(&self) -> Rect { self.rect }
+       fn hit_test(&self, point: Vec2) -> Option<HitResult> { /* ... */ }
+       fn update_layout(&mut self, available: Rect) { /* ... */ }
+   }
+   ```
+
+3. **Add builder for easy construction**
+   ```rust
+   impl MyComponent {
+       pub fn builder() -> MyComponentBuilder { /* ... */ }
+   }
+   ```
+
+4. **Write tests**
+   ```rust
+   #[test]
+   fn test_my_component_layout() {
+       let component = MyComponent::new(/* ... */);
+       assert_eq!(component.bounds().width, 100.0);
+   }
+   ```
+
+### Refactoring Existing Code
+
+1. **Identify hardcoded structures** → Extract to components
+2. **Find manual Y calculations** → Replace with layout containers
+3. **Look for tight coupling** → Introduce interfaces/traits
+4. **Remove global state access** → Pass data through props/config
+
+## Examples
+
+### Before: Monolithic Sidebar
+```rust
+// Tightly coupled, hardcoded
+fn render_sidebar(app: &App, vertices: &mut Vec<Vertex>) {
+    let y1 = 60.0;
+    render_conversations(app, y1, vertices);
+    
+    let y2 = y1 + 300.0;
+    render_documents(app, y2, vertices);
+    
+    let y3 = y2 + 250.0;
+    render_insights(app, y3, vertices);
+}
+```
+
+### After: Composable Sidebar
+```rust
+// Modular, flexible, composable
+let sidebar = VStack::new(vec![
+    Box::new(Section::new(
+        "Conversations",
+        ScrollView::new(conversations, 300.0)
+    )),
+    Box::new(Section::new(
+        "Documents",
+        ScrollView::new(documents, 250.0)
+    )),
+    Box::new(Section::new(
+        "Insights",
+        InsightsList::new(insights)
+    )),
+]);
+
+sidebar.render(renderer, vertices);
+```
+
+## Benefits of This Architecture
+
+1. **Maintainability**: Easy to understand and modify
+2. **Reusability**: Components work anywhere
+3. **Testability**: Test components in isolation
+4. **Flexibility**: Add new features without breaking existing code
+5. **Type Safety**: Compiler catches errors
+6. **Performance**: Only render what's visible
+7. **Scalability**: Handles complex UIs elegantly
+
+## Anti-Patterns to Avoid
+
+❌ **Global state access**
+❌ **Hardcoded positions**
+❌ **Manual Y coordinate calculations**
+❌ **Tight coupling between components**
+❌ **Inheritance hierarchies**
+❌ **Procedural UI construction**
+❌ **Components knowing about their parents**
+❌ **Direct manipulation of siblings**
+
+## References
+
+- React's component model
+- Flutter's widget system
+- SwiftUI's view protocol
+- Elm architecture
+- Immediate mode GUI patterns (with retained state)
+
+## Summary
+
+**Always think:**
+1. **What** components do I need? (not how to position them)
+2. **How** do they compose? (not inheritance)
+3. **What** data drives them? (not hardcoded state)
+4. **How** extensible is this? (plan for unknowns)
+
+**Every UI element should be:**
+- Self-contained
+- Composable
+- Reusable
+- Testable
+- Data-driven
+

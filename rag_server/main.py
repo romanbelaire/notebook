@@ -10,8 +10,9 @@ with the user's code-quality requirement.
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 import json
+import logging
 import uuid
 import hashlib
 import base64
@@ -27,9 +28,25 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
 from app.rag_chat import RAGChat
+from app.retrieval import RetrievalService
+from app.completion_openai import openai_complete
+from app.constellar import (
+    GraphValidationError,
+    TokenLimitExceeded,
+    add_shard as constellar_add_shard,
+    compile as constellar_compile,
+    count_tokens as constellar_count_tokens,
+    create_graph as constellar_create_graph,
+    load_graph as constellar_load_graph,
+    list_graphs as constellar_list_graphs,
+    save_graph as constellar_save_graph,
+    send as constellar_send,
+    set_visibility as constellar_set_visibility,
+)
+from app.constellar.models import ActiveState, ConversationGraph, Shard as ConstellarShard
 from app.task_manager import submit as submit_task, status as task_status, result as task_result, exception as task_exception, get_progress as task_progress
 from app.ingest import ingest_pdfs, ingest_pdfs_with_progress
-from app.insights_store import InsightsStore
+from app.shard_store import ShardStore
 from app.metadata_db import (
     get_connection,
     list_papers,
@@ -47,15 +64,28 @@ from app.metadata_db import (
     check_paper_by_sha256,
 )
 from datetime import datetime
+from contextlib import asynccontextmanager
 import os
+import time
 
 __all__ = ["app"]  # uvicorn entry-point: ``rag_server.main:app``
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    yield
+    # On shutdown: remove unpinned shards and rebuild FAISS index
+    try:
+        _get_shard_store().cleanup_unpinned()
+    except Exception as e:
+        print(f"Shard store cleanup on shutdown: {e}")
+
 
 # ---------------------------------------------------------------------------
 # FastAPI application instance with CORS enabled.
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Research-RAG Server", version="1.0.0")
+app = FastAPI(title="Research-RAG Server", version="1.0.0", lifespan=_lifespan)
 
 # Allow the React dev-server (and any Tauri WebView in production) to talk to
 # this API.  During development we default to the Vite URL; in production the
@@ -82,14 +112,15 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 
 _model_cache: dict[str, RAGChat] = {}
-_insights_store: Optional[InsightsStore] = None
+_retrieval: Optional[RetrievalService] = None
+_shard_store: Optional[ShardStore] = None
 
 
-def _get_insights_store() -> InsightsStore:
-    global _insights_store  # noqa: PLW0603 – explicit global is fine here
-    if _insights_store is None:
-        _insights_store = InsightsStore()
-    return _insights_store
+def _get_shard_store() -> ShardStore:
+    global _shard_store  # noqa: PLW0603
+    if _shard_store is None:
+        _shard_store = ShardStore()
+    return _shard_store
 
 
 # ---------------------------------------------------------------------------
@@ -103,18 +134,29 @@ class Message(BaseModel):
     # validation errors when the new front-end sends its existing objects.
     contexts: Optional[List[str]] = None
     citations: Optional[List[Dict[str, Any]]] = None
+    notes: Optional[List[str]] = None
 
 
 class ChatRequest(BaseModel):
     query: str
     history: List[Message]
+    provider: Literal["local", "openai"] = "local"
     model_id: Optional[str] = None
+    openai_model: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
     answer: str
     contexts: List[str]
     citations: List[Dict[str, Any]]
+
+
+class EmbedRequest(BaseModel):
+    text: str
+
+
+class EmbedResponse(BaseModel):
+    embedding: List[float]
 
 
 class IngestRequest(BaseModel):
@@ -132,21 +174,21 @@ class TaskStatusResponse(BaseModel):
     progress: Optional[Dict[str, Any]] = None  # For tracking ingestion progress
 
 
-class InsightCreateRequest(BaseModel):
+class ShardCreateRequest(BaseModel):
+    id: str = Field(..., description="Shard id (e.g. from message shard)")
     text: str
     contexts: List[str] = Field(default_factory=list)
     title: Optional[str] = None
+    conversation_id: Optional[str] = None
+    parent_id: Optional[str] = None
+    notes: Optional[List[str]] = None
 
 
-class InsightCreateResponse(BaseModel):
-    id: str
-
-
-# Request model for updating insight
-class InsightUpdateRequest(BaseModel):
+class ShardUpdateRequest(BaseModel):
     text: Optional[str] = None
     contexts: Optional[List[str]] = None
     title: Optional[str] = None
+    notes: Optional[List[str]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -223,14 +265,66 @@ def _clean_text_for_embedding(text: str) -> str:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _get_retrieval() -> RetrievalService:
+    """Return the shared retrieval service (FAISS + embedder)."""
+    global _retrieval  # noqa: PLW0603
+    if _retrieval is None:
+        _retrieval = RetrievalService("db")
+    return _retrieval
+
+
 def _get_rag(model_id: Optional[str]) -> RAGChat:
-    """Return a cached RAG instance for *model_id* or create one lazily."""
+    """Return a cached RAG instance for *model_id* or create one lazily. Uses shared retrieval."""
     model_id = model_id or "meta-llama/Llama-3.2-1B-Instruct"
     if model_id in _model_cache:
         return _model_cache[model_id]
-    rag = RAGChat(model_id=model_id)
+    rag = RAGChat(model_id=model_id, retrieval_service=_get_retrieval())
     _model_cache[model_id] = rag
     return rag
+
+
+def _build_rag_context_and_prompt(
+    query: str,
+    history: List[dict],
+    *,
+    window_size: int = 6,
+) -> tuple[str, List[str], List[dict]]:
+    """Build context block and user prompt from retrieval + history. Returns (user_prompt, contexts, citations)."""
+    retrieval = _get_retrieval()
+    recent_messages = history[:-1][-window_size:] if len(history) > 1 else []
+    recent_contexts: List[str] = []
+    recent_meta: List[dict] = []
+    notes_from_history: List[str] = []
+
+    for msg in recent_messages:
+        if "contexts" in msg and "citations" in msg:
+            for ctext, cmeta in zip(msg["contexts"], msg["citations"]):
+                if ctext not in recent_contexts:
+                    recent_contexts.append(ctext)
+                    recent_meta.append(cmeta)
+        note_list = msg.get("notes") or []
+        if note_list:
+            notes_from_history.append("[User notes on this message]: " + "; ".join(note_list))
+
+    retrieved = retrieval.retrieve(query, k=4)
+    combined_contexts = list(recent_contexts)
+    combined_meta = list(recent_meta)
+    existing_set = set(combined_contexts)
+    for text, meta in retrieved:
+        if text in existing_set:
+            continue
+        combined_contexts.append(text)
+        combined_meta.append(meta)
+        existing_set.add(text)
+
+    context_block = "\n---\n".join(combined_contexts)
+    notes_block = "\n".join(notes_from_history) if notes_from_history else ""
+    user_prompt = (
+        f"Context:\n{context_block}\n\n"
+        + (f"Notes from conversation:\n{notes_block}\n\n" if notes_block else "")
+        + f"Question:\n{query}\nAnswer with technical precision."
+    )
+    return user_prompt, combined_contexts, combined_meta
 
 
 # ---------------------------------------------------------------------------
@@ -356,27 +450,67 @@ class PromptSelectRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Constellar graph schemas
+# ---------------------------------------------------------------------------
+
+class GraphShardCreateRequest(BaseModel):
+    """Turn shard or special shard. Either (user_content [+ assistant_content]) or (content + role)."""
+    id: Optional[str] = None  # generated if omitted
+    parent_ids: List[str] = Field(default_factory=list)
+    visible: bool = True
+    metadata: Optional[Dict[str, Any]] = None
+    # Turn shard
+    user_content: Optional[str] = None
+    assistant_content: Optional[str] = None
+    contexts: List[str] = Field(default_factory=list)
+    citations: List[Dict[str, Any]] = Field(default_factory=list)
+    # Special shard
+    content: Optional[str] = None
+    role: Optional[Literal["system", "external", "summary"]] = None
+
+
+class GraphShardPatchRequest(BaseModel):
+    visible: Optional[bool] = None
+
+
+class GraphCompileRequest(BaseModel):
+    current_leaf_id: str
+    user_draft: str
+
+
+class GraphSendRequest(BaseModel):
+    current_leaf_id: str
+    user_draft: str
+    provider: Literal["local", "openai"] = "local"
+    model_id: Optional[str] = None
+    openai_model: Optional[str] = None
+    temperature: float = 0.2
+    max_tokens: int = 1024
+    model_token_limit: int = 128000
+
+
+# ---------------------------------------------------------------------------
 # Routes – ordered roughly by frequency of expected access.
 # ---------------------------------------------------------------------------
 
-@app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
-    """Answer *req.query* using the retrieval-augmented generation backend."""
-    rag = _get_rag(req.model_id)
+@app.post("/chat")
+def chat_deprecated():
+    """Deprecated. Use POST /graph/{graph_id}/send for chat."""
+    raise HTTPException(
+        status_code=410,
+        detail="Deprecated. Use POST /graph/{graph_id}/send for chat.",
+    )
 
-    # Convert history objects into plain dicts as expected by RAGChat.chat.
-    hist_dicts: List[dict] = [msg.dict(exclude_none=True) for msg in req.history]
 
+@app.post("/embed", response_model=EmbedResponse)
+def embed(req: EmbedRequest):
+    """Compute vector embedding for the given text using all-MiniLM-L6-v2."""
+    embedder = _get_embedder()
     try:
-        answer: str = rag.chat(req.query, hist_dicts, system_prompt=_get_selected_system_prompt())
-    except Exception as exc:  # fail loudly so front-end sees detailed message
+        embedding: List[float] = embedder.encode([req.text])[0].tolist()
+        return EmbedResponse(embedding=embedding)
+    except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    # Retrieve sidecar data captured by RAGChat for citation rendering.
-    contexts: List[str] = getattr(rag, "last_contexts", [])
-    citations: List[dict] = getattr(rag, "last_citation_meta", [])
-
-    return ChatResponse(answer=answer, contexts=contexts, citations=citations)
 
 
 # ---------------------------------------------------------------------------
@@ -422,51 +556,247 @@ def task_status_endpoint(task_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Insights CRUD – mirrors `app.insights_store.InsightsStore` operations.
+# Shards CRUD – pinned message shards with FAISS search (replaces insights).
 # ---------------------------------------------------------------------------
 
-@app.get("/insight")
-def list_insights() -> List[Dict[str, Any]]:  # noqa: D401
-    """Return the complete list of insights (unsorted)."""
-    store = _get_insights_store()
-    return store.list_all()
+@app.get("/shards")
+def list_shards(pinned: bool = True) -> List[Dict[str, Any]]:
+    """Return pinned shards for sidebar (all stored shards are pinned)."""
+    store = _get_shard_store()
+    return store.list_all(pinned_only=pinned)
 
 
-@app.post("/insight", response_model=InsightCreateResponse, status_code=status.HTTP_201_CREATED)
-def create_insight(payload: InsightCreateRequest):
-    store = _get_insights_store()
+@app.post("/shard", status_code=status.HTTP_201_CREATED)
+def create_or_update_shard(payload: ShardCreateRequest) -> Dict[str, str]:
+    """Create or update a pinned shard (bookmark message). Returns { \"id\": ... }."""
+    store = _get_shard_store()
     try:
-        # Generate smart title if none provided
         title = payload.title or _generate_insight_title(payload.text)
-        iid = store.add_insight(payload.text, payload.contexts, title=title)
-        return InsightCreateResponse(id=iid)
+        sid = store.upsert_shard(
+            payload.id,
+            payload.text,
+            payload.contexts,
+            title=title,
+            conversation_id=payload.conversation_id,
+            parent_id=payload.parent_id,
+            notes=payload.notes,
+        )
+        return {"id": sid}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.delete("/insight/{insight_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_insight(insight_id: str):
-    store = _get_insights_store()
+@app.delete("/shard/{shard_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_shard(shard_id: str):
+    """Unpin a shard (remove from store)."""
+    store = _get_shard_store()
     try:
-        store.delete_insight(insight_id)
+        store.delete_shard(shard_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@app.get("/insight/search")
-def search_insights(query: str, k: int = 5):
-    store = _get_insights_store()
+@app.get("/shard/search")
+def search_shards(query: str, k: int = 5):
+    """Semantic search over pinned shards."""
+    store = _get_shard_store()
     return store.search(query, k=k)
 
 
-# Update insight endpoint
-@app.put("/insight/{insight_id}", status_code=status.HTTP_204_NO_CONTENT)
-def update_insight_endpoint(insight_id: str, payload: InsightUpdateRequest):
-    store = _get_insights_store()
+@app.put("/shard/{shard_id}", status_code=status.HTTP_204_NO_CONTENT)
+def update_shard_endpoint(shard_id: str, payload: ShardUpdateRequest):
+    store = _get_shard_store()
     try:
-        store.update_insight(insight_id, text=payload.text, contexts=payload.contexts, title=payload.title)
+        store.update_shard(
+            shard_id,
+            text=payload.text,
+            contexts=payload.contexts,
+            title=payload.title,
+            notes=payload.notes,
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Constellar graph endpoints
+# ---------------------------------------------------------------------------
+
+def _shard_to_dict(s: ConstellarShard) -> Dict[str, Any]:
+    return {
+        "id": s.id,
+        "parent_ids": s.parent_ids,
+        "created_at": s.created_at,
+        "visible": s.visible,
+        "metadata": s.metadata,
+        "user_content": s.user_content,
+        "assistant_content": s.assistant_content,
+        "contexts": s.contexts,
+        "citations": s.citations,
+        "content": s.content,
+        "role": s.role,
+    }
+
+
+@app.post("/graph")
+def graph_create():
+    """Create new conversation graph. Returns graph_id and root_id."""
+    graph_id, root_id = constellar_create_graph()
+    return {"graph_id": graph_id, "root_id": root_id}
+
+
+@app.get("/graph/{graph_id}")
+def graph_get(graph_id: str):
+    """Return full graph and active state."""
+    try:
+        graph, state = constellar_load_graph(graph_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    shards = {sid: _shard_to_dict(s) for sid, s in graph.shards.items()}
+    return {
+        "shards": shards,
+        "root_id": graph.root_id,
+        "current_leaf_id": state.current_leaf_id,
+    }
+
+
+@app.get("/graphs")
+def graph_list():
+    """List graph ids, newest first."""
+    return {"graph_ids": constellar_list_graphs()}
+
+
+@app.post("/graph/{graph_id}/shard", status_code=status.HTTP_201_CREATED)
+def graph_add_shard(graph_id: str, payload: GraphShardCreateRequest):
+    """Add a turn shard or special shard."""
+    try:
+        graph, state = constellar_load_graph(graph_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    shard_id = payload.id or uuid.uuid4().hex
+    now = time.time()
+    shard = ConstellarShard(
+        id=shard_id,
+        parent_ids=payload.parent_ids,
+        created_at=now,
+        visible=payload.visible,
+        metadata=payload.metadata,
+        user_content=payload.user_content,
+        assistant_content=payload.assistant_content or "",
+        contexts=payload.contexts,
+        citations=payload.citations,
+        content=payload.content,
+        role=payload.role,
+    )
+    try:
+        constellar_add_shard(graph, shard)
+        constellar_save_graph(graph_id, graph, state)
+    except GraphValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"id": shard_id}
+
+
+@app.patch("/graph/{graph_id}/shard/{shard_id}", status_code=status.HTTP_204_NO_CONTENT)
+def graph_patch_shard(graph_id: str, shard_id: str, payload: GraphShardPatchRequest):
+    """Set visibility (and optionally other fields) on a shard."""
+    try:
+        graph, state = constellar_load_graph(graph_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if shard_id not in graph.shards:
+        raise HTTPException(status_code=404, detail="Shard not found")
+    if payload.visible is not None:
+        constellar_set_visibility(graph, shard_id, payload.visible)
+    constellar_save_graph(graph_id, graph, state)
+
+
+@app.post("/graph/{graph_id}/compile")
+def graph_compile(graph_id: str, payload: GraphCompileRequest):
+    """Compile for given leaf and draft; return messages, compiled_shard_ids, token_count (openai approx)."""
+    try:
+        graph, _ = constellar_load_graph(graph_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    messages, compiled_shard_ids = constellar_compile(
+        graph, payload.current_leaf_id, payload.user_draft
+    )
+    token_count = constellar_count_tokens(messages, "openai")
+    return {
+        "messages": messages,
+        "compiled_shard_ids": compiled_shard_ids,
+        "token_count": token_count,
+    }
+
+
+logger = logging.getLogger(__name__)
+
+
+_DEFAULT_LOCAL_MODEL_ID = os.getenv("CONSTELLAR_DEFAULT_MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct")
+
+
+@app.post("/graph/{graph_id}/send")
+def graph_send(graph_id: str, payload: GraphSendRequest):
+    """Send flow: compile, check tokens, complete, persist one turn shard, snapshot. Returns response, new_leaf_id, token_count."""
+    model_id = payload.model_id
+    if payload.provider == "local":
+        if not model_id or not model_id.strip():
+            model_id = _DEFAULT_LOCAL_MODEL_ID
+            logger.info(
+                "graph_send: provider=local but model_id missing or empty, using default model_id=%s",
+                model_id,
+            )
+    logger.info(
+        "graph_send: graph_id=%s current_leaf_id=%r provider=%s model_id=%s openai_model=%s temperature=%s max_tokens=%s model_token_limit=%s user_draft_len=%s",
+        graph_id,
+        payload.current_leaf_id,
+        payload.provider,
+        model_id,
+        payload.openai_model,
+        payload.temperature,
+        payload.max_tokens,
+        payload.model_token_limit,
+        len(payload.user_draft),
+    )
+    try:
+        graph, state = constellar_load_graph(graph_id)
+    except KeyError as exc:
+        logger.warning("graph_send: graph not found graph_id=%s %s", graph_id, exc)
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    rag = _get_rag(model_id) if payload.provider == "local" else None
+    retrieval = _get_retrieval().retrieve  # (query, k) -> list of (text, meta); used for RAG
+    try:
+        response, new_leaf_id, token_count, contexts, citations = constellar_send(
+            graph_id,
+            payload.current_leaf_id,
+            payload.user_draft,
+            payload.provider,
+            model_id=model_id,
+            openai_model=payload.openai_model,
+            temperature=payload.temperature,
+            max_tokens=payload.max_tokens,
+            model_token_limit=payload.model_token_limit,
+            rag=rag,
+            retrieval=retrieval,
+        )
+    except TokenLimitExceeded as exc:
+        logger.warning("graph_send: token limit exceeded count=%s limit=%s", exc.count, exc.limit)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Token count {exc.count} exceeds limit {exc.limit}",
+        ) from exc
+    except (ValueError, GraphValidationError) as exc:
+        logger.warning("graph_send: validation/value error %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("graph_send: unexpected error graph_id=%s", graph_id)
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+    return {
+        "response": response,
+        "new_leaf_id": new_leaf_id,
+        "token_count": token_count,
+        "contexts": contexts,
+        "citations": citations,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -729,16 +1059,17 @@ class ContextPoolRequest(BaseModel):
 
 @app.post("/context_pool", status_code=status.HTTP_204_NO_CONTENT)
 def set_context_pool(req: ContextPoolRequest):
-    rag = _get_rag(req.model_id)
+    """Set allowed sources on shared retrieval so both local and OpenAI providers use it."""
+    retrieval = _get_retrieval()
     if req.collection_id is None:
-        rag.set_allowed_sources(None)
+        retrieval.set_allowed_sources(None)
         return
 
     try:
         conn = get_connection()
         filenames = get_filenames_for_collection(conn, req.collection_id)
         conn.close()
-        rag.set_allowed_sources(set(filenames))
+        retrieval.set_allowed_sources(set(filenames))
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

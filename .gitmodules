@@ -1,0 +1,3 @@
+[submodule "whisk-submodule"]
+	path = whisk-submodule
+	url = https://github.com/romanbelaire/whisk.git

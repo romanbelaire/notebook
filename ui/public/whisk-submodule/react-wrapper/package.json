@@ -1,0 +1,46 @@
+{
+  "name": "@wisk/react",
+  "version": "1.0.0",
+  "description": "React wrapper for Wisk editor",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc && rollup -c",
+    "dev": "rollup -c -w",
+    "test": "jest",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "wisk",
+    "editor",
+    "react",
+    "rich-text",
+    "block-editor",
+    "web-components"
+  ],
+  "author": "Wisk Team",
+  "license": "FSL-1.1-Apache-2.0",
+  "peerDependencies": {
+    "react": ">=16.8.0",
+    "react-dom": ">=16.8.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.0.0",
+    "@types/react-dom": "^18.0.0",
+    "@rollup/plugin-commonjs": "^25.0.0",
+    "@rollup/plugin-node-resolve": "^15.0.0",
+    "@rollup/plugin-typescript": "^11.0.0",
+    "rollup": "^3.0.0",
+    "typescript": "^5.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sohzm/wisk.git",
+    "directory": "react-wrapper"
+  },
+  "homepage": "https://wisk.cc"
+} 

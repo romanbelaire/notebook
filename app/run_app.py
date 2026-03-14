@@ -1,5 +1,5 @@
 from app.ingest import ingest_pdfs
-from app.insights_store import InsightsStore
+from app.shard_store import ShardStore
 import streamlit as st
 import os
 import subprocess
@@ -106,8 +106,8 @@ if "db_loaded" not in st.session_state:
     st.session_state.db_loaded = False
 if "loaded_model_id" not in st.session_state:
     st.session_state.loaded_model_id = None
-if "insights_store" not in st.session_state:
-    st.session_state.insights_store = InsightsStore()
+if "shard_store" not in st.session_state:
+    st.session_state.shard_store = ShardStore()
 
 with st.sidebar:
     st.header("Data Ingestion")
@@ -165,24 +165,22 @@ with st.sidebar:
     )
 
     # ---------------------------------------------------------------------
-    # Insights management (search & list)
+    # Pinned shards (Insights) – search & list
     # ---------------------------------------------------------------------
-    st.header("📌 Insights")
-    if "insights_store" in st.session_state:
-        insight_query = st.text_input("Search insights", key="insight_search")
+    st.header("📌 Pinned")
+    if "shard_store" in st.session_state:
+        insight_query = st.text_input("Search pinned", key="insight_search")
         if insight_query:
-            matches = st.session_state.insights_store.search(insight_query, k=5)
+            matches = st.session_state.shard_store.search(insight_query, k=5)
         else:
-            # Show recent insights if no query
-            matches = [(d, 0.0) for d in st.session_state.insights_store.list_all()[::-1][:5]]
+            matches = [(d, 0.0) for d in st.session_state.shard_store.list_all()[::-1][:5]]
 
         for meta, dist in matches:
             display_label = meta.get("title", meta["text"])
             st.markdown(f"- {display_label}")
-            # Delete button inline
             if st.button("🗑️ Delete", key=f"del_{meta['id']}"):
                 try:
-                    st.session_state.insights_store.delete_insight(meta["id"])
+                    st.session_state.shard_store.delete_shard(meta["id"])
                     st.rerun()
                 except Exception as e:
                     st.error(str(e))
@@ -276,18 +274,14 @@ for idx, message in enumerate(st.session_state.chat_history):
             with col_pin:
                 col_pin.markdown("", unsafe_allow_html=True)  # ensure container exists
 
-                store = st.session_state.get("insights_store")
+                store = st.session_state.get("shard_store")
                 if store is not None:
                     pin_label = "📌"
-
-                    # Determine pinned status --------------------------------------------------
-                    insight_id = message.get("insight_id")
+                    shard_id = message.get("shard_id") or message.get("insight_id")
                     is_pinned = False
-                    if insight_id:
-                        # Verify still exists in store
+                    if shard_id:
                         try:
-                            # list_all is small; fine to scan
-                            is_pinned = any(d["id"] == insight_id for d in store.list_all())
+                            is_pinned = any(d["id"] == shard_id for d in store.list_all())
                         except Exception:
                             is_pinned = False
 
@@ -299,27 +293,22 @@ for idx, message in enumerate(st.session_state.chat_history):
                             contexts = message.get("contexts", [])
                             try:
                                 if is_pinned:
-                                    # Unpin
-                                    store.delete_insight(insight_id)  # type: ignore[arg-type]
+                                    store.delete_shard(shard_id)
+                                    message.pop("shard_id", None)
                                     message.pop("insight_id", None)
-                                    st.toast("Insight removed", icon="🗑️")
+                                    st.toast("Unpinned", icon="🗑️")
                                 else:
-                                    # Pin with generated title
                                     title = generate_short_title(message["content"], st.session_state.rag)
-                                    try:
-                                        new_id = store.add_insight(message["content"], contexts, title=title)
-                                    except TypeError as te:
-                                        # Handle older store instance that lacks the *title* param
-                                        if "unexpected keyword argument 'title'" in str(te):
-                                            store = InsightsStore()  # reload fresh implementation
-                                            st.session_state.insights_store = store
-                                            new_id = store.add_insight(message["content"], contexts, title=title)
-                                        else:
-                                            raise
-                                    message["insight_id"] = new_id
-                                    st.toast("Insight pinned!", icon="📌")
+                                    new_id = store.upsert_shard(
+                                        f"shard_{idx}_{int(datetime.utcnow().timestamp() * 1e6)}",
+                                        message["content"],
+                                        contexts,
+                                        title=title,
+                                    )
+                                    message["shard_id"] = new_id
+                                    message.pop("insight_id", None)
+                                    st.toast("Pinned!", icon="📌")
                                     st.session_state["flash_idx"] = idx
-                                # Persist change to session_state
                                 st.session_state.chat_history[idx] = message
                                 st.rerun()
                             except Exception as e:

@@ -61,26 +61,41 @@ export interface Insight {
   created_at: string;
 }
 
+/** List pinned shards (same shape as former insights). */
 export async function listInsights() {
-  const { data } = await api.get<Insight[]>("/insight");
+  const { data } = await api.get<Insight[]>("/shards");
   return data;
 }
 
-export async function createInsight(text: string, contexts: string[], title?: string) {
-  const { data } = await api.post<{ id: string }>("/insight", { text, contexts, title });
+/** Pin a shard (create or update). Caller must provide a stable id (e.g. shard id or generated). */
+export async function createInsight(
+  text: string,
+  contexts: string[],
+  title?: string,
+  shardId?: string
+) {
+  const id = shardId ?? `shard_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const { data } = await api.post<{ id: string }>("/shard", {
+    id,
+    text,
+    contexts,
+    title,
+  });
   return data.id;
 }
 
 export async function deleteInsight(id: string) {
-  await api.delete(`/insight/${id}`);
+  await api.delete(`/shard/${id}`);
 }
 
 export async function updateInsight(id: string, text: string, title?: string) {
-  await api.put(`/insight/${id}`, { text, title });
+  await api.put(`/shard/${id}`, { text, title });
 }
 
 export async function searchInsights(query: string, k = 5) {
-  const { data } = await api.get<[Insight, number][]>("/insight/search", { params: { query, k } });
+  const { data } = await api.get<[Insight, number][]>("/shard/search", {
+    params: { query, k },
+  });
   return data;
 }
 

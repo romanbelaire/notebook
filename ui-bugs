@@ -1,0 +1,13 @@
+- once hidden, the message-unhide button is unclickable. need to fix hit registration still
+- zooming, panning 'unfocuses' the camera; resetting the zoom should be smooth as well.
+- when the message box resizes, the shard background needs to resize to fit as well. we need a system to robustly handle dynamic resizing, so that later we can support user-manual resizing.
+- shard modal: when viewing the shard information modal, we need to use the vstack box to make sure the text box does not overlap the heading for each section.
+
+shard modal:
+Shard modal text wrap
+queue_plain_text_wrapped added to the renderer to queue plain text with word wrap to a given max width.
+render_text_input in native-ui/src/ui/core.rs now takes wrap_text: bool; when true it uses queue_plain_text_wrapped instead of a single-line Text component.
+Shard modal in native-ui/src/gfx/components/modals.rs calls render_text_input with wrap_text: true for the user and assistant inputs so their content wraps inside the modal.
+All other render_text_input call sites pass wrap_text: false.
+
+still doesn't work.

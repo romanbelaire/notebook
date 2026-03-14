@@ -2,34 +2,274 @@
 @tailwind components;
 @tailwind utilities;
 
+.app-frame {
+  height: 100vh;
+  width: 100vw;
+  display: flex;
+  flex-direction: column;
+  background-color: var(--color-primary-bg);
+}
+
+/* Header styles */
+header {
+  padding: 12px;
+  margin-top: 0;
+  border-bottom: 1px solid var(--color-trim);
+  background-color: var(--color-header-bg);
+  color: var(--color-light-text);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.title-brand {
+  font-family: "Consolas", "Menlo", "Monaco", "Liberation Mono", "Courier New", monospace;
+  font-weight: 700;
+  color: var(--color-light-text);
+  font-size: 2.5em;
+  margin: 0;
+}
+
+/* Navigation */
+nav {
+  display: flex !important;
+  align-items: center;
+  gap: 16px;
+}
+
+/* Ensure nav is in normal flow, not floating */
+header nav.app-nav-tabs.header-nav {
+  position: relative !important;
+  float: none !important;
+  clear: none !important;
+  transform: none !important;
+  top: auto !important;
+  left: auto !important;
+  right: auto !important;
+  bottom: auto !important;
+}
+
+/* Header navigation layout - responsive */
+/* First row: Title and Controls (nav conditionally rendered by JS) */
+header > div:first-child {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+  order: 1;
+  position: relative;
+  z-index: 1;
+}
+
+/* Title - left aligned */
+header > div:first-child > h1.title-brand {
+  flex-shrink: 0;
+  margin: 0;
+}
+
+/* Window controls - right aligned */
+header > div:first-child > div:last-child {
+  flex-shrink: 0;
+}
+
+/* Nav bar - when inline, between title and controls */
+header > div:first-child > nav.app-nav-tabs.header-nav {
+  flex: 1 1 0% !important; /* Grow to fill available space */
+  display: flex !important;
+  justify-content: center !important;
+  align-items: center !important;
+  min-width: fit-content;
+  position: relative !important; /* Ensure it's in normal flow */
+  z-index: auto !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  background: transparent !important; /* Transparent background */
+}
+
+/* Second row: Nav when wrapped (only when there are 2 divs) */
+header > div:first-child + div {
+  display: flex;
+  justify-content: center;
+  width: 100%;
+  order: 2;
+  margin-top: 0.5rem;
+  position: relative;
+  z-index: 1;
+}
+
+header > div:first-child + div > nav.app-nav-tabs.header-nav {
+  display: flex !important;
+  justify-content: center !important;
+  align-items: center !important;
+  width: 100% !important;
+  position: relative !important;
+  z-index: auto !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  background: transparent !important; /* Transparent background */
+}
+
+/* Center nav content in both cases */
+header nav.app-nav-tabs.header-nav > div {
+  margin-left: auto;
+  margin-right: auto;
+  background-color: transparent !important; /* Override Tailwind bg-secondaryBg/60 */
+}
+
+/* Segmented control */
+nav > div {
+  position: relative;
+  display: grid;
+  /* grid-template-columns removed - set inline in component */
+  background-color: transparent; /* Transparent so header background shows through */
+  border-radius: 9999px;
+  overflow: hidden;
+  height: 40px;
+  box-shadow: none; /* Remove shadow */
+  width: fit-content; /* Allow nav to size to content */
+}
+
+nav button {
+  position: relative;
+  z-index: 10;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: rgba(255, 255, 255, 0.8);
+  cursor: pointer;
+  transition: color 0.2s;
+}
+
+nav button:hover {
+  color: #ffffff;
+}
+
+nav button.active {
+  color: var(--color-light-text);
+}
+
+/* Active tab slider */
+nav > div > span {
+  position: absolute;
+  inset: 0;
+  margin: 2px;
+  background-color: rgba(255, 255, 255, 0.06);
+  border-radius: 9999px;
+  transition: transform 0.3s;
+  box-shadow: 0 0 4px rgba(0, 0, 0, 0.3);
+  width: 20%;
+  transform: translateX(0%);
+}
+
+/* Transform for different active tabs */
+nav > div > span[data-tab="0"] { transform: translateX(0%); }
+nav > div > span[data-tab="1"] { transform: translateX(100%); }
+nav > div > span[data-tab="2"] { transform: translateX(200%); }
+nav > div > span[data-tab="3"] { transform: translateX(300%); }
+nav > div > span[data-tab="4"] { transform: translateX(400%); }
+
+/* Main content area */
+.flex {
+  display: flex;
+}
+
+.flex-1 {
+  flex: 1;
+}
+
+.overflow-hidden {
+  overflow: hidden;
+}
+
+.relative {
+  position: relative;
+}
+
+.h-full {
+  height: 100%;
+}
+
+/* Sidebar */
+.border-r {
+  border-right: 1px solid var(--color-trim);
+}
+
+.bg-secondaryBg {
+  background-color: var(--color-secondary-bg);
+}
+
+/* Window controls */
+.absolute {
+  position: absolute;
+}
+
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/* Basic button styles */
+button {
+  border-radius: 9999px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  padding: 0.6em 1.2em;
+  font-size: 1em;
+  font-weight: 500;
+  font-family: inherit;
+  background-color: var(--color-button-bg);
+  color: var(--color-light-text);
+  cursor: pointer;
+  transition: border-color 0.25s;
+}
+
+button:hover {
+  border-color: rgba(255, 255, 255, 0.6);
+}
+
+button:focus,
+button:focus-visible {
+  outline: 4px auto -webkit-focus-ring-color;
+}
+
+/* Wisk editor container */
+.wisk-editor-container {
+  width: 100%;
+  height: 100%;
+  background-color: var(--color-primary-bg);
+  color: var(--color-defaultText);
+  border: none;
+  outline: none;
+  font-family: "Open Sans", system-ui, Avenir, Helvetica, Arial, sans-serif;
+}
+
+/* Wisk editor iframe */
+.wisk-editor-container iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+  background-color: var(--color-primary-bg);
+}
+
 /* Open Sans font is now loaded via <link> in index.html */
 
+/* Essential variables for legacy components */
 :root {
-  /* Use Open Sans everywhere */
+  /* Typography */
   font-family: "Open Sans", system-ui, Avenir, Helvetica, Arial, sans-serif;
   line-height: 1.5;
   font-weight: 400;
-  letter-spacing: 0.02em;
-  line-height: 1.5;
-  word-spacing: 0.055em;
+  /* Slightly widen perceived glyphs via tracking */
+  letter-spacing: 0.06em;
+  word-spacing: 0.065em;
 
-  /* Custom color palette */
-  --color-defaultText: #cadde2;
+  /* Use active theme palette */
   color: var(--color-defaultText);
-  background-color: var(--color-primary-bg); /* main background */
-
-  /* CSS variables for reference in components if needed */
-  --color-primary-bg: #142338;
-  --color-secondary-bg: #16263c; /* updated sidebar color */
-  --color-header-bg: #111c2d; /* header bar */
-  --color-trim: #182529aa;
-  --color-accent-text: #d48e33; /* bold accent */
-  --color-button-bg: #40404f;
-  --color-insight-bg: #364966;
-  --color-bright-bg: #C0CAAD;
-  --color-chat-assistant-bg: #353f50;
-  --color-tertiary-text: #db363c; /* tertiary text color */
-  --color-light-text: #ffffff;
+  background-color: var(--color-primary-bg);
 
   font-synthesis: none;
   text-rendering: optimizeLegibility;
@@ -39,7 +279,7 @@
 
 a {
   font-weight: 500;
-  color: var(--color-trim);
+  color: rgba(255, 255, 255, 0.7);
   text-decoration: inherit;
 }
 a:hover {
@@ -52,6 +292,8 @@ body {
   place-items: center;
   min-width: 320px;
   min-height: 100vh;
+  background-color: var(--color-primary-bg);
+  color: var(--color-defaultText);
 }
 
 h1 {

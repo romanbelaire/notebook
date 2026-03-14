@@ -1,0 +1,40 @@
+RENDERING ORDER FIX - Jan 2026
+================================
+
+PROBLEM:
+--------
+Quads were being added to the vertex buffer but not visible on screen.
+Debug showed vertices were created (vertex count increased from 48->66)
+but nothing rendered.
+
+ROOT CAUSE:
+-----------
+The test quads were added at the START of the vertex buffer (line ~880),
+so they rendered FIRST (in the background). Other UI elements with full
+opacity (sidebar, chat window, etc.) were drawn on top, completely
+covering them.
+
+SOLUTION:
+---------
+Move the quads to the END of the vertex buffer (before `self.vertex_count = ...`).
+This makes them render LAST, on top of all other UI elements.
+
+KEY INSIGHT:
+------------
+In immediate-mode rendering, draw order = render order = z-order.
+- Vertices added first → drawn first → appear in back
+- Vertices added last → drawn last → appear in front
+
+No depth buffer is used, so overlapping quads use painter's algorithm
+(later draws overwrite earlier draws).
+
+LESSON:
+-------
+When debugging "invisible" quads in 2D rendering:
+1. Verify vertices are created (check vertex count)
+2. Verify shader works (test with simple flat color)
+3. Check render ORDER (are they being covered by other quads?)
+
+The blend state (ALPHA_BLENDING) was correct, the shader was correct,
+the vertices were correct - it was purely a z-order issue!
+

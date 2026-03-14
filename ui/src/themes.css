@@ -1,16 +1,17 @@
 :root, .theme-standard {
-  /* Standard / Default theme variables */
-  --color-primary-bg: #142338;
-  --color-secondary-bg: #16263c;
-  --color-header-bg: #111c2d;
-  --color-trim: #182529aa;
-  --color-accent-text: #d48e33;
-  --color-button-bg: #40404f;
-  --color-insight-bg: #364966;
-  --color-bright-bg: #C0CAAD;
-  --color-chat-assistant-bg: #353f50;
-  --color-tertiary-text: #db363c;
-  --color-light-text: #ffffff;
+  /* Space-default theme: ultra-dark, minimal, high-contrast */
+  --color-primary-bg: #0b0c0d;
+  --color-secondary-bg: #101214;
+  --color-header-bg: #0b0c0d;
+  --color-trim: rgba(255, 255, 255, 0.18);          /* thin white outlines */
+  --color-accent-text: #f0e3c0;                     /* warm accent */
+  --color-button-bg: transparent;                   /* outlined buttons by default */
+  --color-insight-bg: #15181b;
+  --color-bright-bg: #1e2227;
+  --color-chat-assistant-bg: #14171a;
+  --color-tertiary-text: #b3a893;
+  --color-light-text: #f5e7c8;                      /* slightly beige "white" */
+  --color-defaultText: #e8dcc4;                     /* main body text beige */
 }
 
 /* ------------------------------------------------------------------ */
@@ -163,7 +164,7 @@
   top: 0;
   left: 0;
   right: 0;
-  height: 20px; /* top margin */
+  height: 0; /* No top margin */
   background: var(--frame-color);
   -webkit-app-region: drag;
   z-index: 10; /* sits above content but below buttons overlay */

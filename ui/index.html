@@ -10,6 +10,90 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <!-- Open Sans variable font -->
     <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- Tailwind CSS is now bundled via the Vite plugin. -->
+    <style>
+      /* Essential CSS variables and styles */
+      :root {
+        --color-primary-bg: #142338;
+        --color-secondary-bg: #16263c;
+        --color-header-bg: #111c2d;
+        --color-trim: #182529aa;
+        --color-accent-text: #d48e33;
+        --color-button-bg: #40404f;
+        --color-insight-bg: #364966;
+        --color-bright-bg: #C0CAAD;
+        --color-chat-assistant-bg: #353f50;
+        --color-tertiary-text: #db363c;
+        --color-light-text: #ffffff;
+        --color-defaultText: #cadde2;
+      }
+
+      body {
+        margin: 0;
+        padding: 0;
+        font-family: "Open Sans", system-ui, Avenir, Helvetica, Arial, sans-serif;
+        background-color: #142338;
+        color: #cadde2;
+        min-height: 100vh;
+      }
+
+      .app-frame {
+        height: 100vh;
+        width: 100vw;
+        display: flex;
+        flex-direction: column;
+        background-color: #142338;
+        color: #cadde2;
+        position: relative;
+      }
+
+      .app-frame::before {
+        content: "";
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 20px;
+        background: #111c2d;
+        -webkit-app-region: drag;
+        z-index: 10;
+      }
+
+      .app-drag {
+        -webkit-app-region: drag;
+      }
+
+      .no-drag {
+        -webkit-app-region: no-drag;
+      }
+
+      .title-brand {
+        font-family: "Consolas", "Menlo", "Monaco", "Liberation Mono", "Courier New", monospace;
+        font-weight: 700;
+        color: #d48e33;
+        letter-spacing: 0.03em;
+        font-size: 2.5em;
+        margin: 0;
+      }
+
+      /* Wisk editor container */
+      .wisk-editor-container {
+        width: 100%;
+        height: 100%;
+        background-color: #142338;
+        color: #cadde2;
+        border: none;
+        outline: none;
+        font-family: "Open Sans", system-ui, Avenir, Helvetica, Arial, sans-serif;
+      }
+
+      .wisk-editor-container iframe {
+        width: 100%;
+        height: 100%;
+        border: none;
+        background-color: #142338;
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>

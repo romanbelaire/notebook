@@ -1,7 +1,7 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import ChatWindow from "./components/ChatWindow";
 import Sidebar from "./components/Sidebar";
-import ScratchPad from "./components/ScratchPad";
+import WiskScratchPad from "./components/WiskScratchPad";
 import LibraryView from "./components/LibraryView";
 import IngestView from "./components/IngestView";
 import SettingsView from "./components/SettingsView";
@@ -23,12 +23,40 @@ function App() {
   const activeTab = useUIStore((s) => s.activeTab);
   const setActiveTab = useUIStore((s) => s.setActiveTab);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [isNarrow, setIsNarrow] = useState(window.innerWidth <= 800);
   const SIDEBAR_WIDTH = '18rem';
   const CLOSED_WIDTH = '0.0625rem'; // 1px to allow drop shadow visibility when collapsed
   const TOGGLE_SIZE = '2.5rem'; // matches Tailwind w-10 h-10 (2.5rem)
   const [arrowHover, setArrowHover] = useState(false);
   const theme = useSettingsStore((s) => s.theme);
   const toast = useToast();
+
+  // Detect when window is narrow for nav wrapping
+  useEffect(() => {
+    const handleResize = () => {
+      setIsNarrow(window.innerWidth <= 800);
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  useEffect(() => {
+    // Debug: list all loaded style sheets on initial render
+    const sheets = Array.from(document.styleSheets).map((ss) => ss.href ?? '[inline]');
+    console.log('🔎 Loaded style sheets:', sheets);
+    console.log('🔎 Style sheet details:');
+    Array.from(document.styleSheets).forEach((ss, i) => {
+      const id = (ss.ownerNode as HTMLElement | null)?.getAttribute?.('data-vite-dev-id') ?? '(inline)';
+      let sample = '';
+      try {
+        const rules = ss.cssRules ?? [];
+        sample = Array.from(rules).slice(0, 3).map(r => '  ' + (r as CSSStyleRule).cssText).join('\n');
+      } catch (err) {
+        sample = '[cross-origin]';
+      }
+      console.log(`#${i} ${id}`, ss.href || '[inline]', '\n', sample);
+    });
+  }, []);
 
   // Apply theme class to <body>
   useEffect(() => {
@@ -43,21 +71,28 @@ function App() {
     }
   }, [theme]);
 
-  const renderTab = () => {
-    switch (activeTab) {
-      case "Chat":
-        return <ChatWindow />;
-      case "Notepad":
-        return <ScratchPad />;
-      case "Library":
-        return <LibraryView />;
-      case "Data":
-        return <IngestView />;
-      case "Settings":
-        return <SettingsView />;
-      default:
-        return null;
-    }
+  // Render all tabs but hide inactive ones - this prevents unmounting/remounting
+  // which causes Wisk to re-initialize and lose state
+  const renderAllTabs = () => {
+    return (
+      <>
+        <div style={{ display: activeTab === "Chat" ? "block" : "none" }}>
+          <ChatWindow />
+        </div>
+        <div style={{ display: activeTab === "Notepad" ? "block" : "none" }}>
+          <WiskScratchPad />
+        </div>
+        <div style={{ display: activeTab === "Library" ? "block" : "none" }}>
+          <LibraryView />
+        </div>
+        <div style={{ display: activeTab === "Data" ? "block" : "none" }}>
+          <IngestView />
+        </div>
+        <div style={{ display: activeTab === "Settings" ? "block" : "none" }}>
+          <SettingsView />
+        </div>
+      </>
+    );
   };
 
   const handleRootDragOver = (e: ReactDragEvent<HTMLDivElement>) => {
@@ -130,53 +165,64 @@ function App() {
   // ───────────────────────────────────────── DnD-kit sensors ──
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }));
 
+  // Nav component to reuse
+  const navComponent = (
+    <nav className="app-nav-tabs no-drag header-nav">
+      {/* Segmented control */}
+      <div className="relative grid bg-secondaryBg/60 rounded-full overflow-hidden h-10 shadow-inner app-nav-control" style={{ gridTemplateColumns: `repeat(${tabs.length}, 1fr)`, width: 'fit-content', display: 'grid' }}>
+        {/* animated slider */}
+        <span
+          className="absolute inset-0 m-0.5 bg-buttonBg rounded-full transition-transform duration-300 shadow"
+          style={{ width: `${100 / tabs.length}%`, transform: `translateX(${tabs.indexOf(activeTab) * 100}%)` }}
+        />
+        {tabs.map((t) => (
+          <button
+            key={t}
+            className={
+              "relative z-10 w-full h-full flex items-center justify-center text-sm bg-transparent border-none focus:outline-none transition-colors px-4 whitespace-nowrap" +
+              (t === activeTab ? " text-accentText" : " text-light/80 hover:text-light")
+            }
+            onClick={() => setActiveTab(t)}
+          >
+            {t === "Settings" ? (
+              <GearIcon className="w-4 h-4" />
+            ) : (
+              t
+            )}
+          </button>
+        ))}
+      </div>
+    </nav>
+  );
+
   return (
     <DndContext sensors={sensors}>
     <div className="app-frame relative h-screen w-screen flex flex-col bg-primaryBg text-defaultText" onDragOver={handleRootDragOver} onDropCapture={handleRootDrop}>
 
       {/* top margin handled via pseudo-element */}
 
-      <header className="p-3 mt-5 border-b flex items-center justify-between bg-headerBg text-light border-primaryBg shadow app-drag select-none">
-        <h1 className="title-brand text-2xl font-mono">Notebook</h1>
-        {/* Left side placeholder to allow drag area */}
-        <div className="flex-1" />
-        <nav className="flex items-center gap-4 no-drag">
-          {/* Segmented control */}
-          <div className="relative grid bg-secondaryBg/60 rounded-full overflow-hidden h-10 shadow-inner" style={{ gridTemplateColumns: `repeat(${tabs.length}, 1fr)` }}>
-            {/* animated slider */}
-            <span
-              className="absolute inset-0 m-0.5 bg-buttonBg rounded-full transition-transform duration-300 shadow"
-              style={{ width: `${100 / tabs.length}%`, transform: `translateX(${tabs.indexOf(activeTab) * 100}%)` }}
-            />
-            {tabs.map((t) => (
-              <button
-                key={t}
-                className={
-                  "relative z-10 w-full h-full flex items-center justify-center text-sm bg-transparent border-none focus:outline-none transition-colors" +
-                  (t === activeTab ? " text-accentText" : " text-light/80 hover:text-light")
-                }
-                onClick={() => setActiveTab(t)}
-              >
-                {t === "Settings" ? (
-                  <GearIcon className="w-4 h-4" />
-                ) : (
-                  t
-                )}
-              </button>
-            ))}
+      <header className="p-3 border-b bg-headerBg text-light border-primaryBg shadow app-drag select-none">
+        {/* First row: Title and Controls (always together) */}
+        <div className="flex items-center justify-between gap-2 w-full">
+          <h1 className="title-brand text-2xl font-mono flex-shrink-0">Notebook</h1>
+          {!isNarrow && navComponent}
+          <div className="no-drag flex-shrink-0">
+            <WindowControls />
           </div>
-        </nav>
+        </div>
+        
+        {/* Second row: Nav (only when narrow) */}
+        {isNarrow && (
+          <div className="flex justify-center w-full mt-2">
+            {navComponent}
+          </div>
+        )}
       </header>
-
-      {/* Floating window-controls overlay – keeps them visible on narrow widths */}
-      <div className="no-drag absolute" style={{ top: '4px', right: '4px', zIndex: 100 }}>
-        <WindowControls />
-      </div>
 
       <div className="flex flex-1 overflow-hidden relative">
         <div
           className={
-            `relative h-full transition-all duration-300 ease-in-out overflow-hidden pointer-events-none border-r border-primaryBg bg-secondaryBg ${arrowHover ? 'shadow-[0_0_10px_rgba(255,255,255,0.2)]' : 'shadow-md'} transition-shadow`
+            `relative h-full transition-all duration-300 ease-in-out overflow-hidden border-r border-primaryBg bg-secondaryBg ${arrowHover ? 'shadow-[0_0_10px_rgba(255,255,255,0.2)]' : 'shadow-md'} transition-shadow ${sidebarOpen ? 'pointer-events-auto' : 'pointer-events-none'}`
           }
           style={{ width: sidebarOpen ? SIDEBAR_WIDTH : CLOSED_WIDTH }}
         >
@@ -200,7 +246,7 @@ function App() {
         </button>
 
         <main className="flex-1 overflow-auto">
-          {renderTab()}
+          {renderAllTabs()}
         </main>
       </div>
       <InsightModal />

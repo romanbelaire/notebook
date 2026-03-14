@@ -61,11 +61,9 @@ function InsightRow({ ins, deleteConfirmId, setDeleteConfirmId, setModalInsight,
     <div
       ref={combinedRef}
       style={style}
-      {...listeners}
-      {...attributes}
       className={
         "group w-full px-2 py-1 rounded border border-primaryBg transition-opacity flex items-center bg-buttonBg/60 hover:bg-buttonBg opacity-80 hover:opacity-100 " +
-        (isDragging ? "opacity-40" : "cursor-grab")
+        (isDragging ? "opacity-40" : "cursor-pointer")
       }
       title={ins.title || ins.text.slice(0, 60)}
       onClick={(e) => {
@@ -98,13 +96,13 @@ function InsightRow({ ins, deleteConfirmId, setDeleteConfirmId, setModalInsight,
         </div>
       ) : (
         <>
-          <span className="flex-1 truncate">
+          <span className="flex-1 truncate min-w-0">
             {(ins.title || ins.text).slice(0, 40)}
             {(ins.title || ins.text).length > 40 ? "…" : ""}
           </span>
           {/* edit icon */}
           <PencilIcon
-            className="w-4 h-4 ml-2 opacity-0 group-hover:opacity-100 flex-none"
+            className="w-4 h-4 ml-2 opacity-0 group-hover:opacity-100 flex-none shrink-0"
             onClick={(e) => {
               e.stopPropagation();
               setModalInsight(ins);
@@ -112,7 +110,7 @@ function InsightRow({ ins, deleteConfirmId, setDeleteConfirmId, setModalInsight,
           />
           {/* trash icon */}
           <button
-            className="w-4 h-4 ml-2 p-0 text-defaultText flex items-center justify-center bg-transparent border-0 opacity-0 group-hover:opacity-100 hover:bg-white/10 focus:outline-none"
+            className="w-4 h-4 ml-2 p-0 text-defaultText flex items-center justify-center bg-transparent border-0 opacity-0 group-hover:opacity-100 hover:bg-white/10 focus:outline-none shrink-0"
             onClick={(e) => {
               e.stopPropagation();
               setDeleteConfirmId(ins.id);
@@ -121,10 +119,15 @@ function InsightRow({ ins, deleteConfirmId, setDeleteConfirmId, setModalInsight,
           >
             <TrashIcon className="w-4 h-4 pointer-events-none" />
           </button>
-          {/* drag handle icon */}
-          <DotsIcon
-            className="w-4 h-4 ml-2 opacity-60 group-hover:opacity-100 flex-none pointer-events-none"
-          />
+          {/* drag handle: only this starts drag so row click opens modal */}
+          <span
+            className="w-4 h-4 ml-2 flex items-center justify-center cursor-grab active:cursor-grabbing shrink-0 opacity-60 group-hover:opacity-100"
+            {...listeners}
+            {...attributes}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <DotsIcon className="w-4 h-4 pointer-events-none" />
+          </span>
         </>
       )}
     </div>

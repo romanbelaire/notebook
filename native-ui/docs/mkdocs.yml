@@ -1,0 +1,126 @@
+site_name: Notebook Native UI Documentation
+site_description: Comprehensive documentation for the Rust native UI infrastructure
+site_url: https://notebook-native-ui.readthedocs.io/
+repo_url: https://github.com/yourusername/notebook
+repo_name: notebook
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.annotate
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span__
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
+  - admonition
+  - pymdownx.details
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+nav:
+  - Home: index.md
+  - Architecture:
+    - architecture/overview.md
+    - architecture/components.md
+    - architecture/rendering.md
+    - architecture/events.md
+    - architecture/state.md
+    - architecture/layout.md
+  - Modules:
+    - modules/app.md
+    - Graphics:
+      - modules/gfx/index.md
+      - modules/gfx/renderer.md
+      - modules/gfx/renderable.md
+      - modules/gfx/components.md
+      - modules/gfx/types.md
+      - modules/gfx/icons.md
+      - modules/gfx/pdf_renderer.md
+    - UI:
+      - modules/ui/index.md
+      - modules/ui/core.md
+      - modules/ui/components.md
+      - modules/ui/windows.md
+      - modules/ui/input.md
+      - modules/ui/style.md
+      - modules/ui/events.md
+    - State:
+      - modules/state/index.md
+      - modules/state/chat.md
+      - modules/state/ui.md
+      - modules/state/settings.md
+      - modules/state/insights.md
+    - API:
+      - modules/api/index.md
+      - modules/api/client.md
+      - modules/api/models.md
+    - Persistence:
+      - modules/persistence/index.md
+      - modules/persistence/conversation.md
+      - modules/persistence/document.md
+      - modules/persistence/settings.md
+    - Stylus:
+      - modules/stylus/index.md
+    - Utils:
+      - modules/utils/index.md
+      - modules/utils/layout.md
+      - modules/utils/animation.md
+  - API Reference: api/index.md
+  - Guides:
+    - guides/creating-components.md
+    - guides/custom-rendering.md
+    - guides/event-handling.md
+    - guides/styling.md
+    - guides/testing.md
+  - Examples:
+    - examples/basic-component.md
+    - examples/custom-renderable.md
+    - examples/event-handler.md
+  - Reference:
+    - reference/dependencies.md
+    - reference/architecture-rules.md
+    - reference/known-issues.md
+    - reference/migration.md
+
+plugins:
+  - search
+  - minify:
+      minify_html: true
+
+extra:
+  version:
+    provider: mike
+

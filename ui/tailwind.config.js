@@ -1,5 +1,4 @@
-const ch = (v) => `rgb(from var(${v}) r g b / <alpha-value>)`;
-
+/** @type {import('tailwindcss').Config} */
 module.exports = {
   content: [
     "./index.html",
@@ -11,17 +10,17 @@ module.exports = {
         sans: ["Open Sans", "ui-sans-serif", "system-ui", "sans-serif"],
       },
       colors: {
-        primaryBg: ch("--color-primary-bg"),
-        secondaryBg: ch("--color-secondary-bg"),
-        headerBg: ch("--color-header-bg"),
-        trim: ch("--color-trim"),
-        default: ch("--color-defaultText"),
-        defaultText: ch("--color-defaultText"),
-        light: ch("--color-light-text"),
-        "light-text": ch("--color-light-text"),
-        accentText: ch("--color-accent-text"),
-        buttonBg: ch("--color-button-bg"),
-        "chat-assistant-bg": ch("--color-chat-assistant-bg"),
+        primaryBg: '#142338',
+        secondaryBg: '#16263c',
+        headerBg: '#111c2d',
+        trim: '#182529aa',
+        default: '#cadde2',
+        defaultText: '#cadde2',
+        light: '#ffffff',
+        'light-text': '#ffffff',
+        accentText: '#d48e33',
+        buttonBg: '#40404f',
+        'chat-assistant-bg': '#353f50',
       },
       keyframes: {
         wiggle: {
