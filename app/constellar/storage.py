@@ -41,6 +41,7 @@ def _ensure_tables(c: sqlite3.Connection) -> None:
             assistant_content TEXT,
             contexts TEXT,
             citations TEXT,
+            notes TEXT,
             content TEXT,
             role TEXT,
             PRIMARY KEY (id, graph_id),
@@ -57,6 +58,9 @@ def _ensure_tables(c: sqlite3.Connection) -> None:
             response TEXT NOT NULL
         );
     """)
+    columns = {row["name"] for row in c.execute("PRAGMA table_info(shards)").fetchall()}
+    if "notes" not in columns:
+        c.execute("ALTER TABLE shards ADD COLUMN notes TEXT")
     c.commit()
 
 
@@ -71,6 +75,7 @@ def _shard_from_row(row: sqlite3.Row) -> Shard:
         assistant_content=row["assistant_content"],
         contexts=json.loads(row["contexts"]) if row["contexts"] else [],
         citations=json.loads(row["citations"]) if row["citations"] else [],
+        notes=json.loads(row["notes"]) if row["notes"] else [],
         content=row["content"],
         role=row["role"],
     )
@@ -129,8 +134,8 @@ def save_graph(graph_id: str, graph: ConversationGraph, state: ActiveState) -> N
         conn.execute("DELETE FROM shards WHERE graph_id = ?", (graph_id,))
         for s in graph.shards.values():
             conn.execute(
-                """INSERT INTO shards (id, graph_id, parent_ids, created_at, visible, metadata, user_content, assistant_content, contexts, citations, content, role)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO shards (id, graph_id, parent_ids, created_at, visible, metadata, user_content, assistant_content, contexts, citations, notes, content, role)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     s.id,
                     graph_id,
@@ -142,6 +147,7 @@ def save_graph(graph_id: str, graph: ConversationGraph, state: ActiveState) -> N
                     s.assistant_content,
                     json.dumps(s.contexts),
                     json.dumps(s.citations),
+                    json.dumps(s.notes),
                     s.content,
                     s.role,
                 ),

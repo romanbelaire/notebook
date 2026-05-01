@@ -22,6 +22,7 @@ class Shard:
     assistant_content: str | None = None
     contexts: list[str] = field(default_factory=list)
     citations: list[dict[str, Any]] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
     # Special shard (system, external, summary)
     content: str | None = None
     role: str | None = None  # "system" | "external" | "summary"

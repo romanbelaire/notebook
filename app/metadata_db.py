@@ -174,6 +174,16 @@ def replace_chunks(conn: sqlite3.Connection, paper_id: int, chunks: List[str]) -
     conn.commit()
 
 
+def get_chunk_texts_for_paper(conn: sqlite3.Connection, paper_id: int) -> List[str]:
+    """Return stored chunk texts for a paper in order."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT text FROM chunks WHERE paper_id = ? ORDER BY chunk_index ASC",
+        (paper_id,),
+    )
+    return [row[0] for row in cur.fetchall()]
+
+
 def check_paper_by_sha256(conn: sqlite3.Connection, sha256: str) -> Optional[dict]:
     """Check if a paper with the given SHA256 hash already exists."""
     cur = conn.cursor()

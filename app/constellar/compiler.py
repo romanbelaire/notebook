@@ -36,6 +36,9 @@ def compile(
             if s.contexts:
                 ctx = "\n---\n".join(s.contexts)
                 user_content = f"Context:\n{ctx}\n\n{user_content}"
+            if s.notes:
+                notes_block = "\n".join(f"- {note}" for note in s.notes)
+                user_content = f"{user_content}\n\nUser notes on this message:\n{notes_block}"
             messages.append({"role": "user", "content": user_content})
             if s.assistant_content:
                 messages.append({"role": "assistant", "content": s.assistant_content})

@@ -5,7 +5,7 @@ import hashlib
 import base64
 import re
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import fitz  # PyMuPDF
@@ -211,8 +211,8 @@ def extract_pdf_from_firefox_document(file_path: str) -> Union[bytes, None]:
         return None
 
 
-def ingest_pdfs_with_progress(pdf_dir: str = "data/papers", db_dir: str = "db", task_id: str = None) -> None:
-    """Ingest PDFs with progress tracking."""
+def ingest_pdfs_with_progress(pdf_dir: str = "data/papers", db_dir: str = "db", task_id: str = None) -> dict:
+    """Ingest PDFs with progress tracking. Returns stats dict (ingested_new, skipped_duplicates, failed)."""
     try:
         # Count total PDFs first
         Path(pdf_dir).mkdir(parents=True, exist_ok=True)
@@ -228,7 +228,7 @@ def ingest_pdfs_with_progress(pdf_dir: str = "data/papers", db_dir: str = "db", 
             set_progress(task_id, 0, total_files, f"Starting ingestion of {total_files} PDFs")
         
         # Call original function with progress tracking
-        ingest_pdfs_internal(pdf_dir, db_dir, task_id)
+        return ingest_pdfs_internal(pdf_dir, db_dir, task_id)
         
     except Exception as e:
         if task_id:
@@ -237,7 +237,7 @@ def ingest_pdfs_with_progress(pdf_dir: str = "data/papers", db_dir: str = "db", 
         raise  # Re-raise so the task manager can capture it
 
 
-def ingest_pdfs_internal(pdf_dir: str = "data/papers", db_dir: str = "db", task_id: str = None) -> None:
+def ingest_pdfs_internal(pdf_dir: str = "data/papers", db_dir: str = "db", task_id: str = None) -> Dict[str, Any]:
     """Ingest all PDFs in `pdf_dir` into a vector store under `db_dir`.
 
     If *pdf_dir* does not exist, it is created automatically so users can simply
@@ -262,6 +262,8 @@ def ingest_pdfs_internal(pdf_dir: str = "data/papers", db_dir: str = "db", task_
     total_files = len(pdf_files)
     processed_files = 0
     actually_processed = 0
+    skipped_duplicates = 0
+    failed_ingest: List[str] = []
 
     for pdf in pdf_files:
         # Check if this is a Firefox PDF document and fix it first
@@ -275,6 +277,7 @@ def ingest_pdfs_internal(pdf_dir: str = "data/papers", db_dir: str = "db", task_
                 print(f"Successfully extracted and replaced Firefox PDF document: {pdf}")
             except Exception as e:
                 print(f"Error replacing Firefox PDF document {pdf}: {e}")
+                failed_ingest.append(f"{Path(pdf).name} — Firefox extract: {e}")
                 processed_files += 1
                 if task_id:
                     set_progress(task_id, processed_files, total_files, f"Error processing {processed_files}/{total_files} PDFs")
@@ -291,6 +294,7 @@ def ingest_pdfs_internal(pdf_dir: str = "data/papers", db_dir: str = "db", task_
             existing_paper = check_paper_by_sha256(conn, sha256_hash)
             if existing_paper:
                 print(f"Skipping {pdf} - already ingested (SHA256: {sha256_hash[:8]}...)")
+                skipped_duplicates += 1
                 processed_files += 1
                 if task_id:
                     set_progress(task_id, processed_files, total_files, f"Skipped duplicate {processed_files}/{total_files} PDFs")
@@ -396,6 +400,7 @@ def ingest_pdfs_internal(pdf_dir: str = "data/papers", db_dir: str = "db", task_
             upsert_paper_embedding(conn, paper_id, paper_vector)
         except Exception as e:
             print(f"Error storing metadata for {pdf}: {e}")
+            failed_ingest.append(f"{Path(pdf).name} — metadata: {e}")
             # Continue to next file if metadata storage fails
             processed_files += 1
             if task_id:
@@ -435,6 +440,14 @@ def ingest_pdfs_internal(pdf_dir: str = "data/papers", db_dir: str = "db", task_
     print(
         f"Ingested {actually_processed} new PDFs (skipped {len(pdf_files) - actually_processed} duplicates) with {len(chunks)} text chunks into '{db_dir}'."
     )
+
+    return {
+        "kind": "directory_ingest",
+        "ingested_new": actually_processed,
+        "duplicates_removed": skipped_duplicates,
+        "failed_count": len(failed_ingest),
+        "failed": failed_ingest,
+    }
 
 
 def ingest_pdfs(pdf_dir: str = "data/papers", db_dir: str = "db") -> None:

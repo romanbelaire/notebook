@@ -17,6 +17,7 @@ import uuid
 import hashlib
 import base64
 import re
+import urllib.request
 from functools import lru_cache
 import numpy as np
 import glob
@@ -41,10 +42,19 @@ from app.constellar import (
     list_graphs as constellar_list_graphs,
     save_graph as constellar_save_graph,
     send as constellar_send,
+    set_notes as constellar_set_notes,
     set_visibility as constellar_set_visibility,
+    remove_shard as constellar_remove_shard,
 )
 from app.constellar.models import ActiveState, ConversationGraph, Shard as ConstellarShard
-from app.task_manager import submit as submit_task, status as task_status, result as task_result, exception as task_exception, get_progress as task_progress
+from app.task_manager import (
+    submit as submit_task,
+    status as task_status,
+    result as task_result,
+    exception as task_exception,
+    get_progress as task_progress,
+    set_progress as task_set_progress,
+)
 from app.ingest import ingest_pdfs, ingest_pdfs_with_progress
 from app.shard_store import ShardStore
 from app.metadata_db import (
@@ -167,6 +177,15 @@ class IngestResponse(BaseModel):
     task_id: str
 
 
+class ArxivImportRequest(BaseModel):
+    input_text: str
+
+
+class ArxivImportResponse(BaseModel):
+    task_id: str
+    ids: List[str]
+
+
 class TaskStatusResponse(BaseModel):
     status: str
     result: Optional[Any] = None  # noqa: ANN401 – may be arbitrary JSON
@@ -204,13 +223,14 @@ class Paper(BaseModel):
     year: Optional[str] = None
     sha256: Optional[str] = None
     added_at: str
+    exists: bool = True
 
 
 class Collection(BaseModel):
     id: int
     name: str
     created_at: str
-    papers: Optional[List[Paper]] = None
+    papers: List[Paper] = Field(default_factory=list)
 
 
 class CreateCollectionRequest(BaseModel):
@@ -227,6 +247,10 @@ class RenameCollectionRequest(BaseModel):
 
 class RemovePapersRequest(BaseModel):
     paper_ids: list[int]
+
+
+class ReconcilePapersRequest(BaseModel):
+    prune_missing: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +488,7 @@ class GraphShardCreateRequest(BaseModel):
     assistant_content: Optional[str] = None
     contexts: List[str] = Field(default_factory=list)
     citations: List[Dict[str, Any]] = Field(default_factory=list)
+    notes: List[str] = Field(default_factory=list)
     # Special shard
     content: Optional[str] = None
     role: Optional[Literal["system", "external", "summary"]] = None
@@ -471,11 +496,20 @@ class GraphShardCreateRequest(BaseModel):
 
 class GraphShardPatchRequest(BaseModel):
     visible: Optional[bool] = None
+    notes: Optional[List[str]] = None
 
 
 class GraphCompileRequest(BaseModel):
     current_leaf_id: str
     user_draft: str
+
+
+class GraphMention(BaseModel):
+    kind: Literal["paper", "shard", "graph", "notepad"]
+    paper_id: Optional[int] = None
+    graph_id: Optional[str] = None
+    shard_id: Optional[str] = None
+    document_id: Optional[str] = None
 
 
 class GraphSendRequest(BaseModel):
@@ -487,6 +521,8 @@ class GraphSendRequest(BaseModel):
     temperature: float = 0.2
     max_tokens: int = 1024
     model_token_limit: int = 128000
+    system_prompt: Optional[str] = None
+    mentions: List[GraphMention] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +552,104 @@ def embed(req: EmbedRequest):
 # ---------------------------------------------------------------------------
 # PDF ingestion – potentially long-running, hence executed in background.
 # ---------------------------------------------------------------------------
+
+# New-style arXiv IDs: four digits, dot, five digits, optional "v" + digits (e.g. .../abs/2510.18728v1).
+# Use lookarounds instead of \\b: between a digit and "v" there is no word boundary.
+ARXIV_ID_PATTERN = re.compile(
+    r"(?<![\d.])(\d{4}\.\d{5}(?:v\d+)?)(?![\d.])",
+    re.IGNORECASE,
+)
+
+
+def _extract_arxiv_ids(raw_text: str) -> List[str]:
+    ids = [m.group(1) for m in ARXIV_ID_PATTERN.finditer(raw_text)]
+    deduped_ids: list[str] = []
+    seen: set[str] = set()
+    for arxiv_id in ids:
+        if arxiv_id in seen:
+            continue
+        seen.add(arxiv_id)
+        deduped_ids.append(arxiv_id)
+    return deduped_ids
+
+
+def _download_arxiv_pdf(arxiv_id: str, papers_dir: Path) -> Path:
+    url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "NotebookArxivImporter/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        if response.status != 200:
+            raise RuntimeError(f"Failed to fetch arXiv PDF {arxiv_id}: HTTP {response.status}")
+        pdf_bytes = response.read()
+    if not pdf_bytes.startswith(b"%PDF"):
+        raise ValueError(f"Fetched content is not a PDF for arXiv ID {arxiv_id}")
+    target_path = papers_dir / f"arxiv_{arxiv_id}.pdf"
+    target_path.write_bytes(pdf_bytes)
+    return target_path
+
+
+def _import_arxiv_and_ingest(arxiv_ids: List[str], task_id: str) -> Dict[str, Any]:
+    papers_dir = Path("data") / "papers"
+    papers_dir.mkdir(parents=True, exist_ok=True)
+    total_downloads = len(arxiv_ids)
+    downloaded_ids: list[str] = []
+    failed: list[str] = []
+    for idx, arxiv_id in enumerate(arxiv_ids, start=1):
+        task_set_progress(task_id, idx - 1, total_downloads, f"Downloading {arxiv_id}")
+        try:
+            _download_arxiv_pdf(arxiv_id, papers_dir)
+            downloaded_ids.append(arxiv_id)
+        except Exception as e:
+            failed.append(f"arxiv:{arxiv_id} — {e}")
+        task_set_progress(task_id, idx, total_downloads, f"Finished {arxiv_id}")
+
+    if not downloaded_ids:
+        return {
+            "kind": "arxiv_import",
+            "retrieved": 0,
+            "duplicates_removed": 0,
+            "failed_count": len(failed),
+            "failed": failed,
+            "ingested_new": 0,
+        }
+
+    ingest_stats = ingest_pdfs_with_progress(pdf_dir=papers_dir.as_posix(), task_id=task_id)
+    failed.extend(ingest_stats["failed"])
+    return {
+        "kind": "arxiv_import",
+        "retrieved": len(downloaded_ids),
+        "duplicates_removed": ingest_stats["duplicates_removed"],
+        "failed_count": len(failed),
+        "failed": failed,
+        "ingested_new": ingest_stats["ingested_new"],
+    }
+
+
+@app.post("/import/arxiv", response_model=ArxivImportResponse, status_code=status.HTTP_202_ACCEPTED)
+def import_arxiv(req: ArxivImportRequest):
+    arxiv_ids = _extract_arxiv_ids(req.input_text)
+    if not arxiv_ids:
+        raise HTTPException(status_code=400, detail="No arXiv IDs found in input.")
+    task_id = submit_task(_import_arxiv_and_ingest, arxiv_ids=arxiv_ids)
+    return ArxivImportResponse(task_id=task_id, ids=arxiv_ids)
+
+
+@app.post("/import/arxiv/bibtex", response_model=ArxivImportResponse, status_code=status.HTTP_202_ACCEPTED)
+async def import_arxiv_bibtex(file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided")
+    if not file.filename.lower().endswith(".bib"):
+        raise HTTPException(status_code=400, detail="Only .bib files are allowed")
+    raw_bytes = await file.read()
+    raw_text = raw_bytes.decode("utf-8")
+    arxiv_ids = _extract_arxiv_ids(raw_text)
+    if not arxiv_ids:
+        raise HTTPException(status_code=400, detail="No arXiv IDs found in BibTeX file.")
+    task_id = submit_task(_import_arxiv_and_ingest, arxiv_ids=arxiv_ids)
+    return ArxivImportResponse(task_id=task_id, ids=arxiv_ids)
+
 
 @app.post("/ingest", response_model=IngestResponse, status_code=status.HTTP_202_ACCEPTED)
 def ingest(req: IngestRequest):
@@ -633,6 +767,7 @@ def _shard_to_dict(s: ConstellarShard) -> Dict[str, Any]:
         "assistant_content": s.assistant_content,
         "contexts": s.contexts,
         "citations": s.citations,
+        "notes": s.notes,
         "content": s.content,
         "role": s.role,
     }
@@ -685,6 +820,7 @@ def graph_add_shard(graph_id: str, payload: GraphShardCreateRequest):
         assistant_content=payload.assistant_content or "",
         contexts=payload.contexts,
         citations=payload.citations,
+        notes=payload.notes,
         content=payload.content,
         role=payload.role,
     )
@@ -707,6 +843,25 @@ def graph_patch_shard(graph_id: str, shard_id: str, payload: GraphShardPatchRequ
         raise HTTPException(status_code=404, detail="Shard not found")
     if payload.visible is not None:
         constellar_set_visibility(graph, shard_id, payload.visible)
+    if payload.notes is not None:
+        constellar_set_notes(graph, shard_id, payload.notes)
+    constellar_save_graph(graph_id, graph, state)
+
+
+@app.delete("/graph/{graph_id}/shard/{shard_id}", status_code=status.HTTP_204_NO_CONTENT)
+def graph_delete_shard(graph_id: str, shard_id: str):
+    try:
+        graph, state = constellar_load_graph(graph_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if shard_id not in graph.shards:
+        raise HTTPException(status_code=404, detail="Shard not found")
+    try:
+        constellar_remove_shard(graph, shard_id)
+    except GraphValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if state.current_leaf_id == shard_id:
+        state.current_leaf_id = max(graph.shards.values(), key=lambda s: s.created_at).id
     constellar_save_graph(graph_id, graph, state)
 
 
@@ -765,6 +920,7 @@ def graph_send(graph_id: str, payload: GraphSendRequest):
     rag = _get_rag(model_id) if payload.provider == "local" else None
     retrieval = _get_retrieval().retrieve  # (query, k) -> list of (text, meta); used for RAG
     try:
+        mention_dicts = [m.model_dump(exclude_none=True) for m in payload.mentions]
         response, new_leaf_id, token_count, contexts, citations = constellar_send(
             graph_id,
             payload.current_leaf_id,
@@ -777,6 +933,8 @@ def graph_send(graph_id: str, payload: GraphSendRequest):
             model_token_limit=payload.model_token_limit,
             rag=rag,
             retrieval=retrieval,
+            system_prompt=payload.system_prompt,
+            mentions=mention_dicts or None,
         )
     except TokenLimitExceeded as exc:
         logger.warning("graph_send: token limit exceeded count=%s limit=%s", exc.count, exc.limit)
@@ -809,8 +967,26 @@ def get_papers():
     try:
         conn = get_connection()
         rows = list_papers(conn)
+        rows = _annotate_paper_rows(rows)
         conn.close()
         return rows
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/papers/reconcile")
+def reconcile_papers(payload: ReconcilePapersRequest):
+    try:
+        conn = get_connection()
+        rows = list_papers(conn)
+        valid_rows, stale_rows = _reconcile_paper_rows(conn, rows, prune_missing=payload.prune_missing)
+        conn.close()
+        return {
+            "pruned": payload.prune_missing,
+            "valid_count": len(valid_rows),
+            "stale_count": len(stale_rows),
+            "stale": stale_rows,
+        }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -932,6 +1108,7 @@ def get_collections():
         collections = []
         for collection_data in collection_rows:
             papers = list_papers_for_collection(conn, collection_data["id"])
+            papers = _annotate_paper_rows(papers)
             collection_with_papers = {
                 **collection_data,
                 "papers": papers
@@ -942,6 +1119,58 @@ def get_collections():
         return collections
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def _resolve_papers_dir() -> Path | None:
+    config_path = Path("data/pdf_dir.txt")
+    if not config_path.exists():
+        return None
+    configured = config_path.read_text(encoding="utf-8").strip()
+    if not configured:
+        return None
+    return Path(configured)
+
+
+def _paper_file_exists(filename: str, papers_dir: Path | None) -> bool:
+    if filename.lower().endswith(".pdf"):
+        if papers_dir is None:
+            return False
+        return (papers_dir / filename).is_file()
+    if filename.lower().endswith(".md"):
+        return (notes_static_dir / filename).is_file()
+    return True
+
+
+def _annotate_paper_rows(rows: list[dict]) -> list[dict]:
+    papers_dir = _resolve_papers_dir()
+    annotated: list[dict] = []
+    for row in rows:
+        row_with_exists = dict(row)
+        row_with_exists["exists"] = _paper_file_exists(row["filename"], papers_dir)
+        annotated.append(row_with_exists)
+    return annotated
+
+
+def _reconcile_paper_rows(conn, rows: list[dict], prune_missing: bool) -> tuple[list[dict], list[dict]]:
+    annotated_rows = _annotate_paper_rows(rows)
+    valid_rows: list[dict] = []
+    stale_rows: list[dict] = []
+    stale_ids: list[int] = []
+
+    for row in annotated_rows:
+        if row["exists"]:
+            valid_rows.append(row)
+            continue
+        stale_ids.append(row["id"])
+        stale_rows.append({"id": row["id"], "filename": row["filename"]})
+
+    if prune_missing and stale_ids:
+        cur = conn.cursor()
+        for paper_id in stale_ids:
+            cur.execute("DELETE FROM papers WHERE id = ?", (paper_id,))
+        conn.commit()
+
+    return valid_rows, stale_rows
 
 
 @app.post("/collections", response_model=Collection, status_code=status.HTTP_201_CREATED)
