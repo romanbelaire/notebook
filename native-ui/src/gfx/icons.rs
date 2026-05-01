@@ -78,6 +78,7 @@ impl IconRegistry {
         icons.insert("windowed".to_string(), include_str!("../../assets/icons/windowed.svg"));
         icons.insert("zap".to_string(), include_str!("../../assets/icons/zap.svg"));
         icons.insert("zap-yellow".to_string(), include_str!("../../assets/icons/zap-yellow.svg"));
+        icons.insert("save".to_string(), include_str!("../../assets/icons/save.svg"));
         
         Self { icons }
     }

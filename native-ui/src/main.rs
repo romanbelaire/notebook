@@ -1,4 +1,6 @@
+#![allow(warnings)]
 mod app;
+mod clipboard;
 mod gfx;
 mod ui;
 mod state;
@@ -6,6 +8,7 @@ mod api;
 mod utils;
 mod stylus;
 mod persistence;
+
 
 use crate::app::App;
 use crate::gfx::renderer::Renderer;
@@ -93,6 +96,7 @@ impl ApplicationHandler<WindowControlEvent> for NotebookApp {
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     state.app.on_cursor_moved(position);
+                    state.window.set_cursor_icon(state.app.desired_cursor_icon);
                     state.window.request_redraw();
                 }
                 WindowEvent::KeyboardInput { event, .. } => {

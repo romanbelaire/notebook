@@ -245,6 +245,26 @@ Components are rendered in z-order:
 4. Modals (z-order 30)
 5. Header (z-order 100)
 
+That ordering is the **component tree** traversal sort. **Text and icons** also depend on `CompositeLayer` in `src/gfx/renderer.rs` (see below): a label can sit under later layers if it was queued on an earlier compositing layer, even when the parent component’s z-order is high.
+
+## GPU compositing layers
+
+Vello-backed **queued** text and icons carry the renderer’s current `CompositeLayer` at queue time (`Renderer::set_composite_layer`). Each frame, `Renderer` draws geometry and runs batched Vello blits **per layer** in a fixed order (`COMPOSITE_DRAW_ORDER` in `src/gfx/renderer.rs`):
+
+1. `Background`
+2. `MainContent`
+3. `ConstellationText`
+4. `SidebarChrome`
+5. `ComposerChrome`
+6. `HudChrome`
+7. `Modal`
+
+`ConstellationText` runs **after** `MainContent`. Any queued label whose layer is still `MainContent` or `SidebarChrome` can end up **under** constellation text and look missing. Overlays that must read on top (constellation **tooltip**, **right-click context menu**) therefore switch to `HudChrome` before queueing their `Text`—see `src/gfx/components/chat/window.rs`.
+
+**Sidebar (`src/gfx/components/sidebar_content.rs`):** **Quads** (panel chrome, row highlights, solid buttons) stay on `SidebarChrome`. **Every** sidebar string—section titles (“Conversations”, “Documents”, “Insights”), “+” button labels, and scroll-clipped **row** labels—must be queued on `HudChrome`: wrap each `Text::render` with `set_composite_layer(HudChrome)`, then restore `SidebarChrome` before the next `add_quad` / `queue_icon`. If only row labels use `HudChrome` while titles remain on `SidebarChrome`, either headers or rows can disappear depending on blit ordering; matching **all** sidebar typography to the same `HudChrome` pattern as the context menu keeps headers and lists visible together.
+
+**Notepad (`src/gfx/components/notepad.rs`):** The sheet background and stylus editor stay on `MainContent`. The title field, icon buttons, formatting toolbar, and @-mention popup switch to `HudChrome` for the same reason: later passes in `COMPOSITE_DRAW_ORDER` can paint over `MainContent` pixels; Vello text queued on `MainContent` would then appear in logs but not on screen.
+
 ## Error Handling
 
 Rendering errors are handled gracefully:

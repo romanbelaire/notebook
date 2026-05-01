@@ -1,5 +1,42 @@
 use serde::{Serialize, Deserialize};
 
+/// User-defined prompt invoked from chat as `/name` (name is matched case-insensitively).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemPromptEntry {
+    pub id: String,
+    pub name: String,
+    pub content: String,
+}
+
+fn default_system_prompts() -> Vec<SystemPromptEntry> {
+    Vec::new()
+}
+
+/// If input starts with `/token` and *token* matches a named prompt, returns (user message after command, system text).
+/// Otherwise returns (trimmed original, None).
+pub fn parse_slash_system_prompt(text: &str, prompts: &[SystemPromptEntry]) -> (String, Option<String>) {
+    let t = text.trim();
+    if !t.starts_with('/') {
+        return (t.to_string(), None);
+    }
+    let after = &t[1..];
+    let first_space = after.find(' ');
+    let (token, user_rest) = match first_space {
+        Some(i) => (&after[..i], after[i + 1..].trim_start()),
+        None => (after, ""),
+    };
+    if token.is_empty() {
+        return (t.to_string(), None);
+    }
+    let token_lower = token.to_lowercase();
+    for p in prompts {
+        if p.name.to_lowercase() == token_lower {
+            return (user_rest.to_string(), Some(p.content.clone()));
+        }
+    }
+    (t.to_string(), None)
+}
+
 fn default_provider() -> String {
     "local".to_string()
 }
@@ -22,6 +59,8 @@ pub struct SettingsState {
     pub openai_model: String,
     pub theme: String,
     pub api_base_url: Option<String>,
+    #[serde(default = "default_system_prompts")]
+    pub system_prompts: Vec<SystemPromptEntry>,
 }
 
 impl SettingsState {
@@ -31,8 +70,9 @@ impl SettingsState {
             model_id: default_local_model_id().to_string(),
             provider: default_provider(),
             openai_model: default_openai_model(),
-            theme: "dark".to_string(),
+            theme: "standard".to_string(),
             api_base_url: Some("http://localhost:8000".to_string()),
+            system_prompts: Vec::new(),
         }
     }
 

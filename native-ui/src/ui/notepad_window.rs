@@ -3,6 +3,7 @@ use crate::stylus::StylusEditor;
 use crate::ui::components::Renderable;
 use crate::ui::text_editor::TextEditor;
 use crate::ui::{TextInput, Button, NotepadModal, Toolbar};
+use crate::ui::chat_window::MentionEntry;
 
 pub struct NotepadWindow {
     pub position: Vec2,
@@ -16,6 +17,11 @@ pub struct NotepadWindow {
     pub toolbar: Toolbar,
     pub notepad_modal: NotepadModal,
     pub document_title: String,
+    /// `@` mention picker (papers, shards, graphs, notepad docs).
+    pub mention_popup_open: bool,
+    pub mention_selected_index: usize,
+    pub mention_filter: String,
+    pub mention_rows: Vec<MentionEntry>,
 }
 
 impl NotepadWindow {
@@ -39,16 +45,17 @@ impl NotepadWindow {
         title_input.placeholder = "Untitled Note".to_string();
         title_input.text = "Untitled Note".to_string();
 
-        // CRUD buttons
-        const BUTTON_HEIGHT: f32 = 32.0;
-        const BUTTON_WIDTH: f32 = 80.0;
-        let new_button = Button::new(Vec2::ZERO, Vec2::new(BUTTON_WIDTH, BUTTON_HEIGHT), "New");
-        let save_button = Button::new(Vec2::ZERO, Vec2::new(BUTTON_WIDTH, BUTTON_HEIGHT), "Save");
-        let open_button = Button::new(Vec2::ZERO, Vec2::new(BUTTON_WIDTH, BUTTON_HEIGHT), "Open");
-        let delete_button = Button::new(Vec2::ZERO, Vec2::new(BUTTON_WIDTH, BUTTON_HEIGHT), "Delete");
+        // Title row actions (icons; labels are render keys, see notepad.rs render_button)
+        const ICON_BTN: f32 = 32.0;
+        let icon_sz = Vec2::new(ICON_BTN, ICON_BTN);
+        let new_button = Button::new(Vec2::ZERO, icon_sz, "__plus");
+        let save_button = Button::new(Vec2::ZERO, icon_sz, "__save");
+        let open_button = Button::new(Vec2::ZERO, icon_sz, "__open");
+        let delete_button = Button::new(Vec2::ZERO, icon_sz, "__delete");
 
-        // Toolbar
-        let toolbar = Toolbar::new(Vec2::ZERO, size.x - padding * 2.0);
+        // Toolbar (with drop shadow)
+        let toolbar = Toolbar::new(Vec2::ZERO, size.x - padding * 2.0)
+            .with_shadow(crate::ui::style::elevation::LOW());
 
         // Modal
         let notepad_modal = NotepadModal::new();
@@ -65,23 +72,155 @@ impl NotepadWindow {
             toolbar,
             notepad_modal,
             document_title: "Untitled Note".to_string(),
+            mention_popup_open: false,
+            mention_selected_index: 0,
+            mention_filter: String::new(),
+            mention_rows: Vec::new(),
         };
 
         window.update_layout();
         window
     }
 
+    pub fn sync_mention_popup_from_editor(
+        &mut self,
+        papers: &[crate::api::models::ApiPaper],
+        graph_state: &crate::state::GraphState,
+        conversations: &[crate::state::chat::Conversation],
+        notepad_documents: &[(String, String)],
+    ) {
+        if !self.mention_popup_open {
+            return;
+        }
+        let Some(ref cursor) = self.editor.cursor else {
+            self.mention_popup_open = false;
+            self.mention_rows.clear();
+            return;
+        };
+        let Some(block) = self.editor.document.get_block(&cursor.block_id) else {
+            self.mention_popup_open = false;
+            self.mention_rows.clear();
+            return;
+        };
+        let Some(text) = block.content.get_text() else {
+            self.mention_popup_open = false;
+            self.mention_rows.clear();
+            return;
+        };
+        let cur = cursor.position.min(text.len());
+        let before: String = text.chars().take(cur).collect();
+        if let Some(last_at) = before.rfind('@') {
+            let after = &before[last_at.saturating_add(1)..];
+            if after.contains(' ') || after.contains('\n') {
+                self.mention_popup_open = false;
+                self.mention_rows.clear();
+            } else {
+                self.mention_filter = after.to_string();
+                self.mention_selected_index = 0;
+                self.rebuild_mention_rows(papers, graph_state, conversations, notepad_documents);
+            }
+        } else {
+            self.mention_popup_open = false;
+            self.mention_rows.clear();
+        }
+    }
+
+    fn rebuild_mention_rows(
+        &mut self,
+        papers: &[crate::api::models::ApiPaper],
+        graph_state: &crate::state::GraphState,
+        conversations: &[crate::state::chat::Conversation],
+        notepad_documents: &[(String, String)],
+    ) {
+        self.mention_rows.clear();
+        let fl = self.mention_filter.to_lowercase();
+        let matches = |s: &str| fl.is_empty() || s.to_lowercase().contains(&fl);
+        for p in papers {
+            let label = p.title.as_deref().unwrap_or(p.filename.as_str());
+            if matches(label) || matches(&p.filename) {
+                self.mention_rows.push(MentionEntry::Paper(p.id));
+            }
+        }
+        if let Some(gid) = graph_state.graph_id.as_ref() {
+            for id in graph_state.nodes.keys() {
+                if matches(id.as_str()) {
+                    self.mention_rows.push(MentionEntry::Shard {
+                        graph_id: gid.clone(),
+                        shard_id: id.clone(),
+                    });
+                }
+            }
+        }
+        let mut seen_graph: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for c in conversations {
+            if let Some(ref gid) = c.graph_id {
+                if seen_graph.insert(gid.clone()) && (matches(&c.title) || matches(gid.as_str())) {
+                    self.mention_rows.push(MentionEntry::Graph {
+                        graph_id: gid.clone(),
+                    });
+                }
+            }
+        }
+        for (doc_id, title) in notepad_documents {
+            if matches(title.as_str()) || matches(doc_id.as_str()) {
+                self.mention_rows.push(MentionEntry::Notepad {
+                    document_id: doc_id.clone(),
+                    title: title.clone(),
+                });
+            }
+        }
+        if self.mention_selected_index >= self.mention_rows.len() && !self.mention_rows.is_empty() {
+            self.mention_selected_index = self.mention_rows.len() - 1;
+        }
+        self.mention_rows.truncate(20);
+    }
+
+    pub fn mention_popup_rect(&self) -> Option<crate::ui::core::Rect> {
+        if !self.mention_popup_open || self.mention_rows.is_empty() {
+            return None;
+        }
+        let n = self.mention_rows.len().min(12);
+        let row_h = 28.0;
+        let h = n as f32 * row_h + 8.0;
+        let ip = self.editor.position;
+        let is = self.editor.size;
+        Some(crate::ui::core::Rect::new(
+            ip.x,
+            ip.y - h - 4.0,
+            is.x,
+            h,
+        ))
+    }
+
+    pub fn apply_mention_row_selection(&mut self, index: usize) {
+        if index >= self.mention_rows.len() {
+            return;
+        }
+        let replacement = match self.mention_rows[index].clone() {
+            MentionEntry::Paper(id) => format!("@paper:{} ", id),
+            MentionEntry::Shard {
+                graph_id,
+                shard_id,
+            } => format!("@shard:{}:{} ", graph_id, shard_id),
+            MentionEntry::Graph { graph_id } => format!("@graph:{} ", graph_id),
+            MentionEntry::Notepad { document_id, .. } => format!("@notepad:{} ", document_id),
+        };
+        self.editor.replace_active_at_mention(&replacement);
+        self.mention_popup_open = false;
+        self.mention_rows.clear();
+    }
+
     pub fn update_layout(&mut self) {
         use crate::ui::style;
         use crate::ui::core::{Rect, layout};
+        use crate::ui::components::Renderable;
         
         let padding = style::padding::LARGE;
-        const TITLE_HEIGHT: f32 = 40.0;
-        const BUTTON_ROW_HEIGHT: f32 = 36.0;
-        const TOOLBAR_HEIGHT: f32 = 36.0;
-        const SPACING: f32 = 8.0;
+        const TITLE_ROW_HEIGHT: f32 = 40.0;
+        const TOOLBAR_HEIGHT: f32 = 40.0;
+        const ICON_BTN: f32 = 32.0;
+        const SPACING: f32 = style::padding::SMALL;
 
-        // Create window rect with padding
         let window_rect = Rect::new(
             self.position.x,
             self.position.y,
@@ -89,63 +228,44 @@ impl NotepadWindow {
             self.size.y,
         );
         let content_rect = window_rect.inset(padding);
-        
-        let mut y_offset = content_rect.y;
-        
-        // Title input area
+
+        // vstack: title row (title left + icon hstack right), toolbar, editor
+        let top_heights = [TITLE_ROW_HEIGHT, TOOLBAR_HEIGHT];
+        let top_rects = layout::stack_vertical(&content_rect, &top_heights, SPACING, 0.0);
+
+        let title_row_rect = top_rects[0];
+        let actions_width = 4.0 * ICON_BTN + 3.0 * SPACING;
+        let title_left_w = (title_row_rect.width - actions_width - SPACING).max(0.0);
         let title_rect = Rect::new(
-            content_rect.x,
-            y_offset,
-            content_rect.width * 0.6, // Title takes 60% of width
-            TITLE_HEIGHT,
+            title_row_rect.x,
+            title_row_rect.y,
+            title_left_w,
+            TITLE_ROW_HEIGHT,
         );
         self.title_input.update_layout(title_rect, None, None);
-        y_offset += TITLE_HEIGHT + SPACING;
-        
-        // Button row
-        let button_row_rect = Rect::new(
-            content_rect.x,
-            y_offset,
-            content_rect.width,
-            BUTTON_ROW_HEIGHT,
-        );
-        let button_widths = [80.0, 80.0, 80.0, 80.0];
-        let button_rects = layout::stack_horizontal(&button_row_rect, &button_widths, SPACING, 0.0);
-        if let Some(rect) = button_rects.get(0) {
-            self.new_button.position = rect.position();
-        }
-        if let Some(rect) = button_rects.get(1) {
-            self.save_button.position = rect.position();
-        }
-        if let Some(rect) = button_rects.get(2) {
-            self.open_button.position = rect.position();
-        }
-        if let Some(rect) = button_rects.get(3) {
-            self.delete_button.position = rect.position();
-        }
-        y_offset += BUTTON_ROW_HEIGHT + SPACING;
-        
-        // Toolbar
-        let toolbar_rect = Rect::new(
-            content_rect.x,
-            y_offset,
-            content_rect.width,
-            TOOLBAR_HEIGHT,
-        );
-        self.toolbar.position = toolbar_rect.position();
-        self.toolbar.size = toolbar_rect.size();
-        self.toolbar.update_layout();
-        y_offset += TOOLBAR_HEIGHT + SPACING;
-        
-        // Editor area below toolbar
-        let editor_height = content_rect.bottom() - y_offset;
+
+        let actions_x = title_row_rect.x + title_left_w + SPACING;
+        let actions_row = Rect::new(actions_x, title_row_rect.y, actions_width, TITLE_ROW_HEIGHT);
+        let icon_row_y = actions_row.y + (actions_row.height - ICON_BTN) * 0.5;
+        let icon_hstack = Rect::new(actions_row.x, icon_row_y, actions_width, ICON_BTN);
+        let button_widths = [ICON_BTN, ICON_BTN, ICON_BTN, ICON_BTN];
+        let button_rects = layout::stack_horizontal(&icon_hstack, &button_widths, SPACING, 0.0);
+        Renderable::update_layout(&mut self.new_button, button_rects[0], None, None);
+        Renderable::update_layout(&mut self.save_button, button_rects[1], None, None);
+        Renderable::update_layout(&mut self.open_button, button_rects[2], None, None);
+        Renderable::update_layout(&mut self.delete_button, button_rects[3], None, None);
+
+        let toolbar_rect = top_rects[1];
+        Renderable::update_layout(&mut self.toolbar, toolbar_rect, None, None);
+
+        let editor_top = toolbar_rect.bottom() + SPACING;
+        let editor_height = (content_rect.bottom() - editor_top).max(0.0);
         let editor_rect = Rect::new(
             content_rect.x,
-            y_offset,
+            editor_top,
             content_rect.width,
             editor_height,
         );
-        
         self.editor.position = editor_rect.position();
         self.editor.size = editor_rect.size();
     }
@@ -282,6 +402,7 @@ impl NotepadWindow {
                         filename: format!("{}.json", doc_id),
                         authors: None,
                         year: None,
+                        exists: true,
                     });
                 }
             }
@@ -290,6 +411,22 @@ impl NotepadWindow {
     }
 
     pub fn hit_test(&mut self, pos: Vec2) -> NotepadHit {
+        if self.mention_popup_open {
+            if let Some(rect) = self.mention_popup_rect() {
+                if rect.contains_point(pos) {
+                    const ROW: f32 = 28.0;
+                    const PAD: f32 = 4.0;
+                    let inner_y = pos.y - rect.y - PAD;
+                    if inner_y >= 0.0 {
+                        let idx = (inner_y / ROW) as usize;
+                        if idx < self.mention_rows.len() {
+                            return NotepadHit::MentionItem(idx);
+                        }
+                    }
+                    return NotepadHit::Background;
+                }
+            }
+        }
         // Check modal first (if open)
         if self.notepad_modal.is_open {
             if self.notepad_modal.contains(pos) {
@@ -345,6 +482,7 @@ impl NotepadWindow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotepadHit {
+    MentionItem(usize),
     TitleInput,
     NewButton,
     SaveButton,

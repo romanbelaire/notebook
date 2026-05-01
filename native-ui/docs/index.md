@@ -10,7 +10,7 @@ The Notebook Native UI is a modern, GPU-accelerated user interface framework bui
 - **Native Feel**: Direct window management and event handling via winit
 - **Type Safety**: Leverages Rust's type system for compile-time guarantees
 - **Modular Architecture**: Component-based design with clear separation of concerns
-- **Rich Text Support**: Advanced text rendering with Parley and markdown support
+- **Rich Text Support**: Advanced text rendering with Parley; see [Markdown rendering](guides/markdown-rendering.md)
 
 ## Quick Start
 
@@ -121,6 +121,8 @@ This documentation is organized into several sections:
 - **[Modules](modules/app.md)**: Detailed documentation for each module
 - **[API Reference](api/index.md)**: Complete API documentation
 - **[Guides](guides/creating-components.md)**: Step-by-step development guides
+- **[Markdown rendering](guides/markdown-rendering.md)**: Constellation/chat CommonMark support, lists, emphasis, layout rules
+- **[Design language — cassette futurism](design/cassette-futurism.md)**: Motivation, goal→principle map, token roles, hero layout reference, motion guidelines
 - **[Examples](examples/basic-component.md)**: Code examples and tutorials
 - **[Reference](reference/dependencies.md)**: Dependencies, architecture rules, migration notes
 

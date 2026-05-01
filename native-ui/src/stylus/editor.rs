@@ -259,6 +259,62 @@ impl StylusEditor {
         self.has_unsaved_changes = true;
     }
 
+    /// Split the current block at the cursor position into two blocks.
+    /// The text before the cursor stays in the current block; text from the
+    /// cursor onwards moves into a new Paragraph block inserted immediately after.
+    pub fn split_block_at_cursor(&mut self) {
+        let (block_id, pos) = if let Some(ref c) = self.cursor {
+            (c.block_id.clone(), c.position)
+        } else {
+            return;
+        };
+
+        let (before_text, after_text, before_formats, after_formats) = {
+            let Some(block) = self.document.get_block(&block_id) else { return; };
+            let BlockContent::Text { ref text, ref formats } = block.content else { return; };
+            let split = pos.min(text.len());
+            let before = text[..split].to_string();
+            let after = text[split..].to_string();
+            let mut bf: Vec<crate::stylus::formatting::FormatSpan> = Vec::new();
+            let mut af: Vec<crate::stylus::formatting::FormatSpan> = Vec::new();
+            for span in formats {
+                let s = span.start.min(split);
+                let e = span.end.min(split);
+                if s < e {
+                    bf.push(crate::stylus::formatting::FormatSpan::new(s, e, span.format.clone()));
+                }
+                if span.end > split {
+                    let as_start = span.start.saturating_sub(split);
+                    let as_end = span.end - split;
+                    if as_start < as_end {
+                        af.push(crate::stylus::formatting::FormatSpan::new(as_start, as_end, span.format.clone()));
+                    }
+                }
+            }
+            (before, after, bf, af)
+        };
+
+        if let Some(block) = self.document.get_block_mut(&block_id) {
+            block.content = BlockContent::Text { text: before_text, formats: before_formats };
+        }
+
+        let new_block = Block {
+            id: format!("block_{}", uuid::Uuid::new_v4().to_string().replace("-", "")),
+            block_type: BlockType::Paragraph,
+            content: BlockContent::Text { text: after_text, formats: after_formats },
+            collapsed: false,
+            metadata: serde_json::json!({}),
+        };
+        let new_id = new_block.id.clone();
+        self.document.insert_block(new_block, Some(&block_id));
+        self.mark_changed();
+
+        self.focus_block(&new_id);
+        if let Some(ref mut c) = self.cursor {
+            c.position = 0;
+        }
+    }
+
     pub fn create_block(&mut self, block_type: BlockType, after_id: Option<&str>) -> String {
         let block = Block::new(block_type);
         let id = block.id.clone();
@@ -346,6 +402,46 @@ impl StylusEditor {
                     self.mark_changed();
                 }
             }
+        }
+    }
+
+    /// Replace the active `@…` segment (from last `@` before cursor through cursor) with `replacement`.
+    pub fn replace_active_at_mention(&mut self, replacement: &str) {
+        let Some(ref cursor) = self.cursor else {
+            return;
+        };
+        let block_id = cursor.block_id.clone();
+        let pos = cursor.position;
+        let Some(block) = self.document.get_block_mut(&block_id) else {
+            return;
+        };
+        if let BlockContent::Text {
+            ref mut text,
+            ref mut formats,
+        } = block.content
+        {
+            let pos = pos.min(text.len());
+            let before = &text[..pos];
+            let Some(last_at) = before.rfind('@') else {
+                return;
+            };
+            let end = pos;
+            let removed = end - last_at;
+            text.drain(last_at..end);
+            text.insert_str(last_at, replacement);
+            let delta = replacement.len() as isize - removed as isize;
+            formats.retain(|span| span.end <= last_at || span.start >= end);
+            for span in formats.iter_mut() {
+                if span.start >= end {
+                    span.start = ((span.start as isize) + delta).max(0) as usize;
+                    span.end = ((span.end as isize) + delta).max(0) as usize;
+                }
+            }
+            if let Some(ref mut c) = self.cursor {
+                c.position = last_at + replacement.len();
+            }
+            self.document.update_metadata();
+            self.mark_changed();
         }
     }
     
@@ -1133,9 +1229,8 @@ impl StylusEditor {
     
     /// Set cursor position from screen coordinates
     fn set_cursor_from_position(&mut self, pos: Vec2) {
-        let padding = 10.0;
+        let padding = 20.0; // Must match StylusRenderer::PADDING
         let mut y_offset = self.position.y + padding - self.scroll_offset;
-        let line_height = 24.0;
         let block_spacing = 8.0;
         
         for block in &self.document.blocks {
@@ -1144,18 +1239,9 @@ impl StylusEditor {
             if pos.y >= y_offset && pos.y < y_offset + block_height {
                 // Clicked on this block
                 let block_id = block.id.clone();
-                if let Some(text) = block.content.get_text() {
-                    // Calculate character position from x coordinate
-                    let font_size = crate::stylus::renderer::StylusRenderer::get_font_size_static(&block.block_type);
-                    let rel_x = pos.x - (self.position.x + padding);
-                    let char_width = font_size * 0.6;
-                    let char_pos = (rel_x / char_width).max(0.0) as usize;
-                    let cursor_pos = char_pos.min(text.len());
-                    
+                if block.content.get_text().is_some() {
+                    // Cursor index will be computed from glyph positions via renderer.
                     self.focus_block(&block_id);
-                    if let Some(ref mut cursor) = self.cursor {
-                        cursor.position = cursor_pos;
-                    }
                 } else {
                     self.focus_block(&block_id);
                 }
@@ -1168,9 +1254,8 @@ impl StylusEditor {
     
     /// Get cursor from screen coordinates
     fn get_cursor_from_position(&self, pos: Vec2) -> Option<Cursor> {
-        let padding = 10.0;
+        let padding = 20.0; // Must match StylusRenderer::PADDING
         let mut y_offset = self.position.y + padding - self.scroll_offset;
-        let line_height = 24.0;
         let block_spacing = 8.0;
         
         for block in &self.document.blocks {
@@ -1178,13 +1263,9 @@ impl StylusEditor {
             
             if pos.y >= y_offset && pos.y < y_offset + block_height {
                 // Clicked on this block
-                if let Some(text) = block.content.get_text() {
-                    let font_size = crate::stylus::renderer::StylusRenderer::get_font_size_static(&block.block_type);
-                    let rel_x = pos.x - (self.position.x + padding);
-                    let char_width = font_size * 0.6;
-                    let char_pos = (rel_x / char_width).max(0.0) as usize;
-                    let cursor_pos = char_pos.min(text.len());
-                    return Some(Cursor::new(block.id.clone(), cursor_pos));
+                if block.content.get_text().is_some() {
+                    // Glyph-based cursor selection handled via compute_notepad_cursor_from_pos.
+                    return Some(Cursor::at_start(block.id.clone()));
                 } else {
                     return Some(Cursor::at_start(block.id.clone()));
                 }

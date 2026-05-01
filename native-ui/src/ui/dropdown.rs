@@ -1,6 +1,7 @@
 use glam::Vec2;
 use crate::ui::core::Rect;
 use crate::ui::components::{Renderable, VStack};
+use crate::ui::shadow::ShadowSpec;
 use crate::utils::animation::{SpringAnimation, AnimationPreset};
 use crate::gfx::types::{Vertex, Quad};
 use crate::gfx::renderer::Renderer;
@@ -18,12 +19,17 @@ pub struct Dropdown {
     pub menu_rect: Rect,  // Calculated menu position
     pub open_animation: SpringAnimation,  // For smooth open/close
     pub menu_vstack: Option<VStack>,  // For menu item layout
+    /// When false, omit the "Create new collection" footer (slash prompt menu).
+    pub show_create_footer: bool,
+    pub shadow: Option<ShadowSpec>,
 }
 
 #[derive(Clone, Debug)]
 pub struct DropdownItem {
     pub id: Option<i32>,  // None for "All papers"
     pub label: String,
+    /// Slash palette: matched prompt name for insertion after selection.
+    pub slash_name: Option<String>,
 }
 
 impl Dropdown {
@@ -37,7 +43,15 @@ impl Dropdown {
             menu_rect: Rect::new(0.0, 0.0, 0.0, 0.0),
             open_animation: SpringAnimation::with_preset(0.0, AnimationPreset::Snappy),
             menu_vstack: None,
+            show_create_footer: true,
+            shadow: None,
         }
+    }
+
+    /// Attach a drop shadow behind the menu chassis.
+    pub fn with_shadow(mut self, spec: ShadowSpec) -> Self {
+        self.shadow = Some(spec);
+        self
     }
 
     pub fn contains(&self, p: Vec2) -> bool {
@@ -131,7 +145,11 @@ impl Dropdown {
         
         // Calculate menu height
         let items_height = self.items.len() as f32 * item_height;
-        let menu_height = items_height + menu_padding * 2.0 + menu_spacing + create_button_height;
+        let menu_height = if self.show_create_footer {
+            items_height + menu_padding * 2.0 + menu_spacing + create_button_height
+        } else {
+            items_height + menu_padding * 2.0
+        };
         
         // Calculate menu width (match button width or use minimum)
         let menu_width = self.button_size.x.max(200.0);
@@ -158,7 +176,7 @@ impl Dropdown {
                 vstack.add_text_styled(
                     &item.label,
                     style::font_size::NORMAL,
-                    style::text::PRIMARY,
+                    style::text::PRIMARY(),
                     TextAlignment::Left,
                 );
             }
@@ -206,8 +224,18 @@ impl Renderable for Dropdown {
                 self.menu_rect.height,
             );
             
+            if let Some(spec) = &self.shadow {
+                let scaled = ShadowSpec {
+                    offset: spec.offset,
+                    sigma: spec.sigma,
+                    color: glam::Vec4::new(spec.color.x, spec.color.y, spec.color.z, spec.color.w * opacity),
+                    spread: spec.spread,
+                };
+                renderer.queue_shadow(&animated_menu_rect, style::corner_radius::MEDIUM, &scaled);
+            }
+
             // Menu background with animation opacity
-            let mut menu_bg_color = style::bg::SECONDARY;
+            let mut menu_bg_color = style::bg::SECONDARY();
             menu_bg_color.w *= opacity;
             
             let menu_bg = Quad {
@@ -238,7 +266,7 @@ impl Renderable for Dropdown {
                                 child_bounds.width,
                                 child_bounds.height,
                             );
-                            let mut highlight_color = style::highlight::SELECTION;
+                            let mut highlight_color = style::highlight::SELECTION();
                             highlight_color.w *= opacity;
                             let highlight_bg = Quad {
                                 position: animated_highlight_rect.position(),
@@ -280,7 +308,7 @@ impl Renderable for Dropdown {
                         use crate::ui::text::Text;
                         let mut item_text = Text::new_for_render(&self.items[index].label)
                             .with_font_size(style::font_size::NORMAL)
-                            .with_color(style::text::PRIMARY)
+                            .with_color(style::text::PRIMARY())
                             .with_alignment(TextAlignment::Left);
                         item_text.update_layout(animated_child_rect, dirty_rect, None);
                         
@@ -295,59 +323,61 @@ impl Renderable for Dropdown {
                 renderer.pop_parent();
             }
             
-            // "Create new collection" button at bottom (with animated position)
-            let menu_spacing = 5.0;
-            let create_button_y = animated_menu_rect.y + menu_padding + (self.items.len() as f32 * item_height) + menu_spacing;
-            let create_button_rect = Rect::new(
-                animated_menu_rect.x + menu_padding,
-                create_button_y,
-                animated_menu_rect.width - menu_padding * 2.0,
-                30.0,
-            );
-            
-            let mut button_color = style::button::SECONDARY;
-            button_color.w *= opacity;
-            let create_button_bg = Quad {
-                position: create_button_rect.position(),
-                size: create_button_rect.size(),
-                color: button_color,
-                corner_radius: style::corner_radius::SMALL,
-                bubble_effect: false,
-                slider_effect: false,
-            };
-            vertices.extend_from_slice(&create_button_bg.to_vertices());
-            
-            // Plus icon + text
-            let plus_icon_size = 14.0;
-            let plus_icon_pos = Vec2::new(
-                create_button_rect.x + 8.0,
-                create_button_rect.y + create_button_rect.height / 2.0 - plus_icon_size / 2.0,
-            );
-            let mut icon_color = style::text::PRIMARY;
-            icon_color.w *= opacity;
-            renderer.queue_icon(
-                icon_names::PLUS,
-                plus_icon_pos,
-                plus_icon_size,
-                icon_color,
-            );
-            
-            let create_text_rect = Rect::new(
-                create_button_rect.x + 25.0,
-                create_button_rect.y,
-                create_button_rect.width - 25.0,
-                create_button_rect.height,
-            );
-            let mut create_text = Text::new_for_render("Create new collection")
-                .with_font_size(style::font_size::SMALL)
-                .with_color(icon_color)
-                .with_alignment(TextAlignment::Left);
-            create_text.update_layout(create_text_rect, dirty_rect, None);
-            
-            renderer.push_parent("dropdown_create".to_string());
-            renderer.validate_component("dropdown_create", None, "DropdownCreate");
-            create_text.render(renderer, app, vertices, dirty_rect);
-            renderer.pop_parent();
+            if self.show_create_footer {
+                // "Create new collection" button at bottom (with animated position)
+                let menu_spacing = 5.0;
+                let create_button_y = animated_menu_rect.y + menu_padding + (self.items.len() as f32 * item_height) + menu_spacing;
+                let create_button_rect = Rect::new(
+                    animated_menu_rect.x + menu_padding,
+                    create_button_y,
+                    animated_menu_rect.width - menu_padding * 2.0,
+                    30.0,
+                );
+                
+                let mut button_color = style::button::SECONDARY();
+                button_color.w *= opacity;
+                let create_button_bg = Quad {
+                    position: create_button_rect.position(),
+                    size: create_button_rect.size(),
+                    color: button_color,
+                    corner_radius: style::corner_radius::SMALL,
+                    bubble_effect: false,
+                    slider_effect: false,
+                };
+                vertices.extend_from_slice(&create_button_bg.to_vertices());
+                
+                // Plus icon + text
+                let plus_icon_size = 14.0;
+                let plus_icon_pos = Vec2::new(
+                    create_button_rect.x + 8.0,
+                    create_button_rect.y + create_button_rect.height / 2.0 - plus_icon_size / 2.0,
+                );
+                let mut icon_color = style::text::PRIMARY();
+                icon_color.w *= opacity;
+                renderer.queue_icon(
+                    icon_names::PLUS,
+                    plus_icon_pos,
+                    plus_icon_size,
+                    icon_color,
+                );
+                
+                let create_text_rect = Rect::new(
+                    create_button_rect.x + 25.0,
+                    create_button_rect.y,
+                    create_button_rect.width - 25.0,
+                    create_button_rect.height,
+                );
+                let mut create_text = Text::new_for_render("Create new collection")
+                    .with_font_size(style::font_size::SMALL)
+                    .with_color(icon_color)
+                    .with_alignment(TextAlignment::Left);
+                create_text.update_layout(create_text_rect, dirty_rect, None);
+                
+                renderer.push_parent("dropdown_create".to_string());
+                renderer.validate_component("dropdown_create", None, "DropdownCreate");
+                create_text.render(renderer, app, vertices, dirty_rect);
+                renderer.pop_parent();
+            }
         }
     }
     
@@ -364,6 +394,10 @@ impl Renderable for Dropdown {
     
     fn min_size(&self) -> Vec2 {
         self.button_size
+    }
+
+    fn corner_radius(&self) -> f32 {
+        style::corner_radius::MEDIUM
     }
 }
 

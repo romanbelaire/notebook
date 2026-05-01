@@ -4,6 +4,7 @@
 /// instead of hardcoding structure and layout.
 use glam::{Vec2, Vec4};
 use crate::ui::core::Rect;
+use crate::ui::shadow::ShadowSpec;
 use crate::ui::style;
 use crate::gfx::types::{Vertex, Quad};
 use crate::gfx::renderer::Renderer;
@@ -16,6 +17,7 @@ pub struct Section {
     pub content: Box<dyn Renderable>,
     pub rect: Rect,
     pub title_height: f32,
+    pub shadow: Option<ShadowSpec>,
 }
 
 impl Section {
@@ -25,17 +27,27 @@ impl Section {
             content,
             rect: Rect::new(0.0, 0.0, 0.0, 0.0),
             title_height: 40.0,
+            shadow: None,
         }
+    }
+
+    /// Attach a drop shadow behind the section.
+    pub fn with_shadow(mut self, spec: ShadowSpec) -> Self {
+        self.shadow = Some(spec);
+        self
     }
 }
 
 impl Renderable for Section {
     fn render(&self, renderer: &mut Renderer, app: &App, vertices: &mut Vec<Vertex>, dirty_rect: Option<Rect>) {
         const TITLE_FONT_SIZE: f32 = style::font_size::NORMAL;
+        if let Some(spec) = &self.shadow {
+            renderer.queue_shadow(&self.rect, 0.0, spec);
+        }
         let title_bg = Quad {
             position: Vec2::new(self.rect.x, self.rect.y),
             size: Vec2::new(self.rect.width, self.title_height),
-            color: style::bg::SECONDARY,
+            color: style::bg::SECONDARY(),
             corner_radius: 0.0,
             bubble_effect: false,
             slider_effect: false,
@@ -49,7 +61,7 @@ impl Renderable for Section {
         );
         let mut title_text = crate::ui::text::Text::new_for_render(&self.title)
             .with_font_size(TITLE_FONT_SIZE)
-            .with_color(style::text::PRIMARY)
+            .with_color(style::text::PRIMARY())
             .with_alignment(crate::ui::text::TextAlignment::Left);
         title_text.update_layout(title_rect, dirty_rect, None);
         renderer.push_parent("section_title".to_string());
@@ -260,11 +272,11 @@ pub fn render_conversation_item(
     
     // Background
     let item_color = if is_selected {
-        style::highlight::HOVER
+        style::highlight::HOVER()
     } else if is_hovered {
-        style::bg::TERTIARY
+        style::bg::TERTIARY()
     } else {
-        style::bg::SECONDARY
+        style::bg::SECONDARY()
     };
     
     let inset_rect = rect.inset(style::padding::TINY);
@@ -286,11 +298,11 @@ pub fn render_conversation_item(
     };
     
     let text_color = if is_selected {
-        style::text::PRIMARY
+        style::text::PRIMARY()
     } else if is_hovered {
         Vec4::new(0.95, 0.95, 0.95, 1.0)
     } else {
-        style::text::SECONDARY
+        style::text::SECONDARY()
     };
     
     // Render title using Text component
@@ -326,11 +338,11 @@ pub fn render_document_item(
     
     // Background
     let item_color = if is_selected {
-        style::highlight::HOVER
+        style::highlight::HOVER()
     } else if is_hovered {
-        style::bg::TERTIARY
+        style::bg::TERTIARY()
     } else {
-        style::bg::SECONDARY
+        style::bg::SECONDARY()
     };
     
     let inset_rect = rect.inset(style::padding::TINY);
@@ -352,11 +364,11 @@ pub fn render_document_item(
     };
     
     let text_color = if is_selected {
-        style::text::PRIMARY
+        style::text::PRIMARY()
     } else if is_hovered {
         Vec4::new(0.95, 0.95, 0.95, 1.0)
     } else {
-        style::text::SECONDARY
+        style::text::SECONDARY()
     };
     
     // Render document name using Text component

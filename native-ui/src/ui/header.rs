@@ -17,11 +17,11 @@ impl HeaderWindow {
     pub fn new(position: Vec2, size: Vec2) -> Self {
         use crate::ui::style;
         
-        let tab_bar_width = 400.0;
-        let tab_bar_height = 40.0;
+        let tab_bar_width = style::hero::TAB_BAR_WIDTH;
+        let tab_bar_height = style::hero::TAB_BAR_HEIGHT;
         let tab_bar_x = style::center_x(size.x, tab_bar_width);
-        let tab_bar_y = style::padding::TINY;
-        
+        let tab_bar_y = size.y - style::stroke::INSTRUMENT_RULE_PX - tab_bar_height;
+
         let tab_bar = TabBar::new(
             Vec2::new(tab_bar_x, tab_bar_y),
             Vec2::new(tab_bar_width, tab_bar_height),
@@ -34,21 +34,21 @@ impl HeaderWindow {
         Self {
             position,
             size,
-            title: "Notebook".to_string(),
+            title: "Constellar".to_string(),
             tab_bar,
             show_window_controls: true,
             minimize_button: crate::ui::Button::new(
-                Vec2::new(controls_x, style::padding::TINY),
+                Vec2::new(controls_x, style::padding::SMALL),
                 button_size,
                 "−",
             ),
             maximize_button: crate::ui::Button::new(
-                Vec2::new(controls_x + button_size.x + button_spacing, style::padding::TINY),
+                Vec2::new(controls_x + button_size.x + button_spacing, style::padding::SMALL),
                 button_size,
                 "□",
             ),
             close_button: crate::ui::Button::new(
-                Vec2::new(controls_x + (button_size.x + button_spacing) * 2.0, style::padding::TINY),
+                Vec2::new(controls_x + (button_size.x + button_spacing) * 2.0, style::padding::SMALL),
                 button_size,
                 "×",
             ),
@@ -104,18 +104,21 @@ impl HeaderWindow {
         self.size = Vec2::new(viewport_size.x, self.size.y);
         
         // Update tab bar position (keep it centered)
-        let tab_bar_width = 400.0;
+        let tab_bar_width = style::hero::TAB_BAR_WIDTH;
         let tab_bar_x = style::center_x(viewport_size.x, tab_bar_width);
-        self.tab_bar.position = Vec2::new(tab_bar_x, style::padding::TINY);
+        self.tab_bar.position = Vec2::new(
+            tab_bar_x,
+            self.size.y - style::stroke::INSTRUMENT_RULE_PX - self.tab_bar.size.y,
+        );
         
         // Update window control buttons
         let button_size = Vec2::new(30.0, 30.0);
         let button_spacing = style::padding::TINY;
         let controls_x = viewport_size.x - button_size.x * 3.0 - button_spacing * 2.0 - style::padding::SMALL;
         
-        self.minimize_button.position = Vec2::new(controls_x, style::padding::TINY);
-        self.maximize_button.position = Vec2::new(controls_x + button_size.x + button_spacing, style::padding::TINY);
-        self.close_button.position = Vec2::new(controls_x + (button_size.x + button_spacing) * 2.0, style::padding::TINY);
+        self.minimize_button.position = Vec2::new(controls_x, style::padding::SMALL);
+        self.maximize_button.position = Vec2::new(controls_x + button_size.x + button_spacing, style::padding::SMALL);
+        self.close_button.position = Vec2::new(controls_x + (button_size.x + button_spacing) * 2.0, style::padding::SMALL);
     }
 }
 

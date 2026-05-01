@@ -44,13 +44,14 @@ impl TabBar {
         let tabs = Tab::all();
         let active_index = 0;
         
-        // Leading edge: slow but moves first (viscous, no jiggle)
-        let mut slider_animation = SpringAnimation::with_params(active_index as f32, 115.0, 22.0);
+        // Leading and trailing edges: smooth spring (no SDF liquid stretch)
+        let mut slider_animation =
+            SpringAnimation::with_preset(active_index as f32, AnimationPreset::Mechanical);
         slider_animation.target = active_index as f32;
         slider_animation.value = active_index as f32;
 
-        // Trailing edge: slower so pill stretches more; high damping = no bounce
-        let mut slider_trailing_animation = SpringAnimation::with_preset(active_index as f32, AnimationPreset::Viscous);
+        let mut slider_trailing_animation =
+            SpringAnimation::with_preset(active_index as f32, AnimationPreset::Mechanical);
         slider_trailing_animation.target = active_index as f32;
         slider_trailing_animation.value = active_index as f32;
 

@@ -1,0 +1,6 @@
+up arrow: go to parent of active shard
+down arrow: go to first child of active shard
+left/right arrows: previous/next sibling node
+
+ctrl+left arrow: open/close sidebar (no longer ctrl+right arrow)
+

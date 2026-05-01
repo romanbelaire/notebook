@@ -1,11 +1,13 @@
 use crate::api::models::{
     ChatRequest, ChatResponse, ApiChatMessage, Insight, CreateShardRequest, UpdateShardRequest,
     CreateGraphResponse, GetGraphResponse, GraphSendRequest, GraphSendResponse, GraphListResponse,
-    GraphCompileRequest, GraphCompileResponse, GraphShardPatchRequest,
+    GraphCompileRequest, GraphCompileResponse, GraphShardPatchRequest, ArxivImportResponse,
 };
 use crate::ui::chat_window::ChatMessage;
 use anyhow::Result;
 use reqwest::Client;
+use reqwest::multipart;
+use std::path::Path;
 use std::time::Duration;
 use futures::StreamExt;
 
@@ -289,6 +291,46 @@ impl ApiClient {
         Ok(())
     }
 
+    pub async fn add_papers_to_collection(&self, collection_id: i32, paper_ids: &[i32]) -> Result<()> {
+        let request = crate::api::models::CollectionPaperIdsRequest {
+            paper_ids: paper_ids.to_vec(),
+        };
+        let url = format!("{}/collections/{}/add", self.base_url, collection_id);
+        let response = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            anyhow::bail!("API error {}: {}", status, error_text);
+        }
+        Ok(())
+    }
+
+    pub async fn remove_papers_from_collection(&self, collection_id: i32, paper_ids: &[i32]) -> Result<()> {
+        let request = crate::api::models::CollectionPaperIdsRequest {
+            paper_ids: paper_ids.to_vec(),
+        };
+        let url = format!("{}/collections/{}/remove", self.base_url, collection_id);
+        let response = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            anyhow::bail!("API error {}: {}", status, error_text);
+        }
+        Ok(())
+    }
+
     pub async fn ingest_pdfs(&self, pdf_dir: &str) -> Result<String> {
         let url = format!("{}/ingest", self.base_url);
         let request = serde_json::json!({
@@ -313,6 +355,43 @@ impl ApiClient {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("No task_id in response"))?;
         Ok(task_id.to_string())
+    }
+
+    pub async fn import_arxiv_text(&self, input_text: &str) -> Result<ArxivImportResponse> {
+        let url = format!("{}/import/arxiv", self.base_url);
+        let request = serde_json::json!({
+            "input_text": input_text
+        });
+        let response = self.client.post(&url).json(&request).send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            anyhow::bail!("API error {}: {}", status, error_text);
+        }
+        let result: ArxivImportResponse = response.json().await?;
+        Ok(result)
+    }
+
+    pub async fn import_arxiv_bibtex(&self, path: &Path) -> Result<ArxivImportResponse> {
+        let url = format!("{}/import/arxiv/bibtex", self.base_url);
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("Invalid bibtex filename"))?
+            .to_string();
+        let file_bytes = std::fs::read(path)?;
+        let part = multipart::Part::bytes(file_bytes)
+            .file_name(file_name)
+            .mime_str("application/x-bibtex")?;
+        let form = multipart::Form::new().part("file", part);
+        let response = self.client.post(&url).multipart(form).send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            anyhow::bail!("API error {}: {}", status, error_text);
+        }
+        let result: ArxivImportResponse = response.json().await?;
+        Ok(result)
     }
 
     pub async fn get_task_status(&self, task_id: &str) -> Result<serde_json::Value> {
@@ -609,15 +688,16 @@ impl ApiClient {
         Ok(body)
     }
 
-    /// Patch shard visibility.
-    pub async fn patch_shard_visibility(
+    /// Patch shard fields (visibility, notes).
+    pub async fn patch_shard(
         &self,
         graph_id: &str,
         shard_id: &str,
-        visible: bool,
+        visible: Option<bool>,
+        notes: Option<Vec<String>>,
     ) -> Result<()> {
         let url = format!("{}/graph/{}/shard/{}", self.base_url, graph_id, shard_id);
-        let payload = GraphShardPatchRequest { visible: Some(visible) };
+        let payload = GraphShardPatchRequest { visible, notes };
         let response = self.client.patch(&url).json(&payload).send().await?;
         let status = response.status();
         if !status.is_success() {
@@ -625,6 +705,16 @@ impl ApiClient {
             anyhow::bail!("API error {}: {}", status, error_text);
         }
         Ok(())
+    }
+
+    /// Patch shard visibility.
+    pub async fn patch_shard_visibility(
+        &self,
+        graph_id: &str,
+        shard_id: &str,
+        visible: bool,
+    ) -> Result<()> {
+        self.patch_shard(graph_id, shard_id, Some(visible), None).await
     }
 
     /// Remove shard from graph (e.g. DELETE /graph/{graph_id}/shard/{shard_id}).

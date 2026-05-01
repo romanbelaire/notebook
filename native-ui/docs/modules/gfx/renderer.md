@@ -2,6 +2,12 @@
 
 The `Renderer` struct is the main graphics rendering coordinator. It manages wgpu resources, vello integration, and the rendering pipeline.
 
+## Markdown scenes (constellation)
+
+Message bodies in constellation shards are turned into Vello scenes in **`build_markdown_scene`** (CommonMark via pulldown-cmark, Parley layout, bold/italic, lists, paragraph breaks). Card sizing uses **`GraphState::measure_markdown_block`**, which must stay aligned with that walk.
+
+Author-facing syntax and maintainer notes: **[Markdown rendering](../../guides/markdown-rendering.md)**.
+
 ## Overview
 
 The `Renderer` handles:
@@ -99,6 +105,10 @@ Scissor rects:
 - Clip rendering to component bounds
 - Are automatically intersected for nested components
 - Use UI coordinates directly
+
+### Composite layers (`set_composite_layer`)
+
+`set_composite_layer` sets where subsequent **quads** (`add_vertices` / `add_quad`) and **queued** text/icons are tagged. The framebuffer draws layers in a fixed order (`Background` → `MainContent` → `ConstellationText` → `SidebarChrome` → `ComposerChrome` → `HudChrome` → `Modal`). Anything that must appear **above** constellation text (e.g. context menus, sidebar row labels and section headers) should queue its `Text` while the layer is `HudChrome`; sidebar **geometry** usually stays on `SidebarChrome` and toggles layer only around `Text::render`. Full rationale and the sidebar pattern: [GPU compositing layers](../../architecture/rendering.md#gpu-compositing-layers).
 
 ### Component Validation
 

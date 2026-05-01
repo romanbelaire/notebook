@@ -33,5 +33,6 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv = uv_params.uv_min + (uv_params.uv_max - uv_params.uv_min) * in.tex_coord;
     let tex_color = textureSample(vello_texture, vello_sampler, uv);
-    return tex_color;
+    let a = tex_color.a;
+    return vec4<f32>(tex_color.rgb * a, a);
 }

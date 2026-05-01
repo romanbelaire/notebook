@@ -3,6 +3,7 @@ use crate::ui::core::{Rect, text};
 use crate::gfx::types::Vertex;
 use crate::gfx::renderer::Renderer;
 use crate::ui::components::Renderable;
+use crate::ui::shadow::ShadowSpec;
 use crate::ui::style;
 
 /// A text label component that can be used in the layout system
@@ -17,6 +18,9 @@ pub struct Text {
     color: Vec4,
     alignment: TextAlignment,
     scissor_rect: Option<Rect>,  // Optional scissor rect for clipping
+    /// If true, `scissor_rect` was set via `with_scissor` (including `None` = no clip, do not inherit `scissor_stack`).
+    explicit_scissor: bool,
+    shadow: Option<ShadowSpec>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -66,9 +70,11 @@ impl Text {
             text: text.into(),
             rect: Rect::new(0.0, 0.0, 0.0, 0.0),
             font_size: style::font_size::NORMAL,
-            color: style::text::PRIMARY,
+            color: style::text::PRIMARY(),
             alignment: TextAlignment::Left,
             scissor_rect: None,
+            explicit_scissor: false,
+            shadow: None,
         }
     }
     
@@ -92,9 +98,11 @@ impl Text {
             text: text.into(),
             rect: Rect::new(0.0, 0.0, 0.0, 0.0),
             font_size: style::font_size::NORMAL,
-            color: style::text::PRIMARY,
+            color: style::text::PRIMARY(),
             alignment: TextAlignment::Left,
             scissor_rect: None,
+            explicit_scissor: false,
+            shadow: None,
         }
     }
     
@@ -128,7 +136,14 @@ impl Text {
     
     /// Set scissor rect (builder method)
     pub fn with_scissor(mut self, scissor_rect: Option<Rect>) -> Self {
+        self.explicit_scissor = true;
         self.scissor_rect = scissor_rect;
+        self
+    }
+
+    /// Attach a drop shadow (rendered behind the text's bounds rect).
+    pub fn with_shadow(mut self, spec: ShadowSpec) -> Self {
+        self.shadow = Some(spec);
         self
     }
     
@@ -150,7 +165,7 @@ impl Text {
     /// Compute wrapped text size with word wrapping
     /// `measure_fn` should be a function that measures text width: `fn(&str, f32) -> Vec2`
     pub fn wrapped_size_with_measure(&self, max_width: f32, mut measure_fn: impl FnMut(&str, f32) -> Vec2) -> Vec2 {
-        let line_height = self.font_size * 1.2;
+        let line_height = self.font_size * 1.35;
         let words: Vec<&str> = self.text.split_whitespace().collect();
         let mut current_line = String::new();
         let mut lines = Vec::new();
@@ -227,7 +242,11 @@ impl Renderable for Text {
         if !renderer.validate_component(&component_id, None, "Text") {
             return; // Skip rendering (orphaned or duplicate)
         }
-        
+
+        if let Some(spec) = &self.shadow {
+            renderer.queue_shadow(&self.rect, 0.0, spec);
+        }
+
         let text_pos = match self.alignment {
             TextAlignment::Left => {
                 text::left_aligned(&self.rect, self.font_size, 0.0)
@@ -242,11 +261,29 @@ impl Renderable for Text {
             }
         };
         
-        // Use scissor-aware text rendering if scissor rect is provided
-        if let Some(ref scissor) = self.scissor_rect {
-            renderer.queue_text_with_ui_scissor(&self.text, text_pos, self.color, self.font_size, Some(scissor));
+        let max_w = Some(self.rect.width);
+        if self.explicit_scissor {
+            if let Some(ref scissor) = self.scissor_rect {
+                renderer.queue_text_with_ui_scissor(
+                    &self.text,
+                    text_pos,
+                    self.color,
+                    self.font_size,
+                    Some(scissor),
+                    max_w,
+                );
+            } else {
+                renderer.queue_text_with_scissor(
+                    &self.text,
+                    text_pos,
+                    self.color,
+                    self.font_size,
+                    None,
+                    max_w,
+                );
+            }
         } else {
-            renderer.queue_text(&self.text, text_pos, self.color, self.font_size);
+            renderer.queue_text(&self.text, text_pos, self.color, self.font_size, max_w);
         }
     }
     
@@ -259,13 +296,8 @@ impl Renderable for Text {
     }
     
     fn min_size(&self) -> Vec2 {
-        // Estimate text size - actual measurement happens during render
-        // Use a standard line height for text components (25.0) to match layout expectations
-        // Width is estimated based on character count
-        let char_count = self.text.chars().count();
-        let estimated_width = char_count as f32 * self.font_size * 0.6; // Approximate char width
-        // Use 25.0 as standard text line height to match previous layout system
-        Vec2::new(estimated_width, 25.0)
+        // Defer to renderer for actual glyph-based measurement; provide a minimal placeholder.
+        Vec2::new(0.0, 25.0)
     }
 }
 

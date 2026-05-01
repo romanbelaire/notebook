@@ -1,10 +1,24 @@
 //! Graph state for Constellar: one graph per "current conversation", keyed by graph_id.
 //! Mirrors backend ConversationGraph + ActiveState; nodes have world position/velocity for constellation UI.
 
-use glam::Vec2;
-use std::collections::HashMap;
 use crate::api::models::GraphShardResponse;
+use crate::gfx::text_layout::ParagraphWrappedFlow;
 use crate::persistence::GraphLayoutPersistence;
+use crate::ui::style;
+use glam::Vec2;
+use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+/// Map a node id to a stable position in [0, 1) on the ribbon color wheel.
+/// Uses DefaultHasher for determinism within a single process run.
+fn hue_from_id(id: &str) -> f32 {
+    let mut h = DefaultHasher::new();
+    id.hash(&mut h);
+    let raw = h.finish();
+    (raw & 0xFFFF) as f32 / 0xFFFF as f32
+}
 
 /// One turn shard (message pair) or special shard. Mirrors API GraphShardResponse.
 /// Per-message visibility: when compiling context, include user/assistant only if the corresponding flag is true.
@@ -38,6 +52,27 @@ impl GraphShard {
         let a = self.assistant_content.as_deref().unwrap_or("");
         u.trim().is_empty() && a.trim().is_empty()
     }
+
+    /// User + assistant markdown/plain text for system clipboard.
+    pub fn clipboard_plain_text(&self) -> String {
+        let mut out = String::new();
+        if let Some(ref u) = self.user_content {
+            if !u.is_empty() {
+                out.push_str("User:\n");
+                out.push_str(u);
+            }
+        }
+        if let Some(ref a) = self.assistant_content {
+            if !a.is_empty() {
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str("Assistant:\n");
+                out.push_str(a);
+            }
+        }
+        out
+    }
 }
 
 impl From<&GraphShardResponse> for GraphShard {
@@ -59,12 +94,11 @@ impl From<&GraphShardResponse> for GraphShard {
     }
 }
 
-/// Node in the constellation: shard data + world position and velocity for layout/physics.
+/// Node in the constellation: shard data + world position for deterministic tree layout.
 #[derive(Clone, Debug)]
 pub struct ConstellationNode {
     pub shard: GraphShard,
     pub position: Vec2,
-    pub velocity: Vec2,
     /// Cached size (width, height) from last layout; used for hit-test and rendering.
     pub size: Vec2,
     /// Unclamped content height computed from text + chrome. If this exceeds `size.y`,
@@ -90,6 +124,10 @@ pub struct ConstellationNode {
     pub depth: u32,
     /// Number of direct children (nodes for which this node is a parent).
     pub child_count: u32,
+    /// Position on the ribbon color wheel [0, 1).
+    /// Roots get a hash-derived hue; first children inherit the parent's hue;
+    /// subsequent children get a fresh hash-derived hue.
+    pub ribbon_hue_t: f32,
 }
 
 /// Active graph state: current conversation = one graph.
@@ -103,37 +141,82 @@ pub struct GraphState {
     pub content_version: u64,
     /// id -> node (turn shards only for v1; special shards can be skipped or rendered as single block).
     pub nodes: HashMap<String, ConstellationNode>,
+    /// User-resized node sizes (from layout persistence or drag-resize). When set, update_node_sizes uses these instead of content-derived size.
+    pub manual_sizes: HashMap<String, Vec2>,
+    /// Node ids that have been manually dragged; tree layout preserves their position.
+    pub manual_positions: HashSet<String>,
+    /// True when node sizes have changed and a layout pass is needed before the next render.
+    pub layout_dirty: bool,
+    /// Most recently visited child for each parent, used for intelligent down-arrow navigation.
+    pub last_visited_child: HashMap<String, String>,
 }
+
+/// Fixed shard width in world units. All cards default to this width so columns are uniform.
+const STANDARD_SHARD_WIDTH: f32 = 360.0;
+/// Placeholder width used before `update_node_sizes` runs.
+const PLACEHOLDER_SHARD_WIDTH: f32 = STANDARD_SHARD_WIDTH;
+/// Placeholder height for nodes before layout measures content.
+const PLACEHOLDER_NODE_HEIGHT: f32 = 120.0;
+const MIN_SHARD_MANUAL_WIDTH: f32 = 200.0;
+const MIN_SHARD_MANUAL_HEIGHT: f32 = 60.0;
+/// Horizontal gap between sibling subtrees in world units.
+const LAYOUT_SIBLING_GAP: f32 = 80.0;
+/// Vertical gap between a parent row and its children row in world units.
+const LAYOUT_ROW_GAP: f32 = 80.0;
 
 impl GraphState {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Min/max width for constellation shard drag-resize (world units).
+    pub fn shard_manual_width_bounds(_viewport_size_x: f32) -> (f32, f32) {
+        (MIN_SHARD_MANUAL_WIDTH, STANDARD_SHARD_WIDTH * 2.0)
+    }
+
+    /// Minimum manual height (world units) for constellation shard drag-resize.
+    /// Maximum is per-shard (the shard's own `content_height`) and lives in the resize handler.
+    pub fn shard_manual_min_height() -> f32 {
+        MIN_SHARD_MANUAL_HEIGHT
+    }
+
     pub fn is_empty(&self) -> bool {
         self.graph_id.is_none() && self.nodes.is_empty()
     }
 
-    pub fn set_graph(&mut self, graph_id: String, root_id: String, current_leaf_id: String, shards: HashMap<String, GraphShard>) {
+    /// Constellation rendering (shards, full-bleed viewport) — requires a loaded graph with drawable nodes.
+    #[inline]
+    pub fn constellation_view_active(&self) -> bool {
+        self.graph_id.is_some() && !self.nodes.is_empty()
+    }
+
+    pub fn set_graph(
+        &mut self,
+        graph_id: String,
+        root_id: String,
+        current_leaf_id: String,
+        shards: HashMap<String, GraphShard>,
+    ) {
         self.content_version = self.content_version.wrapping_add(1);
         self.graph_id = Some(graph_id.clone());
         self.root_id = Some(root_id.clone());
         self.current_leaf_id = Some(current_leaf_id);
-        let stored = GraphLayoutPersistence::load_positions(&graph_id);
+        let (stored_manual_positions, stored_sizes) = GraphLayoutPersistence::load_positions(&graph_id);
+        self.manual_sizes = stored_sizes;
+        self.manual_positions.clear();
+        // Restore manually-dragged positions; these override the tree layout.
+        let manual_positions_data = stored_manual_positions;
         // Do not add the empty root to nodes (backend creates root with empty strings); first real message attaches to root.
         self.nodes = shards
             .into_iter()
             .filter(|(id, s)| s.is_turn() && !(id == &root_id && s.is_empty_content()))
             .map(|(id, shard)| {
-                let position = stored.get(&id).copied().unwrap_or(Vec2::ZERO);
-                let velocity = Vec2::ZERO;
-                let size = Vec2::new(280.0, 120.0); // Placeholder; layout will measure
+                let size = Vec2::new(PLACEHOLDER_SHARD_WIDTH, PLACEHOLDER_NODE_HEIGHT); // Placeholder; layout will measure
                 (
                     id,
                     ConstellationNode {
                         shard,
-                        position,
-                        velocity,
+                        position: Vec2::ZERO,
                         size,
                         content_height: 0.0,
                         user_text_height: 0.0,
@@ -146,14 +229,22 @@ impl GraphState {
                         text_layer_size_assistant: Vec2::ZERO,
                         depth: 0,
                         child_count: 0,
+                        ribbon_hue_t: 0.0,
                     },
                 )
             })
             .collect();
         self.promote_empty_root_to_first_child();
-        // Only run BFS for nodes that have no stored position
-        self.apply_initial_layout_merge(&stored);
+        // Apply stored manual positions after node map is built.
+        for (id, pos) in &manual_positions_data {
+            if let Some(node) = self.nodes.get_mut(id) {
+                node.position = *pos;
+                self.manual_positions.insert(id.clone());
+            }
+        }
+        self.layout_dirty = true;
         self.recompute_hierarchy_metadata();
+        self.compute_ribbon_hues();
     }
 
     /// If the root node is empty and has exactly one child (the first chat shard), make that child the root
@@ -179,78 +270,163 @@ impl GraphState {
         }
     }
 
-    /// Initial layout: use stored positions where available; BFS for nodes without stored position.
-    /// When root has no shard (not in nodes), layout starts from nodes whose parent is root_id.
-    fn apply_initial_layout_merge(&mut self, stored: &HashMap<String, Vec2>) {
+    /// Deterministic tree layout: positions all nodes using a two-pass centering algorithm.
+    ///
+    /// Each node's primary parent is `parent_ids[0]` (if present in nodes); secondary parents
+    /// draw cross-edges but do not affect placement. Siblings are horizontally centered under their parent.
+    ///
+    /// Nodes in `manual_positions` keep their current position; their children are still placed
+    /// relative to the node's actual position.
+    fn apply_tree_layout(&mut self) {
+        if self.nodes.is_empty() {
+            self.layout_dirty = false;
+            return;
+        }
+
         let root_id = match &self.root_id {
             Some(r) => r.clone(),
-            None => return,
-        };
-        const DX: f32 = 220.0;
-        const GAP: f32 = 24.0;
-        const PLACEHOLDER_CHILD_HEIGHT: f32 = 120.0;
-        // Anchor logical root at origin when present; otherwise treat its children as first layer
-        // and place them in a vertical column rooted at the origin before BFS.
-        let mut queue: Vec<String> = Vec::new();
-        let mut visited = std::collections::HashSet::new();
-        if let Some(n) = self.nodes.get_mut(&root_id) {
-            if !stored.contains_key(&root_id) {
-                n.position = Vec2::ZERO;
+            None => {
+                self.layout_dirty = false;
+                return;
             }
-            queue.push(root_id.clone());
-            visited.insert(root_id.clone());
-        } else {
-            let children = self.children_ids(&root_id);
-            let mut cursor_y = 0.0f32;
-            for cid in children {
-                if let Some(child) = self.nodes.get_mut(&cid) {
-                    if !stored.contains_key(&cid) {
-                        let cx = 0.0;
-                        let cy = cursor_y;
-                        child.position = Vec2::new(cx, cy);
-                    }
+        };
+
+        // Build primary_children map: primary parent -> sorted list of children.
+        // A node's primary parent is parent_ids[0] if that node exists in self.nodes.
+        // Nodes without a primary parent in nodes become layout roots.
+        let mut primary_children: HashMap<String, Vec<String>> = HashMap::new();
+        let mut layout_roots: Vec<String> = Vec::new();
+
+        for (id, node) in &self.nodes {
+            match node.shard.parent_ids.first() {
+                Some(pid) if self.nodes.contains_key(pid) => {
+                    primary_children.entry(pid.clone()).or_default().push(id.clone());
                 }
-                visited.insert(cid.clone());
-                queue.push(cid.clone());
-                cursor_y += PLACEHOLDER_CHILD_HEIGHT + GAP;
+                _ => layout_roots.push(id.clone()),
             }
         }
-        while let Some(id) = queue.pop() {
-            let parent_pos = self.nodes.get(&id).map(|n| n.position).unwrap_or(Vec2::ZERO);
-            let parent_size = self.nodes.get(&id).map(|n| n.size).unwrap_or(Vec2::new(280.0, 120.0));
-            let parent_bottom = parent_pos.y + parent_size.y;
-            let children: Vec<String> = self
-                .nodes
-                .iter()
-                .filter(|(_, n)| n.shard.parent_ids.contains(&id))
-                .map(|(cid, _)| cid.clone())
-                .collect();
-            for (i, cid) in children.into_iter().enumerate() {
-                if visited.insert(cid.clone()) {
-                    if let Some(n) = self.nodes.get_mut(&cid) {
-                        if !stored.contains_key(&cid) {
-                            let cx = parent_pos.x + DX;
-                            let cy = parent_bottom + GAP + (i as f32) * (PLACEHOLDER_CHILD_HEIGHT + GAP);
-                            n.position = Vec2::new(cx, cy);
+        layout_roots.sort();
+        for children in primary_children.values_mut() {
+            children.sort();
+        }
+
+        // Snapshot node sizes for read-only use during computation.
+        let heights: HashMap<String, f32> = self.nodes.iter()
+            .map(|(id, n)| (id.clone(), n.size.y))
+            .collect();
+        let widths: HashMap<String, f32> = self.nodes.iter()
+            .map(|(id, n)| (id.clone(), n.size.x))
+            .collect();
+
+        // BFS traversal order (used to get post-order by reversing).
+        let mut bfs_order: Vec<String> = Vec::new();
+        {
+            let mut queue: VecDeque<String> = layout_roots.iter().cloned().collect();
+            let mut visited: HashSet<String> = layout_roots.iter().cloned().collect();
+            while let Some(id) = queue.pop_front() {
+                bfs_order.push(id.clone());
+                if let Some(children) = primary_children.get(&id) {
+                    for cid in children {
+                        if visited.insert(cid.clone()) {
+                            queue.push_back(cid.clone());
                         }
                     }
-                    queue.push(cid);
                 }
             }
         }
+
+        // Pass 1 (post-order): compute subtree_width for each node.
+        // A subtree's width is the horizontal space it requires including all sibling gaps.
+        let mut subtree_widths: HashMap<String, f32> = HashMap::new();
+        for id in bfs_order.iter().rev() {
+            let node_w = widths.get(id).copied().unwrap_or(STANDARD_SHARD_WIDTH);
+            let children = primary_children.get(id).map(|v| v.as_slice()).unwrap_or(&[]);
+            if children.is_empty() {
+                subtree_widths.insert(id.clone(), node_w);
+            } else {
+                let sum: f32 = children.iter()
+                    .map(|cid| subtree_widths.get(cid).copied().unwrap_or(STANDARD_SHARD_WIDTH))
+                    .sum();
+                let gaps = (children.len() - 1) as f32 * LAYOUT_SIBLING_GAP;
+                subtree_widths.insert(id.clone(), (sum + gaps).max(node_w));
+            }
+        }
+
+        // Pass 2 (pre-order): assign positions top-down.
+        // Roots are centered around x=0; each row is offset vertically by the parent height + row gap.
+
+        let total_roots_w: f32 = {
+            let sum: f32 = layout_roots.iter()
+                .map(|id| subtree_widths.get(id).copied().unwrap_or(0.0))
+                .sum();
+            let gaps = (layout_roots.len().saturating_sub(1)) as f32 * LAYOUT_SIBLING_GAP;
+            sum + gaps
+        };
+
+        // Queue entries: (node_id, computed_center_x, computed_y)
+        let mut assign_queue: VecDeque<(String, f32, f32)> = VecDeque::new();
+        let mut cursor_x = -total_roots_w / 2.0;
+        for id in &layout_roots {
+            let subtree_w = subtree_widths.get(id).copied().unwrap_or(0.0);
+            let center_x = cursor_x + subtree_w / 2.0;
+            assign_queue.push_back((id.clone(), center_x, 0.0));
+            cursor_x += subtree_w + LAYOUT_SIBLING_GAP;
+        }
+
+        let mut new_positions: HashMap<String, Vec2> = HashMap::new();
+        while let Some((id, center_x, y)) = assign_queue.pop_front() {
+            let node_h = heights.get(&id).copied().unwrap_or(PLACEHOLDER_NODE_HEIGHT);
+            let node_w = widths.get(&id).copied().unwrap_or(STANDARD_SHARD_WIDTH);
+            // For manually positioned nodes, use their actual position as the anchor
+            // so children still flow from the correct location.
+            let (actual_center_x, actual_y) = if self.manual_positions.contains(&id) {
+                let pos = self.nodes[&id].position;
+                (pos.x + node_w / 2.0, pos.y)
+            } else {
+                new_positions.insert(id.clone(), Vec2::new(center_x - node_w / 2.0, y));
+                (center_x, y)
+            };
+
+            let children = primary_children.get(&id).cloned().unwrap_or_default();
+            if children.is_empty() {
+                continue;
+            }
+            let child_y = actual_y + node_h + LAYOUT_ROW_GAP;
+            let total_children_w: f32 = {
+                let sum: f32 = children.iter()
+                    .map(|cid| subtree_widths.get(cid).copied().unwrap_or(STANDARD_SHARD_WIDTH))
+                    .sum();
+                let gaps = (children.len() - 1) as f32 * LAYOUT_SIBLING_GAP;
+                sum + gaps
+            };
+            let mut child_cursor_x = actual_center_x - total_children_w / 2.0;
+            for cid in &children {
+                let child_subtree_w = subtree_widths.get(cid).copied().unwrap_or(STANDARD_SHARD_WIDTH);
+                let child_center_x = child_cursor_x + child_subtree_w / 2.0;
+                assign_queue.push_back((cid.clone(), child_center_x, child_y));
+                child_cursor_x += child_subtree_w + LAYOUT_SIBLING_GAP;
+            }
+        }
+
+        // Apply computed positions to non-manual nodes.
+        for (id, pos) in new_positions {
+            if let Some(node) = self.nodes.get_mut(&id) {
+                node.position = pos;
+            }
+        }
+
+        self.layout_dirty = false;
     }
 
-    pub fn add_node(&mut self, shard: GraphShard, position: Vec2) {
+    pub fn add_node(&mut self, shard: GraphShard, _position: Vec2) {
         self.content_version = self.content_version.wrapping_add(1);
         let id = shard.id.clone();
-        let velocity = Vec2::ZERO;
-        let size = Vec2::new(280.0, 120.0);
+        let size = Vec2::new(PLACEHOLDER_SHARD_WIDTH, PLACEHOLDER_NODE_HEIGHT);
         self.nodes.insert(
             id.clone(),
             ConstellationNode {
                 shard,
-                position,
-                velocity,
+                position: Vec2::ZERO,
                 size,
                 content_height: 0.0,
                 user_text_height: 0.0,
@@ -263,22 +439,18 @@ impl GraphState {
                 text_layer_size_assistant: Vec2::ZERO,
                 depth: 0,
                 child_count: 0,
+                ribbon_hue_t: 0.0,
             },
         );
         // When the first shard is created via chat (child of empty root), promote it to root.
         self.promote_empty_root_to_first_child();
-        // If this node became the root, place it at origin.
-        if self.root_id.as_ref() == Some(&id) {
-            if let Some(n) = self.nodes.get_mut(&id) {
-                n.position = Vec2::ZERO;
-            }
-        }
+        self.layout_dirty = true;
         self.recompute_hierarchy_metadata();
+        self.compute_ribbon_hues();
     }
 
     /// Recompute depth (BFS from root) and child_count for all nodes.
     fn recompute_hierarchy_metadata(&mut self) {
-        use std::collections::{HashMap, VecDeque};
 
         let root_id = match &self.root_id {
             Some(r) => r.clone(),
@@ -328,17 +500,60 @@ impl GraphState {
         }
     }
 
-    /// ID of the node used as the physics anchor when present (logical root).
-    fn anchored_root_id(&self) -> Option<String> {
-        self.root_id
-            .as_ref()
-            .and_then(|rid| {
-                if self.nodes.contains_key(rid) {
-                    Some(rid.clone())
-                } else {
-                    None
+    /// Assign `ribbon_hue_t` to every node:
+    /// - Layout roots (no primary parent in graph) get `hue_from_id(node_id)`.
+    /// - The first child (sorted index 0) of any node inherits the parent's hue.
+    /// - Every subsequent child gets its own `hue_from_id(child_id)`.
+    ///
+    /// Processed BFS top-down so parent hues are always available when children are visited.
+    fn compute_ribbon_hues(&mut self) {
+        if self.nodes.is_empty() {
+            return;
+        }
+
+        // Build primary_children: parent -> sorted child ids (same logic as apply_tree_layout).
+        let mut primary_children: HashMap<String, Vec<String>> = HashMap::new();
+        let mut layout_roots: Vec<String> = Vec::new();
+        for (id, node) in &self.nodes {
+            match node.shard.parent_ids.first() {
+                Some(pid) if self.nodes.contains_key(pid) => {
+                    primary_children.entry(pid.clone()).or_default().push(id.clone());
                 }
-            })
+                _ => layout_roots.push(id.clone()),
+            }
+        }
+        layout_roots.sort();
+        for v in primary_children.values_mut() {
+            v.sort();
+        }
+
+        // BFS: assign hues top-down.
+        let mut hue_map: HashMap<String, f32> = HashMap::new();
+        let mut queue: VecDeque<String> = VecDeque::new();
+
+        for id in &layout_roots {
+            hue_map.insert(id.clone(), hue_from_id(id));
+            queue.push_back(id.clone());
+        }
+
+        while let Some(id) = queue.pop_front() {
+            let parent_hue = *hue_map.get(&id).unwrap_or(&0.0);
+            if let Some(children) = primary_children.get(&id) {
+                for (idx, cid) in children.iter().enumerate() {
+                    let hue = if idx == 0 {
+                        parent_hue
+                    } else {
+                        hue_from_id(cid)
+                    };
+                    hue_map.insert(cid.clone(), hue);
+                    queue.push_back(cid.clone());
+                }
+            }
+        }
+
+        for (id, node) in self.nodes.iter_mut() {
+            node.ribbon_hue_t = *hue_map.get(id).unwrap_or(&0.0);
+        }
     }
 
     pub fn get_node(&self, id: &str) -> Option<&ConstellationNode> {
@@ -356,7 +571,7 @@ impl GraphState {
             Some(r) => r.clone(),
             None => return Vec::new(),
         };
-        let mut queue = std::collections::VecDeque::new();
+        let mut queue = VecDeque::new();
         if self.nodes.contains_key(&root_id) {
             queue.push_back(root_id);
         } else {
@@ -365,7 +580,7 @@ impl GraphState {
             }
         }
         let mut out = Vec::new();
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = HashSet::new();
         while let Some(id) = queue.pop_front() {
             if !visited.insert(id.clone()) {
                 continue;
@@ -380,181 +595,6 @@ impl GraphState {
             }
         }
         out
-    }
-
-    /// Physics constants for BOIDS-like layout
-    const TETHER_GAP: f32 = 24.0; // Rest length: parent bottom to child top
-    const TETHER_STIFFNESS: f32 = 300.0; // Bouncy preset
-    const TETHER_DAMPING: f32 = 12.0;
-    const REPULSION_MIN_SEP: f32 = 90.0;
-    const REPULSION_STRENGTH: f32 = 800.0;
-    const VELOCITY_DAMPING: f32 = 4.0;
-    const ROOT_CENTER_STRENGTH: f32 = 0.5;
-    /// Nodes with speed below this are treated as frozen for repulsion (no repulsion force added).
-    const PER_NODE_FREEZE_EPS: f32 = 0.005;
-
-    /// Step physics: tether to parents, repulsion between nodes, damping. Call each frame when graph is active.
-    pub fn step_physics(&mut self, dt: f32) {
-        if self.nodes.is_empty() {
-            return;
-        }
-        let root_id = match self.anchored_root_id() {
-            Some(r) => r,
-            None => return,
-        };
-
-        // Collect positions and sizes for force computation (read-only)
-        let positions: HashMap<String, Vec2> = self
-            .nodes
-            .iter()
-            .map(|(id, n)| (id.clone(), n.position))
-            .collect();
-        let sizes: HashMap<String, Vec2> = self
-            .nodes
-            .iter()
-            .map(|(id, n)| (id.clone(), n.size))
-            .collect();
-        let speeds: HashMap<String, f32> = self
-            .nodes
-            .iter()
-            .map(|(id, n)| (id.clone(), n.velocity.length()))
-            .collect();
-
-        // Effective radius per node: base card radius plus extra spacing based on child_count.
-        let mut radii: HashMap<String, f32> = HashMap::new();
-        for (id, node) in &self.nodes {
-            let base = 0.5 * node.size.x.max(node.size.y);
-            let extra = 12.0 * (node.child_count as f32).sqrt();
-            radii.insert(id.clone(), base + extra);
-        }
-
-        // Spatial hash grid for repulsion: group nodes into cells so we only consider nearby neighbors.
-        let mut max_dim = 0.0f32;
-        for node in self.nodes.values() {
-            max_dim = max_dim.max(node.size.x.max(node.size.y));
-        }
-        let max_dim = if max_dim > 0.0 { max_dim } else { 1.0 };
-        let cell_size = max_dim * 2.0;
-        let inv_cell_size = 1.0 / cell_size;
-        let mut grid: HashMap<(i32, i32), Vec<String>> = HashMap::new();
-        for (id, pos) in &positions {
-            let size = sizes
-                .get(id)
-                .copied()
-                .unwrap_or(Vec2::new(280.0, 120.0));
-            let center = *pos + size * 0.5;
-            let cx = (center.x * inv_cell_size).floor() as i32;
-            let cy = (center.y * inv_cell_size).floor() as i32;
-            grid.entry((cx, cy)).or_insert_with(Vec::new).push(id.clone());
-        }
-
-        for (id, node) in self.nodes.iter_mut() {
-            if id == &root_id {
-                // Keep the root pinned at origin so the rest of the graph stabilises around a fixed anchor.
-                node.position = Vec2::ZERO;
-                node.velocity = Vec2::ZERO;
-                continue;
-            }
-            let mut force = Vec2::ZERO;
-
-            // Tether to each parent: parent bottom-center → child top-center, rest length = TETHER_GAP.
-            // When parent is root and root has no shard (not in nodes), tether to origin.
-            for parent_id in &node.shard.parent_ids {
-                let parent_attach = if parent_id == &root_id && !positions.contains_key(parent_id) {
-                    Vec2::ZERO
-                } else if let Some(&parent_pos) = positions.get(parent_id) {
-                    let parent_size = sizes.get(parent_id).copied().unwrap_or(Vec2::new(280.0, 120.0));
-                    parent_pos + Vec2::new(parent_size.x * 0.5, parent_size.y)
-                } else {
-                    continue;
-                };
-                let child_attach = node.position + Vec2::new(node.size.x * 0.5, 0.0);
-                let delta = parent_attach - child_attach;
-                let dist = delta.length().max(1.0);
-                let stretch = dist - Self::TETHER_GAP;
-                let spring_force = delta.normalize() * stretch * Self::TETHER_STIFFNESS * 0.01;
-                force += spring_force;
-            }
-
-            // Repulsion from nearby nodes only (spatial hash grid). Skip for nearly-static nodes.
-            let speed = node.velocity.length();
-            if speed >= Self::PER_NODE_FREEZE_EPS {
-                let my_center = node.position + node.size * 0.5;
-                let my_radius = *radii.get(id).unwrap();
-                let cell_x = (my_center.x * inv_cell_size).floor() as i32;
-                let cell_y = (my_center.y * inv_cell_size).floor() as i32;
-                for dx in -1..=1 {
-                    for dy in -1..=1 {
-                        let key = (cell_x + dx, cell_y + dy);
-                        if let Some(neighbors) = grid.get(&key) {
-                            for other_id in neighbors {
-                                if other_id == id {
-                                    continue;
-                                }
-                                let other_pos = positions
-                                    .get(other_id)
-                                    .copied()
-                                    .unwrap_or(Vec2::ZERO);
-                                let other_size = sizes
-                                    .get(other_id)
-                                    .copied()
-                                    .unwrap_or(Vec2::new(280.0, 120.0));
-                                let other_center = other_pos + other_size * 0.5;
-                                let other_radius = *radii.get(other_id).unwrap();
-                                let delta = my_center - other_center;
-                                let dist = delta.length().max(1.0);
-                                let min_sep = my_radius + other_radius + Self::REPULSION_MIN_SEP;
-                                if dist < min_sep {
-                                    let overlap = min_sep - dist;
-                                    let repulsion =
-                                        delta.normalize() * overlap * Self::REPULSION_STRENGTH / dist;
-                                    force += repulsion;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Integrate with depth- and parent-aware damping so parents settle before children.
-            node.velocity += force * dt;
-
-            let parent_max_speed = node
-                .shard
-                .parent_ids
-                .iter()
-                .map(|pid| *speeds.get(pid).unwrap_or(&0.0))
-                .fold(0.0, f32::max);
-            let depth = node.depth as f32;
-            let parent_busy = parent_max_speed > 0.02;
-            let extra_damping = if parent_busy && depth > 0.0 {
-                (depth * 0.5).min(4.0)
-            } else {
-                0.0
-            };
-            let damping = Self::VELOCITY_DAMPING + extra_damping;
-
-            node.velocity *= 1.0 - (damping * dt).min(0.9);
-            node.position += node.velocity * dt;
-        }
-    }
-
-    /// Sum of velocity magnitudes across all nodes. Used to skip physics when settled.
-    pub fn total_velocity_magnitude(&self) -> f32 {
-        self.nodes
-            .values()
-            .map(|n| n.velocity.length())
-            .sum()
-    }
-
-    /// When physics is not running and total velocity is below threshold, zero all velocities
-    /// so we reach a clean "resting" state and avoid continuous redraws from floating-point drift.
-    pub fn zero_velocities_if_settled(&mut self, threshold: f32) {
-        if self.total_velocity_magnitude() <= threshold {
-            for node in self.nodes.values_mut() {
-                node.velocity = Vec2::ZERO;
-            }
-        }
     }
 
     /// Axis-aligned bounding box of all nodes in world space. Returns (min, max) or None if empty.
@@ -594,7 +634,19 @@ impl GraphState {
             .collect()
     }
 
-    /// Parent IDs of a node (for edges and Alt+arrow).
+    /// Set the active leaf, recording it as the last-visited child of its primary parent.
+    pub fn set_current_leaf(&mut self, id: String) {
+        let primary_parent = self.nodes
+            .get(&id)
+            .and_then(|n| n.shard.parent_ids.first().cloned())
+            .filter(|pid| self.nodes.contains_key(pid));
+        if let Some(parent_id) = primary_parent {
+            self.last_visited_child.insert(parent_id, id.clone());
+        }
+        self.current_leaf_id = Some(id);
+    }
+
+    /// Parent IDs of a node (for edges and arrow navigation).
     pub fn parent_ids(&self, id: &str) -> Vec<String> {
         self.nodes
             .get(id)
@@ -602,38 +654,375 @@ impl GraphState {
             .unwrap_or_default()
     }
 
-    /// Measure text block with word wrap; returns (width, height). Used for adaptive node sizing.
-    fn measure_block<M: FnMut(&str, f32) -> Vec2>(measure: &mut M, text: &str, max_width: f32, font_size: f32) -> Vec2 {
-        let line_height = font_size * 1.2;
-        let words: Vec<&str> = text.split_whitespace().collect();
-        let mut current_line = String::new();
+    /// Siblings of a node: other children of the same primary parent, sorted by ID (matches layout order).
+    pub fn sibling_ids(&self, id: &str) -> Vec<String> {
+        let primary_parent = self.nodes
+            .get(id)
+            .and_then(|n| n.shard.parent_ids.first().cloned())
+            .filter(|pid| self.nodes.contains_key(pid));
+        let Some(parent_id) = primary_parent else { return vec![]; };
+        let mut siblings: Vec<String> = self.nodes
+            .iter()
+            .filter(|(sid, n)| *sid != id && n.shard.parent_ids.first().map(|p| p == &parent_id).unwrap_or(false))
+            .map(|(sid, _)| sid.clone())
+            .collect();
+        siblings.sort();
+        siblings
+    }
+
+    /// Previous sibling in sorted order, wrapping around.
+    pub fn prev_sibling_id(&self, id: &str) -> Option<String> {
+        let parent_id = self.nodes
+            .get(id)
+            .and_then(|n| n.shard.parent_ids.first().cloned())
+            .filter(|pid| self.nodes.contains_key(pid))?;
+        let mut all_children: Vec<String> = self.nodes
+            .iter()
+            .filter(|(_, n)| n.shard.parent_ids.first().map(|p| p == &parent_id).unwrap_or(false))
+            .map(|(cid, _)| cid.clone())
+            .collect();
+        all_children.sort();
+        let pos = all_children.iter().position(|s| s == id)?;
+        if pos == 0 { None } else { Some(all_children[pos - 1].clone()) }
+    }
+
+    /// Next sibling in sorted order.
+    pub fn next_sibling_id(&self, id: &str) -> Option<String> {
+        let parent_id = self.nodes
+            .get(id)
+            .and_then(|n| n.shard.parent_ids.first().cloned())
+            .filter(|pid| self.nodes.contains_key(pid))?;
+        let mut all_children: Vec<String> = self.nodes
+            .iter()
+            .filter(|(_, n)| n.shard.parent_ids.first().map(|p| p == &parent_id).unwrap_or(false))
+            .map(|(cid, _)| cid.clone())
+            .collect();
+        all_children.sort();
+        let pos = all_children.iter().position(|s| s == id)?;
+        all_children.get(pos + 1).cloned()
+    }
+
+    /// Measure markdown block with wrap; returns (width, height) aligned with
+    /// [`crate::gfx::renderer::Renderer::build_markdown_scene`].
+    fn measure_markdown_block<M: FnMut(&str, f32, f32, bool, bool) -> ParagraphWrappedFlow>(
+        measure: &mut M,
+        markdown: &str,
+        max_width: f32,
+        font_size: f32,
+    ) -> Vec2 {
+        fn effective_font_size(font_size: f32, _bold: bool, _italic: bool, _code: bool) -> f32 {
+            font_size
+        }
+
+        fn flush_inline<M: FnMut(&str, f32, f32, bool, bool) -> ParagraphWrappedFlow>(
+            measure: &mut M,
+            text: &mut String,
+            font_size: f32,
+            bold: bool,
+            italic: bool,
+            code: bool,
+            current_x: &mut f32,
+            total_h: &mut f32,
+            max_w: &mut f32,
+            max_width: f32,
+            line_max_font: &mut f32,
+            line_has_content: &mut bool,
+            trailing_segment: bool,
+        ) {
+            if text.is_empty() {
+                return;
+            }
+            let size = effective_font_size(font_size, bold, italic, code);
+            let seg_x = *current_x;
+            let rem = (max_width - seg_x).max(1.0);
+            let flow = measure(text, size, rem, bold, italic);
+            *current_x = seg_x + flow.last_line_advance;
+            if trailing_segment {
+                *total_h += flow.content_height;
+            } else {
+                *total_h += flow.content_height - flow.last_line_height;
+            }
+            *max_w = (*max_w).max(seg_x + flow.layout_width);
+            *line_max_font = (*line_max_font).max(size);
+            *line_has_content = true;
+            text.clear();
+        }
+
+        let line_ratio = style::font_size::LINE_HEIGHT_RATIO;
+        let mut current_x = 0.0f32;
         let mut max_w = 0.0f32;
-        let mut line_count = 0u32;
-        for word in words {
-            let test_line = if current_line.is_empty() {
-                word.to_string()
-            } else {
-                format!("{} {}", current_line, word)
-            };
-            let test_size = measure(&test_line, font_size);
-            if test_size.x > max_width && !current_line.is_empty() {
-                max_w = max_w.max(measure(&current_line, font_size).x);
-                line_count += 1;
-                current_line = word.to_string();
-            } else {
-                current_line = test_line;
+        let mut total_h = 0.0f32;
+        let mut line_max_font = font_size;
+        let mut line_has_content = false;
+        let mut current_text = String::new();
+        let mut is_bold = false;
+        let mut is_italic = false;
+        let mut is_code = false;
+        #[derive(Clone, Copy)]
+        struct ListFrame {
+            ordered: bool,
+            next_n: u64,
+        }
+        let mut list_stack: Vec<ListFrame> = Vec::new();
+
+        for event in Parser::new(markdown) {
+            match event {
+                Event::Start(Tag::List(first)) => {
+                    list_stack.push(ListFrame {
+                        ordered: first.is_some(),
+                        next_n: first.unwrap_or(1),
+                    });
+                }
+                Event::End(TagEnd::List(_)) => {
+                    list_stack.pop();
+                }
+                Event::Start(Tag::Item) => {
+                    let prefix = list_stack.last().map(|f| {
+                        if f.ordered {
+                            format!("{}. ", f.next_n)
+                        } else {
+                            "• ".to_string()
+                        }
+                    });
+                    if let Some(p) = prefix {
+                        current_text.push_str(&p);
+                    }
+                }
+                Event::End(TagEnd::Item) => {
+                    if let Some(f) = list_stack.last_mut() {
+                        if f.ordered {
+                            f.next_n += 1;
+                        }
+                    }
+                    if !current_text.is_empty() {
+                        let sz = effective_font_size(font_size, is_bold, is_italic, is_code);
+                        let rem = (max_width - current_x).max(1.0);
+                        let flow = measure(&current_text, sz, rem, is_bold, is_italic);
+                        total_h += flow.content_height;
+                        max_w = max_w.max(current_x + flow.layout_width);
+                        line_max_font = line_max_font.max(sz);
+                        line_has_content = true;
+                        current_text.clear();
+                    }
+                    current_x = 0.0;
+                    line_max_font = font_size;
+                    line_has_content = false;
+                }
+                Event::End(TagEnd::Paragraph) => {
+                    if !current_text.is_empty() {
+                        let sz = effective_font_size(font_size, is_bold, is_italic, is_code);
+                        let rem = (max_width - current_x).max(1.0);
+                        let flow = measure(&current_text, sz, rem, is_bold, is_italic);
+                        total_h += flow.content_height;
+                        max_w = max_w.max(current_x + flow.layout_width);
+                        line_max_font = line_max_font.max(sz);
+                        line_has_content = true;
+                        current_text.clear();
+                    } else {
+                        total_h += font_size * line_ratio;
+                    }
+                    current_x = 0.0;
+                    line_max_font = font_size;
+                    line_has_content = false;
+                }
+                Event::Start(Tag::Strong) => {
+                    flush_inline(
+                        measure,
+                        &mut current_text,
+                        font_size,
+                        is_bold,
+                        is_italic,
+                        is_code,
+                        &mut current_x,
+                        &mut total_h,
+                        &mut max_w,
+                        max_width,
+                        &mut line_max_font,
+                        &mut line_has_content,
+                        false,
+                    );
+                    is_bold = true;
+                }
+                Event::End(pulldown_cmark::TagEnd::Strong) => {
+                    flush_inline(
+                        measure,
+                        &mut current_text,
+                        font_size,
+                        is_bold,
+                        is_italic,
+                        is_code,
+                        &mut current_x,
+                        &mut total_h,
+                        &mut max_w,
+                        max_width,
+                        &mut line_max_font,
+                        &mut line_has_content,
+                        false,
+                    );
+                    is_bold = false;
+                }
+                Event::Start(Tag::Emphasis) => {
+                    flush_inline(
+                        measure,
+                        &mut current_text,
+                        font_size,
+                        is_bold,
+                        is_italic,
+                        is_code,
+                        &mut current_x,
+                        &mut total_h,
+                        &mut max_w,
+                        max_width,
+                        &mut line_max_font,
+                        &mut line_has_content,
+                        false,
+                    );
+                    is_italic = true;
+                }
+                Event::End(pulldown_cmark::TagEnd::Emphasis) => {
+                    flush_inline(
+                        measure,
+                        &mut current_text,
+                        font_size,
+                        is_bold,
+                        is_italic,
+                        is_code,
+                        &mut current_x,
+                        &mut total_h,
+                        &mut max_w,
+                        max_width,
+                        &mut line_max_font,
+                        &mut line_has_content,
+                        false,
+                    );
+                    is_italic = false;
+                }
+                Event::Start(Tag::CodeBlock(_)) => {
+                    flush_inline(
+                        measure,
+                        &mut current_text,
+                        font_size,
+                        is_bold,
+                        is_italic,
+                        is_code,
+                        &mut current_x,
+                        &mut total_h,
+                        &mut max_w,
+                        max_width,
+                        &mut line_max_font,
+                        &mut line_has_content,
+                        false,
+                    );
+                    is_code = true;
+                }
+                Event::End(pulldown_cmark::TagEnd::CodeBlock) => {
+                    flush_inline(
+                        measure,
+                        &mut current_text,
+                        font_size,
+                        is_bold,
+                        is_italic,
+                        is_code,
+                        &mut current_x,
+                        &mut total_h,
+                        &mut max_w,
+                        max_width,
+                        &mut line_max_font,
+                        &mut line_has_content,
+                        false,
+                    );
+                    is_code = false;
+                }
+                Event::Text(text) => {
+                    let size = effective_font_size(font_size, is_bold, is_italic, is_code);
+                    for word in text.split_whitespace() {
+                        let candidate = if current_text.is_empty() {
+                            word.to_string()
+                        } else {
+                            format!(" {}", word)
+                        };
+                        let test = format!("{}{}", current_text, candidate);
+                        let rem_try = (max_width - current_x).max(1.0);
+                        let try_flow = measure(&test, size, rem_try, is_bold, is_italic);
+                        if current_x + try_flow.layout_width > max_width && !current_text.is_empty()
+                        {
+                            let rem_flush = (max_width - current_x).max(1.0);
+                            let flow = measure(
+                                &current_text,
+                                size,
+                                rem_flush,
+                                is_bold,
+                                is_italic,
+                            );
+                            total_h += flow.content_height;
+                            max_w = max_w.max(current_x + flow.layout_width);
+                            line_max_font = line_max_font.max(size);
+                            line_has_content = true;
+                            current_text.clear();
+                            current_x = 0.0;
+                            current_text = word.to_string();
+                        } else {
+                            current_text = test;
+                        }
+                    }
+                }
+                Event::SoftBreak | Event::HardBreak => {
+                    if !current_text.is_empty() {
+                        let sz = effective_font_size(font_size, is_bold, is_italic, is_code);
+                        let rem = (max_width - current_x).max(1.0);
+                        let flow = measure(
+                            &current_text,
+                            sz,
+                            rem,
+                            is_bold,
+                            is_italic,
+                        );
+                        total_h += flow.content_height;
+                        max_w = max_w.max(current_x + flow.layout_width);
+                        line_max_font = line_max_font.max(sz);
+                        line_has_content = true;
+                        current_text.clear();
+                    } else {
+                        total_h += font_size * line_ratio;
+                    }
+                    current_x = 0.0;
+                    line_max_font = font_size;
+                    line_has_content = false;
+                }
+                _ => {}
             }
         }
-        if !current_line.is_empty() {
-            line_count += 1;
-            max_w = max_w.max(measure(&current_line, font_size).x);
+
+        flush_inline(
+            measure,
+            &mut current_text,
+            font_size,
+            is_bold,
+            is_italic,
+            is_code,
+            &mut current_x,
+            &mut total_h,
+            &mut max_w,
+            max_width,
+            &mut line_max_font,
+            &mut line_has_content,
+            true,
+        );
+        if total_h == 0.0 {
+            total_h = font_size * line_ratio;
         }
-        let h = (line_count.max(1) as f32) * line_height;
-        Vec2::new(max_w, h)
+        max_w = max_w.max(current_x);
+
+        Vec2::new(max_w.max(1.0).min(max_width), total_h)
     }
 
     /// World rect (min, max) for viewport culling. When set, only nodes whose AABB intersects this rect are measured.
-    fn node_in_visible_rect(position: Vec2, size: Vec2, visible_min: Vec2, visible_max: Vec2) -> bool {
+    fn node_in_visible_rect(
+        position: Vec2,
+        size: Vec2,
+        visible_min: Vec2,
+        visible_max: Vec2,
+    ) -> bool {
         !(position.x + size.x < visible_min.x
             || position.x > visible_max.x
             || position.y + size.y < visible_min.y
@@ -643,94 +1032,130 @@ impl GraphState {
     /// Update each node's size from its content (user + assistant bubbles). Single source of truth for `node.size`;
     /// call each frame before constellation render (see renderer) so the shard background and hit-test stay in sync.
     /// When a node is being edited in place, pass its id and the current edit textarea size in `editing_override`
-    /// so the shard background resizes to fit the message box. Future manual resize can plug in by constraining
-    /// or overriding the computed size here.
-    /// When `visible_rect` is `Some((min, max))` in world space, only nodes whose AABB intersects that rect are updated.
-    pub fn update_node_sizes<M: FnMut(&str, f32) -> Vec2>(
+    /// so the shard background resizes to fit the message box.
+    /// When `visible_rect` is `Some((min, max))` in world space, only out-of-view nodes are skipped — unless
+    /// `layout_dirty` is true, in which case all nodes are measured so the tree layout has accurate heights.
+    pub fn update_node_sizes<M: FnMut(&str, f32, f32, bool, bool) -> ParagraphWrappedFlow>(
         &mut self,
-        viewport_size: Vec2,
         measure: M,
         editing_override: Option<(&str, Vec2)>,
         visible_rect: Option<(Vec2, Vec2)>,
+        viewport_width: f32,
     ) {
-        const PADDING: f32 = 8.0;
+        const PADDING: f32 = style::padding::SMALL;
         const BUBBLE_SPACING: f32 = 6.0;
-        const ACTION_ROW_HEIGHT: f32 = 28.0;  // action buttons + pin area
-        const MSG_BUTTON_ROW_RESERVE: f32 = 22.0;  // space at bottom of each bubble for edit/hide buttons
-        const FONT_SIZE: f32 = 16.0;
-        const MIN_NODE_WIDTH: f32 = 200.0;
-        const MIN_NODE_HEIGHT: f32 = 60.0;
-        const MAX_CARD_HEIGHT: f32 = 360.0; // Fixed cap so long messages truncate and scroll within card
+        const ACTION_ROW_HEIGHT: f32 = 28.0;
+        const MSG_BUTTON_ROW_RESERVE: f32 = 22.0;
+        const FONT_SIZE: f32 = style::font_size::MESSAGE_BODY;
 
-        // Allow slightly wider cards so default zoom text isn't overly wrapped.
-        let max_width = (viewport_size.x * 0.8).max(MIN_NODE_WIDTH);
-        let max_height = viewport_size.y * 0.75;
+        // Default card width: 80% of viewport, floored at STANDARD_SHARD_WIDTH.
+        let card_width = (viewport_width * 0.8).max(STANDARD_SHARD_WIDTH);
+        let min_node_height = MIN_SHARD_MANUAL_HEIGHT;
+        let lateral = (style::padding::SMALL + style::padding::SHARD_MESSAGE_INSET) * 2.0;
+        // Initial wrap width derived from standard card width (matches constellation bubble geometry).
+        let text_wrap_width = (card_width * style::constellation::BUBBLE_MAX_WIDTH_RATIO - lateral)
+            .max(style::constellation::BUBBLE_MIN_CONTENT_WIDTH);
+
+        // When layout is dirty we must measure all nodes (even off-screen) so the tree layout
+        // has accurate heights. Otherwise apply the visible_rect cull for performance.
+        let skip_cull = self.layout_dirty;
 
         let mut measure = measure;
-        for (node_id, node) in self.nodes.iter_mut() {
-            if let Some((visible_min, visible_max)) = visible_rect {
-                if !Self::node_in_visible_rect(node.position, node.size, visible_min, visible_max) {
-                    continue;
+        let node_ids: Vec<String> = self.nodes.keys().cloned().collect();
+        for node_id in &node_ids {
+            {
+                let node = self.nodes.get(node_id).unwrap();
+                if !skip_cull {
+                    if let Some((visible_min, visible_max)) = visible_rect {
+                        if !Self::node_in_visible_rect(node.position, node.size, visible_min, visible_max) {
+                            continue;
+                        }
+                    }
                 }
             }
-            let mut content_w = 0.0f32;
-            let mut content_h = PADDING; // top margin
+
+            // Determine the actual card width for this node (manual override or default).
+            let shard_w = self
+                .manual_sizes
+                .get(node_id)
+                .map(|m| m.x.clamp(MIN_SHARD_MANUAL_WIDTH, card_width * 2.0))
+                .unwrap_or(card_width);
+            let bubble_inner_floor = (shard_w * style::constellation::BUBBLE_MAX_WIDTH_RATIO - lateral)
+                .max(style::constellation::BUBBLE_MIN_CONTENT_WIDTH);
+            let wrap_w = text_wrap_width.max(bubble_inner_floor);
+
+            let node = self.nodes.get(node_id).unwrap();
+            let assistant_size = editing_override.as_ref().and_then(|(id, size)| {
+                if *id == node_id.as_str() { Some(*size) } else { None }
+            });
+
             let mut user_text_h = 0.0f32;
             let mut user_text_w = 0.0f32;
             let mut assistant_text_h = 0.0f32;
             let mut assistant_text_w = 0.0f32;
 
-            if let Some(ref u) = node.shard.user_content {
+            if let Some(ref u) = node.shard.user_content.clone() {
                 if !u.is_empty() {
-                    let sz = Self::measure_block(&mut measure, u, max_width - PADDING * 2.0, FONT_SIZE);
+                    let sz = Self::measure_markdown_block(&mut measure, &u, wrap_w, FONT_SIZE);
                     user_text_h = sz.y;
-                    user_text_w = sz.x;
-                    content_w = content_w.max(sz.x);
-                    content_h += sz.y + PADDING * 2.0 + MSG_BUTTON_ROW_RESERVE + BUBBLE_SPACING; // user bubble (text + pad + button row) + spacing
+                    user_text_w = sz.x.max(bubble_inner_floor);
                 }
             }
-            let assistant_size = editing_override.as_ref().and_then(|(id, size)| {
-                if *id == node_id.as_str() { Some(*size) } else { None }
-            });
             if let Some(edit_size) = assistant_size {
                 assistant_text_h = edit_size.y;
                 assistant_text_w = edit_size.x;
-                content_w = content_w.max(edit_size.x + PADDING * 2.0);
-                content_h += edit_size.y + PADDING * 2.0 + MSG_BUTTON_ROW_RESERVE; // assistant bubble when editing
-            } else if let Some(ref a) = node.shard.assistant_content {
+            } else if let Some(ref a) = node.shard.assistant_content.clone() {
                 if !a.is_empty() {
-                    let sz = Self::measure_block(&mut measure, a, max_width - PADDING * 2.0, FONT_SIZE);
+                    let sz = Self::measure_markdown_block(&mut measure, &a, wrap_w, FONT_SIZE);
                     assistant_text_h = sz.y;
-                    assistant_text_w = sz.x;
-                    content_w = content_w.max(sz.x);
-                    content_h += sz.y + PADDING * 2.0 + MSG_BUTTON_ROW_RESERVE; // assistant bubble (text + pad + button row)
+                    assistant_text_w = sz.x.max(bubble_inner_floor);
                 }
             }
-            const CITATION_LINE_HEIGHT: f32 = 14.4;
+
+            let node = self.nodes.get(node_id).unwrap();
+            let mut content_h = PADDING;
+            if user_text_h > 0.0 {
+                content_h += user_text_h + PADDING * 2.0 + MSG_BUTTON_ROW_RESERVE + BUBBLE_SPACING;
+            }
+            if let Some(edit_size) = assistant_size {
+                content_h += edit_size.y + PADDING * 2.0 + MSG_BUTTON_ROW_RESERVE;
+            } else if assistant_text_h > 0.0 {
+                content_h += assistant_text_h + PADDING * 2.0 + MSG_BUTTON_ROW_RESERVE;
+            }
+
+            const CITATION_LINE_HEIGHT: f32 =
+                style::font_size::SMALL * style::font_size::LINE_HEIGHT_RATIO;
             const CITATION_GAP: f32 = 4.0;
             if !node.shard.citations.is_empty() {
                 content_h += CITATION_GAP + node.shard.citations.len() as f32 * CITATION_LINE_HEIGHT;
             }
-            const NOTE_LINE_H: f32 = 18.0;
+            const NOTE_LINE_H: f32 = style::font_size::LARGE;
             const NOTES_GAP: f32 = 4.0;
             if !node.shard.notes.is_empty() {
                 content_h += NOTES_GAP + node.shard.notes.len() as f32 * NOTE_LINE_H;
             }
+            content_h += PADDING + ACTION_ROW_HEIGHT;
 
-            content_h += PADDING; // bottom margin
-            content_h += ACTION_ROW_HEIGHT; // pin + action buttons
-            let raw_w = (content_w + PADDING * 2.0).max(MIN_NODE_WIDTH);
-            let raw_h = content_h.max(MIN_NODE_HEIGHT);
-
-            // Size to content; cap at max for very long messages (fixed MAX_CARD_HEIGHT ensures truncation)
-            let w = raw_w.min(max_width);
-            let h = raw_h.min(max_height).min(MAX_CARD_HEIGHT).max(MIN_NODE_HEIGHT);
-            node.size = Vec2::new(w, h);
+            let raw_h = content_h.max(min_node_height);
+            let node = self.nodes.get_mut(node_id).unwrap();
+            if let Some(manual) = self.manual_sizes.get(node_id) {
+                node.size = Vec2::new(
+                    manual.x.clamp(MIN_SHARD_MANUAL_WIDTH, card_width * 2.0),
+                    manual.y.clamp(min_node_height, raw_h),
+                );
+            } else {
+                node.size = Vec2::new(shard_w, raw_h);
+            }
             node.content_height = raw_h;
             node.user_text_height = user_text_h;
             node.assistant_text_height = assistant_text_h;
             node.user_text_width = user_text_w;
             node.assistant_text_width = assistant_text_w;
+        }
+
+        // Run tree layout after measuring all nodes when sizes have changed.
+        if self.layout_dirty {
+            self.apply_tree_layout();
         }
     }
 }

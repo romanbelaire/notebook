@@ -1,3 +1,6 @@
+//! UI motion. For cassette-futurism **mechanical** (tape-deck) feel, prefer
+//! [`AnimationPreset::Mechanical`] on chrome and tabs; see `docs/design/cassette-futurism.md`.
+
 /// Spring physics animation for smooth, natural motion
 pub struct SpringAnimation {
     pub value: f32,
@@ -5,6 +8,8 @@ pub struct SpringAnimation {
     pub velocity: f32,
     pub stiffness: f32,
     pub damping: f32,
+    /// Max overshoot distance from target (clamps bounce). None = unlimited.
+    pub max_bounce: Option<f32>,
 }
 
 /// Preset animation configurations for common use cases
@@ -22,6 +27,8 @@ pub enum AnimationPreset {
     Gentle,
     /// Viscous: slow, high stretch, no bounce (for liquid nav slider trailing edge)
     Viscous,
+    /// Mechanical: overdamped settle, little overshoot — tabs, chrome, capstan-like UI motion.
+    Mechanical,
     /// Custom parameters
     Custom { stiffness: f32, damping: f32 },
 }
@@ -35,6 +42,7 @@ impl AnimationPreset {
             AnimationPreset::TightBounce => 800.0,
             AnimationPreset::Gentle => 100.0,
             AnimationPreset::Viscous => 65.0,
+            AnimationPreset::Mechanical => 240.0,
             AnimationPreset::Custom { stiffness, .. } => *stiffness,
         }
     }
@@ -47,6 +55,7 @@ impl AnimationPreset {
             AnimationPreset::TightBounce => 8.0,
             AnimationPreset::Gentle => 10.0,
             AnimationPreset::Viscous => 22.0,
+            AnimationPreset::Mechanical => 28.0,
             AnimationPreset::Custom { damping, .. } => *damping,
         }
     }
@@ -72,6 +81,7 @@ impl SpringAnimation {
             velocity: 0.0,
             stiffness: preset.stiffness(),
             damping: preset.damping(),
+            max_bounce: None,
         }
     }
 
@@ -83,7 +93,14 @@ impl SpringAnimation {
             velocity: 0.0,
             stiffness,
             damping,
+            max_bounce: None,
         }
+    }
+
+    /// Set maximum bounce distance (clamps overshoot). For cursor: ~0.25 ≈ 2px at 8px/char.
+    pub fn with_max_bounce(mut self, max_bounce: f32) -> Self {
+        self.max_bounce = Some(max_bounce);
+        self
     }
 
     /// Update the animation with delta time
@@ -92,6 +109,14 @@ impl SpringAnimation {
         self.velocity += force * dt;
         self.velocity *= 1.0 - (self.damping * dt).min(0.9);
         self.value += self.velocity * dt;
+
+        if let Some(max_b) = self.max_bounce {
+            let overshoot = (self.value - self.target).abs();
+            if overshoot > max_b {
+                self.value = self.target + (self.value - self.target).signum() * max_b;
+                self.velocity *= 0.5;
+            }
+        }
 
         if (self.target - self.value).abs() < 0.01 && self.velocity.abs() < 0.01 {
             self.value = self.target;

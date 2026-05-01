@@ -24,5 +24,6 @@ pub mod icon_names {
     pub const WINDOWED: &str = "windowed";
     pub const ZAP: &str = "zap";
     pub const ZAP_YELLOW: &str = "zap-yellow";
+    pub const SAVE: &str = "save";
 }
 

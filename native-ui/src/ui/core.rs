@@ -59,6 +59,18 @@ impl Rect {
             && self.bottom() > other.y
     }
 
+    /// Axis-aligned intersection, or `None` if there is no overlap.
+    pub fn intersection(&self, other: &Rect) -> Option<Rect> {
+        let left = self.x.max(other.x);
+        let top = self.y.max(other.y);
+        let right = self.right().min(other.right());
+        let bottom = self.bottom().min(other.bottom());
+        if right <= left || bottom <= top {
+            return None;
+        }
+        Some(Rect::new(left, top, right - left, bottom - top))
+    }
+
     /// Check if this rect is visible within the viewport (for frustum culling)
     /// Returns true if the rect intersects with the viewport, false if completely off-screen
     pub fn is_visible(&self, viewport: &Rect) -> bool {
@@ -223,7 +235,7 @@ pub mod text {
             Self {
                 // Treat glyphs as ~10% wider for layout to ease reading
                 width: char_count as f32 * font_size * 0.66,
-                height: font_size * 1.2,
+                height: font_size * 1.35,
                 baseline_offset: font_size * 0.75,
             }
         }
@@ -540,9 +552,31 @@ pub mod text_input_render {
     use crate::app::App;
     use crate::ui::components::Renderable;
 
-    /// Render a standard text input field with proper cursor and selection.
-    /// When wrap_text is true, text is word-wrapped to the input width (e.g. for shard modal).
-    pub fn render_text_input(
+    fn cursor_x_from_animation(
+        positions: &[f32],
+        text_is_empty: bool,
+        text_pos_x: f32,
+        cursor_anim: f32,
+    ) -> f32 {
+        if text_is_empty {
+            return text_pos_x;
+        }
+        let cursor_pos_floor = cursor_anim.floor() as usize;
+        let cursor_pos_ceil = cursor_anim.ceil() as usize;
+        let t = cursor_anim - cursor_anim.floor();
+        if cursor_pos_ceil < positions.len() && cursor_pos_floor < positions.len() {
+            let x1 = positions[cursor_pos_floor];
+            let x2 = positions[cursor_pos_ceil];
+            x1 + (x2 - x1) * t
+        } else if cursor_pos_floor < positions.len() {
+            positions[cursor_pos_floor]
+        } else {
+            positions.last().copied().unwrap_or(text_pos_x)
+        }
+    }
+
+    /// Shared body for [`render_text_input`] and [`crate::ui::TextInput`]'s `Renderable` impl.
+    pub(crate) fn render_text_input_inner(
         renderer: &mut Renderer,
         input: &TextInput,
         app: &App,
@@ -551,6 +585,7 @@ pub mod text_input_render {
         padding: Option<f32>,
         corner_radius: Option<f32>,
         wrap_text: bool,
+        dirty_rect: Option<Rect>,
     ) {
         const DEFAULT_FONT_SIZE: f32 = style::font_size::NORMAL;
         const DEFAULT_PADDING: f32 = style::padding::SMALL;
@@ -560,38 +595,23 @@ pub mod text_input_render {
         let text_padding = padding.unwrap_or(DEFAULT_PADDING);
         let corner_radius = corner_radius.unwrap_or(DEFAULT_CORNER_RADIUS);
 
-        // Create rect for input field
         let input_rect = Rect::from_pos_size(input.position, input.size);
 
-        // Input field background
         let input_bg = Quad {
             position: input_rect.position(),
             size: input_rect.size(),
             color: if input.focused {
-                style::bg::INPUT_FOCUSED
+                style::bg::INPUT_FOCUSED()
             } else {
-                style::bg::INPUT
+                style::bg::INPUT()
             },
             corner_radius,
             bubble_effect: false,
-                slider_effect: false,
+            slider_effect: false,
         };
         vertices.extend_from_slice(&input_bg.to_vertices());
 
-        // Render input text or placeholder
-        let text_buf = input.text.clone();
-        let text_is_empty = text_buf.is_empty();
-        let text_to_show = if text_is_empty {
-            input.placeholder.clone()
-        } else {
-            text_buf.clone()
-        };
-        let text_color = if text_is_empty {
-            style::text::PLACEHOLDER
-        } else {
-            style::text::PRIMARY
-        };
-
+        let text_is_empty = input.text.is_empty();
         let text_rect = Rect::new(
             input_rect.x + text_padding,
             input_rect.y,
@@ -604,88 +624,194 @@ pub mod text_input_render {
             renderer.push_parent(content_id.clone());
             renderer.validate_component(&content_id, None, "TextInputContent");
             renderer.push_scissor(&text_rect);
-            renderer.queue_plain_text_wrapped(&text_to_show, text_rect.position(), text_color, font_size, text_rect.width);
+            if !text_is_empty {
+                renderer.queue_plain_text_wrapped(
+                    &input.text,
+                    text_rect.position(),
+                    style::text::PRIMARY(),
+                    font_size,
+                    text_rect.width,
+                );
+            } else if !input.placeholder.is_empty() {
+                renderer.queue_plain_text_wrapped(
+                    &input.placeholder,
+                    text_rect.position(),
+                    style::text::PLACEHOLDER(),
+                    font_size,
+                    text_rect.width,
+                );
+            }
+            if input.focused && !input.ghost_text.is_empty() && !text_is_empty {
+                let cursor_idx = app.cursor_position_animation.value.floor() as usize;
+                let line_height = font_size * style::font_size::LINE_HEIGHT_RATIO;
+                let (gx, gy) = renderer.cursor_xy_for_wrapped_cursor_index(
+                    &input.text,
+                    font_size,
+                    text_rect.x,
+                    text_rect.y,
+                    text_rect.width,
+                    cursor_idx.min(input.text.chars().count()),
+                );
+                let ghost_rect = Rect::new(
+                    gx,
+                    gy,
+                    (text_rect.x + text_rect.width - gx).max(0.0),
+                    line_height,
+                );
+                let mut ghost_component = crate::ui::text::Text::new_for_render(&input.ghost_text)
+                    .with_font_size(font_size)
+                    .with_color(style::text::GHOST())
+                    .with_alignment(crate::ui::text::TextAlignment::Left);
+                ghost_component.update_layout(ghost_rect, dirty_rect, None);
+                ghost_component.render(renderer, app, vertices, dirty_rect);
+            }
             renderer.pop_scissor();
             renderer.pop_parent();
         } else {
-            let mut text_component = crate::ui::text::Text::new_for_render(&text_to_show)
-                .with_font_size(font_size)
-                .with_color(text_color)
-                .with_alignment(crate::ui::text::TextAlignment::Left);
-            text_component.update_layout(text_rect, None, None);
             let content_id = format!("text_input_content_{:p}", input);
             renderer.push_parent(content_id.clone());
             renderer.validate_component(&content_id, None, "TextInputContent");
-            text_component.render(renderer, app, vertices, None);
+            if !text_is_empty {
+                let mut primary = crate::ui::text::Text::new_for_render(&input.text)
+                    .with_font_size(font_size)
+                    .with_color(style::text::PRIMARY())
+                    .with_alignment(crate::ui::text::TextAlignment::Left);
+                primary.update_layout(text_rect, dirty_rect, None);
+                primary.render(renderer, app, vertices, dirty_rect);
+            } else if !input.placeholder.is_empty() {
+                let mut ph = crate::ui::text::Text::new_for_render(&input.placeholder)
+                    .with_font_size(font_size)
+                    .with_color(style::text::PLACEHOLDER())
+                    .with_alignment(crate::ui::text::TextAlignment::Left);
+                ph.update_layout(text_rect, dirty_rect, None);
+                ph.render(renderer, app, vertices, dirty_rect);
+            }
+            if input.focused && !input.ghost_text.is_empty() && !text_is_empty {
+                let text_pos = text::left_aligned(&input_rect, font_size, text_padding);
+                let positions_for_ghost = if !input.glyph_positions.is_empty() {
+                    input.glyph_positions.clone()
+                } else {
+                    renderer.compute_glyph_positions(&input.text, font_size, text_pos.x)
+                };
+                let cursor_x = cursor_x_from_animation(
+                    &positions_for_ghost,
+                    false,
+                    text_pos.x,
+                    app.cursor_position_animation.value,
+                );
+                let ghost_rect = Rect::new(
+                    cursor_x,
+                    input_rect.y,
+                    (input_rect.x + input_rect.width - text_padding - cursor_x).max(0.0),
+                    input_rect.height,
+                );
+                renderer.push_scissor(&text_rect);
+                let mut ghost_component = crate::ui::text::Text::new_for_render(&input.ghost_text)
+                    .with_font_size(font_size)
+                    .with_color(style::text::GHOST())
+                    .with_alignment(crate::ui::text::TextAlignment::Left);
+                ghost_component.update_layout(ghost_rect, dirty_rect, None);
+                ghost_component.render(renderer, app, vertices, dirty_rect);
+                renderer.pop_scissor();
+            }
             renderer.pop_parent();
         }
-        
-        // Compute glyph positions for cursor/selection (still needed for cursor positioning)
+
         let text_pos = text::left_aligned(&input_rect, font_size, text_padding);
-        let positions = if !input.glyph_positions.is_empty() && 
-                         input.text == text_to_show {
+        let positions = if text_is_empty {
+            vec![text_pos.x]
+        } else if !input.glyph_positions.is_empty() {
             input.glyph_positions.clone()
         } else {
-            renderer.compute_glyph_positions(&text_to_show, font_size, text_pos.x)
+            renderer.compute_glyph_positions(&input.text, font_size, text_pos.x)
         };
 
-        // Render selection highlight if we have an active selection
         if let (Some(sel_start), Some(sel_end)) = (input.selection_start, input.selection_end) {
-            let sel_start_pos = if sel_start < positions.len() {
-                positions[sel_start]
+            let (start, end) = if sel_start <= sel_end {
+                (sel_start, sel_end)
             } else {
-                positions.last().copied().unwrap_or(text_pos.x)
+                (sel_end, sel_start)
             };
-            let sel_end_pos = if sel_end < positions.len() {
-                positions[sel_end]
-            } else {
-                positions.last().copied().unwrap_or(text_pos.x)
-            };
-            
-            let sel_bg = Quad {
-                position: Vec2::new(sel_start_pos, input_rect.y),
-                size: Vec2::new(sel_end_pos - sel_start_pos, input_rect.height),
-                color: style::highlight::SELECTION,
-                corner_radius: 0.0,
-                bubble_effect: false,
-                slider_effect: false,
-            };
-            vertices.extend_from_slice(&sel_bg.to_vertices());
+
+            if start < positions.len() && end <= positions.len() {
+                let sel_start_pos = if start < positions.len() {
+                    positions[start]
+                } else {
+                    positions.last().copied().unwrap_or(text_pos.x)
+                };
+                let sel_end_pos = if end < positions.len() {
+                    positions[end]
+                } else {
+                    positions.last().copied().unwrap_or(text_pos.x)
+                };
+
+                let sel_bg = Quad {
+                    position: Vec2::new(sel_start_pos, input_rect.y),
+                    size: Vec2::new(sel_end_pos - sel_start_pos, input_rect.height),
+                    color: style::highlight::SELECTION(),
+                    corner_radius: 0.0,
+                    bubble_effect: false,
+                    slider_effect: false,
+                };
+                vertices.extend_from_slice(&sel_bg.to_vertices());
+            }
         }
 
-        // Render cursor with blinking and smooth interpolation
         if input.focused && app.cursor_visible {
-            // Use smoothly interpolated cursor position
             let cursor_pos_float = app.cursor_position_animation.value;
             let cursor_pos_floor = cursor_pos_float.floor() as usize;
             let cursor_pos_ceil = cursor_pos_float.ceil() as usize;
             let t = cursor_pos_float - cursor_pos_float.floor();
-            
-            let cursor_x = if cursor_pos_ceil < positions.len() && cursor_pos_floor < positions.len() {
-                // Interpolate between two glyph positions for smooth movement
+
+            let cursor_x = if text_is_empty {
+                text_pos.x
+            } else if cursor_pos_ceil < positions.len() && cursor_pos_floor < positions.len() {
                 let x1 = positions[cursor_pos_floor];
                 let x2 = positions[cursor_pos_ceil];
                 x1 + (x2 - x1) * t
             } else if cursor_pos_floor < positions.len() {
                 positions[cursor_pos_floor]
             } else {
-                // If at end or beyond, use last position or starting position
                 positions.last().copied().unwrap_or(text_pos.x)
             };
-            
-            // Use cursor helper to get proper rect
+
             let cursor_rect = cursor::rect_at_position(&input_rect, cursor_x, font_size);
-            
+
             let cursor_quad = Quad {
                 position: cursor_rect.position(),
                 size: cursor_rect.size(),
-                color: style::text::PRIMARY,
+                color: style::text::PRIMARY(),
                 corner_radius: 0.0,
                 bubble_effect: false,
                 slider_effect: false,
             };
             vertices.extend_from_slice(&cursor_quad.to_vertices());
         }
+    }
+
+    /// Render a standard text input field with proper cursor and selection.
+    /// When wrap_text is true, text is word-wrapped to the input width (e.g. for shard modal).
+    pub fn render_text_input(
+        renderer: &mut Renderer,
+        input: &TextInput,
+        app: &App,
+        vertices: &mut Vec<Vertex>,
+        font_size: Option<f32>,
+        padding: Option<f32>,
+        corner_radius: Option<f32>,
+        wrap_text: bool,
+    ) {
+        render_text_input_inner(
+            renderer,
+            input,
+            app,
+            vertices,
+            font_size,
+            padding,
+            corner_radius,
+            wrap_text,
+            None,
+        );
     }
 }
 

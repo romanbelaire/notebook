@@ -2,6 +2,7 @@
 /// These components cache item components and update them when data changes
 use glam::Vec2;
 use crate::ui::core::Rect;
+use crate::ui::shadow::ShadowSpec;
 use crate::gfx::types::Vertex;
 use crate::gfx::renderer::Renderer;
 use crate::app::App;
@@ -13,6 +14,7 @@ pub struct ConversationListComponent {
     component_id: String,
     item_components: HashMap<String, Box<dyn Renderable>>, // Map conversation ID to component
     last_conversation_ids: Vec<String>, // Track last known IDs for diffing
+    pub shadow: Option<ShadowSpec>,
 }
 
 impl ConversationListComponent {
@@ -21,7 +23,13 @@ impl ConversationListComponent {
             component_id: "conversation_list".to_string(),
             item_components: HashMap::new(),
             last_conversation_ids: Vec::new(),
+            shadow: None,
         }
+    }
+
+    pub fn with_shadow(mut self, spec: ShadowSpec) -> Self {
+        self.shadow = Some(spec);
+        self
     }
     
     /// Update the list based on current conversations
@@ -54,6 +62,9 @@ impl ConversationListComponent {
 impl Renderable for ConversationListComponent {
     fn render(&self, renderer: &mut Renderer, app: &App, vertices: &mut Vec<Vertex>, dirty_rect: Option<Rect>) {
         renderer.validate_component(&self.component_id, Some("sidebar_content"), "ConversationListComponent");
+        if let Some(spec) = &self.shadow {
+            renderer.queue_shadow(&self.bounds(), 0.0, spec);
+        }
         renderer.push_parent(self.component_id.clone());
         for (id, item) in &self.item_components {
             let item_id = format!("conversation_item_{}", id);
@@ -89,6 +100,7 @@ impl ConversationListComponent {
 struct ConversationItemComponent {
     conversation_id: String,
     component_id: String,
+    shadow: Option<ShadowSpec>,
 }
 
 impl ConversationItemComponent {
@@ -96,16 +108,26 @@ impl ConversationItemComponent {
         Self {
             conversation_id: conversation_id.clone(),
             component_id: format!("conversation_item_{}", conversation_id),
+            shadow: None,
         }
+    }
+
+    #[allow(dead_code)]
+    fn with_shadow(mut self, spec: ShadowSpec) -> Self {
+        self.shadow = Some(spec);
+        self
     }
 }
 
 impl Renderable for ConversationItemComponent {
-    fn render(&self, renderer: &mut Renderer, app: &App, vertices: &mut Vec<Vertex>, _dirty_rect: Option<Rect>) {
+    fn render(&self, renderer: &mut Renderer, app: &App, _vertices: &mut Vec<Vertex>, _dirty_rect: Option<Rect>) {
         let conversation = app.chat_state.conversations.iter()
             .find(|c| c.id == self.conversation_id);
         if conversation.is_some() {
             renderer.validate_component(&self.component_id, None, "ConversationItemComponent");
+            if let Some(spec) = &self.shadow {
+                renderer.queue_shadow(&self.bounds(), 0.0, spec);
+            }
         }
     }
     
@@ -126,6 +148,7 @@ pub struct MessageListComponent {
     component_id: String,
     item_components: HashMap<usize, Box<dyn Renderable>>, // Map message index to component
     last_message_count: usize,
+    pub shadow: Option<ShadowSpec>,
 }
 
 impl MessageListComponent {
@@ -134,7 +157,13 @@ impl MessageListComponent {
             component_id: "message_list".to_string(),
             item_components: HashMap::new(),
             last_message_count: 0,
+            shadow: None,
         }
+    }
+
+    pub fn with_shadow(mut self, spec: ShadowSpec) -> Self {
+        self.shadow = Some(spec);
+        self
     }
     
     /// Update the list based on current messages
@@ -173,6 +202,9 @@ impl MessageListComponent {
 impl Renderable for MessageListComponent {
     fn render(&self, renderer: &mut Renderer, app: &App, vertices: &mut Vec<Vertex>, dirty_rect: Option<Rect>) {
         renderer.validate_component(&self.component_id, Some("chat"), "MessageListComponent");
+        if let Some(spec) = &self.shadow {
+            renderer.queue_shadow(&self.bounds(), 0.0, spec);
+        }
         renderer.push_parent(self.component_id.clone());
         for (idx, item) in &self.item_components {
             let item_id = format!("message_item_{}", idx);
@@ -200,6 +232,7 @@ impl Renderable for MessageListComponent {
 struct MessageItemComponent {
     message_index: usize,
     component_id: String,
+    shadow: Option<ShadowSpec>,
 }
 
 impl MessageItemComponent {
@@ -207,13 +240,23 @@ impl MessageItemComponent {
         Self {
             message_index,
             component_id: format!("message_item_{}", message_index),
+            shadow: None,
         }
+    }
+
+    #[allow(dead_code)]
+    fn with_shadow(mut self, spec: ShadowSpec) -> Self {
+        self.shadow = Some(spec);
+        self
     }
 }
 
 impl Renderable for MessageItemComponent {
     fn render(&self, renderer: &mut Renderer, _app: &App, _vertices: &mut Vec<Vertex>, _dirty_rect: Option<Rect>) {
         renderer.validate_component(&self.component_id, None, "MessageItemComponent");
+        if let Some(spec) = &self.shadow {
+            renderer.queue_shadow(&self.bounds(), 0.0, spec);
+        }
     }
     
     fn bounds(&self) -> Rect {
@@ -233,6 +276,7 @@ pub struct DocumentListComponent {
     component_id: String,
     item_components: HashMap<String, Box<dyn Renderable>>, // Map document ID to component
     last_document_ids: Vec<String>,
+    pub shadow: Option<ShadowSpec>,
 }
 
 impl DocumentListComponent {
@@ -241,7 +285,13 @@ impl DocumentListComponent {
             component_id: "document_list".to_string(),
             item_components: HashMap::new(),
             last_document_ids: Vec::new(),
+            shadow: None,
         }
+    }
+
+    pub fn with_shadow(mut self, spec: ShadowSpec) -> Self {
+        self.shadow = Some(spec);
+        self
     }
     
     /// Update the list based on current documents
@@ -280,6 +330,9 @@ impl DocumentListComponent {
 impl Renderable for DocumentListComponent {
     fn render(&self, renderer: &mut Renderer, app: &App, vertices: &mut Vec<Vertex>, dirty_rect: Option<Rect>) {
         renderer.validate_component(&self.component_id, Some("sidebar_content"), "DocumentListComponent");
+        if let Some(spec) = &self.shadow {
+            renderer.queue_shadow(&self.bounds(), 0.0, spec);
+        }
         renderer.push_parent(self.component_id.clone());
         for (id, item) in &self.item_components {
             let item_id = format!("document_item_{}", id);
@@ -307,6 +360,7 @@ impl Renderable for DocumentListComponent {
 struct DocumentItemComponent {
     document_id: String,
     component_id: String,
+    shadow: Option<ShadowSpec>,
 }
 
 impl DocumentItemComponent {
@@ -314,13 +368,23 @@ impl DocumentItemComponent {
         Self {
             document_id: document_id.clone(),
             component_id: format!("document_item_{}", document_id),
+            shadow: None,
         }
+    }
+
+    #[allow(dead_code)]
+    fn with_shadow(mut self, spec: ShadowSpec) -> Self {
+        self.shadow = Some(spec);
+        self
     }
 }
 
 impl Renderable for DocumentItemComponent {
     fn render(&self, renderer: &mut Renderer, _app: &App, _vertices: &mut Vec<Vertex>, _dirty_rect: Option<Rect>) {
         renderer.validate_component(&self.component_id, None, "DocumentItemComponent");
+        if let Some(spec) = &self.shadow {
+            renderer.queue_shadow(&self.bounds(), 0.0, spec);
+        }
     }
     
     fn bounds(&self) -> Rect {
