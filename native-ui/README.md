@@ -9,6 +9,20 @@ cargo build
 cargo run
 ```
 
+## PDF Preview Runtime Requirements
+
+PDF preview in the modal uses PDFium through `pdfium-render`.
+
+- Install a PDFium runtime library for your platform.
+- Ensure the PDFium shared library is available on `PATH` before launching `notebook-native-ui`.
+- If PDFium cannot be loaded, PDF preview fails loudly with a modal error explaining that PDFium binding failed.
+
+### Viewer Controls
+
+- `Prev` / `Next` page navigation.
+- `-` and `+` zoom controls.
+- `100%` zoom reset.
+
 ## Architecture
 
 - `src/main.rs` - Entry point, event loop

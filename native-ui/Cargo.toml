@@ -22,7 +22,7 @@ bytemuck = { version = "1.14", features = ["derive"] }
 
 # Async & networking
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
-reqwest = { version = "0.11", features = ["json", "stream"] }
+reqwest = { version = "0.11", features = ["json", "stream", "multipart"] }
 futures = "0.3"
 
 # Serialization
@@ -34,7 +34,7 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 pulldown-cmark = "0.12"
 
 # PDF parsing and rendering
-# pdf = "0.9"  # TODO: Add proper PDF parsing library later
+pdfium-render = { version = "0.8", default-features = false, features = ["thread_safe", "pdfium_latest", "image_024"] }
 
 # SVG parsing
 usvg = "0.40"
@@ -47,3 +47,6 @@ env_logger = "0.11"
 
 # Native file dialogs
 rfd = "0.15"
+
+# OS clipboard (text only; disable default image-data to avoid heavy `image` crate / rustc version pins)
+arboard = { version = "3", default-features = false }

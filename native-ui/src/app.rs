@@ -1,6 +1,6 @@
-use crate::ui::{SubWindow, HeaderWindow, SidebarWindow, ChatWindow, LibraryWindow, IngestWindow, SettingsWindow, NotepadWindow, InsightModal, PdfModal, ChatInfoDialog, ToastManager, NotepadModal, TextEditor, GlobalSearchModal, ShardModal};
+use crate::ui::{SubWindow, HeaderWindow, SidebarWindow, ChatWindow, LibraryWindow, IngestWindow, SettingsWindow, NotepadWindow, InsightModal, PdfModal, ChatInfoDialog, ToastManager, NotepadModal, TextEditor, GlobalSearchModal, ShardModal, IngestImportFailuresModal, SystemPromptsModal, CollectionModal, DocumentKind};
 use crate::ui::tab_bar::Tab;
-use crate::ui::chat_window::ChatMessage;
+use crate::ui::chat_window::{ChatMessage, Citation, MessageRole};
 use crate::state::{ChatState, GraphState, UIState, SettingsState, InsightsState};
 use crate::api::ApiClient;
 use crate::api::models::Collection;
@@ -9,7 +9,20 @@ use glam::Vec2;
 use winit::event::{ElementState, MouseButton};
 use winit::event_loop::EventLoopProxy;
 use winit::keyboard::{KeyCode, PhysicalKey, ModifiersState};
+use winit::window::CursorIcon;
 use std::sync::mpsc;
+use std::cell::RefCell;
+
+fn notebook_env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            let v = v.trim();
+            v == "1"
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+}
 
 #[derive(Debug, Clone)]
 pub enum WindowControlEvent {
@@ -26,6 +39,30 @@ pub struct PendingConstellationClick {
     pub start_pos: Vec2,
 }
 
+#[derive(Debug, Clone)]
+pub enum ConstellationTooltip {
+    Simple { text: String, position: Vec2 },
+    MacroNode {
+        title: String,
+        plus_line: String,
+        meta_line: String,
+        position: Vec2,
+    },
+}
+
+/// Constellation context menu open state (right-click on shard or background).
+#[derive(Debug, Clone)]
+pub enum ConstellationContextMenu {
+    Shard { position: Vec2, node_id: String },
+    Background { position: Vec2 },
+}
+
+/// Right-click Cut / Copy / Paste for the focused text field.
+#[derive(Debug, Clone)]
+pub struct TextEditContextMenu {
+    pub position: Vec2,
+}
+
 pub struct App {
     pub windows: Vec<SubWindow>,
     pub header: HeaderWindow,
@@ -33,11 +70,14 @@ pub struct App {
     pub chat_window: Option<ChatWindow>,
     pub library_window: Option<LibraryWindow>,
     pub ingest_window: Option<IngestWindow>,
-    pub settings_window: Option<SettingsWindow>,
+    pub settings_window: RefCell<Option<SettingsWindow>>,
     pub notepad_window: Option<NotepadWindow>,
     pub insight_modal: InsightModal,
     pub shard_modal: ShardModal,
+    pub system_prompts_modal: SystemPromptsModal,
+    pub ingest_import_failures_modal: IngestImportFailuresModal,
     pub pdf_modal: PdfModal,
+    pub collection_modal: CollectionModal,
     pub chat_info_dialog: ChatInfoDialog,
     pub global_search_modal: GlobalSearchModal,
     pub toast_manager: ToastManager,
@@ -80,6 +120,8 @@ pub struct App {
     graph_send_receiver: mpsc::Receiver<Result<(String, crate::api::models::GraphSendResponse), String>>,
     graph_send_sender: mpsc::Sender<Result<(String, crate::api::models::GraphSendResponse), String>>,
     collections_loaded: bool,
+    /// Last papers list from API (for @-mention picker and global search).
+    pub papers_cache: Vec<crate::api::models::ApiPaper>,
     papers_loaded: bool,
     insights_loaded: bool,
     /// One-shot: ensure we have a conversation and graph on startup when none exist.
@@ -131,20 +173,236 @@ pub struct App {
     pub pending_notepad_click: Option<Vec2>,
     /// Pending constellation click (evaluated on mouse release for click vs drag).
     pub pending_constellation_click: Option<PendingConstellationClick>,
+    /// Tooltip payload when hovering over constellation elements. Cleared when not over constellation.
+    pub constellation_tooltip: Option<ConstellationTooltip>,
+    /// Cursor icon to show (computed in on_cursor_moved). Main loop applies via window.set_cursor_icon().
+    pub desired_cursor_icon: CursorIcon,
+    /// Open constellation context menu (right-click). None when closed.
+    pub constellation_context_menu: Option<ConstellationContextMenu>,
+    /// Cut / Copy / Paste menu for focused text (right-click in field).
+    pub text_edit_context_menu: Option<TextEditContextMenu>,
+    /// Shard move drag: (node_id, last_screen_pos). When set, pan_drag_start is not used.
+    pub shard_move_drag: Option<(String, Vec2)>,
+    /// Shard resize drag: (node_id, initial_world_size, initial_screen_pos).
+    pub shard_resize_drag: Option<(String, Vec2, Vec2)>,
     // Component hierarchy root
     pub root: crate::ui::components::Root,
     /// Throttle for saving graph layout (persist node positions every 2s when graph active).
     layout_save_timer: f32,
-    /// Frames to keep running constellation physics after graph load/change; when 0, physics runs only when total velocity > threshold.
-    physics_settle_frames: u32,
-    /// Accumulator for fixed-rate physics stepping (e.g. 30 Hz).
-    physics_dt_accumulator: f32,
-    /// Seconds since last constellation interaction; when high and velocity low, physics is turned off.
-    physics_idle_timer: f32,
     /// Bumped when viewport, sidebar, or active tab changes; used to skip root.update_layout when unchanged.
     pub layout_generation: u64,
     /// When true, log per-frame text command count and visible constellation nodes when threshold exceeded.
     pub debug_text_stats: bool,
+    /// When true (e.g. `NOTEBOOK_DEBUG_TEXT_PIPELINE=1`), log queued text/icon pipeline: layer counts, scissor keys, bbox vs scissor, batch layers, MainContent Vello group count.
+    pub debug_text_pipeline: bool,
+    /// When true (e.g. `NOTEBOOK_DEBUG_TEXT_FORCE_FULL_MAIN_BLIT=1`), MainContent text blits use a full-frame scissor (diagnostic: if text appears, scissor/atlas sampling was wrong).
+    pub debug_text_pipeline_force_full_main_blit: bool,
+}
+
+/// Max movement (screen px) from press to release to count as a click (focus shard) rather than a drag (pan only).
+const CLICK_VS_DRAG_THRESHOLD: f32 = 8.0;
+
+fn extract_arxiv_ids_from_text(input: &str) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for token in input.split(|ch: char| !(ch.is_ascii_digit() || ch == '.')) {
+        let mut parts = token.split('.');
+        let left = parts.next();
+        let right = parts.next();
+        if parts.next().is_some() {
+            continue;
+        }
+        if let (Some(a), Some(b)) = (left, right) {
+            if a.len() == 4
+                && b.len() == 5
+                && a.chars().all(|ch| ch.is_ascii_digit())
+                && b.chars().all(|ch| ch.is_ascii_digit())
+            {
+                let id = format!("{}.{}", a, b);
+                if seen.insert(id.clone()) {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    ids
+}
+
+struct IngestTaskDoneParsed {
+    status_text: String,
+    import_summary_line: String,
+    failure_lines: Vec<String>,
+    show_view_failures: bool,
+    info_toasts: Vec<String>,
+    success_toast: String,
+}
+
+fn parse_ingest_task_done(status: &serde_json::Value) -> Option<IngestTaskDoneParsed> {
+    let res = status.get("result")?;
+    let kind = res.get("kind").and_then(|v| v.as_str())?;
+    match kind {
+        "arxiv_import" => {
+            let retrieved = res.get("retrieved").and_then(|v| v.as_u64()).unwrap_or(0);
+            let dup = res.get("duplicates_removed").and_then(|v| v.as_u64()).unwrap_or(0);
+            let failed_n = res.get("failed_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let summary_line = format!(
+                "ArXiv — Retrieved: {} | Duplicates skipped: {} | Failed: {}",
+                retrieved, dup, failed_n
+            );
+            let failure_lines: Vec<String> = res
+                .get("failed")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let show_view_failures = !failure_lines.is_empty();
+            Some(IngestTaskDoneParsed {
+                status_text: format!("✅ {}", summary_line),
+                import_summary_line: summary_line,
+                failure_lines,
+                show_view_failures,
+                info_toasts: vec![
+                    format!("Retrieved {} document(s)", retrieved),
+                    format!("Duplicates skipped: {}", dup),
+                    format!("Failed: {}", failed_n),
+                ],
+                success_toast: "Ingestion finished".to_string(),
+            })
+        }
+        "directory_ingest" => {
+            let new_docs = res.get("ingested_new").and_then(|v| v.as_u64()).unwrap_or(0);
+            let dup = res.get("duplicates_removed").and_then(|v| v.as_u64()).unwrap_or(0);
+            let failed_n = res.get("failed_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let summary_line = format!(
+                "Ingestion — New: {} | Duplicates skipped: {} | Failed: {}",
+                new_docs, dup, failed_n
+            );
+            let failure_lines: Vec<String> = res
+                .get("failed")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let show_view_failures = !failure_lines.is_empty();
+            Some(IngestTaskDoneParsed {
+                status_text: format!("✅ {}", summary_line),
+                import_summary_line: summary_line,
+                failure_lines,
+                show_view_failures,
+                info_toasts: vec![
+                    format!("Ingested {} new document(s)", new_docs),
+                    format!("Duplicates skipped: {}", dup),
+                    format!("Failed: {}", failed_n),
+                ],
+                success_toast: "Ingestion finished".to_string(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// `(document_id, title)` for @-mention picker and graph send expansion.
+fn notepad_documents_for_mentions() -> Vec<(String, String)> {
+    use crate::persistence::DocumentPersistence;
+    let Ok(ids) = DocumentPersistence::list_documents() else {
+        return Vec::new();
+    };
+    ids.into_iter()
+        .filter_map(|id| {
+            DocumentPersistence::load_document(&id)
+                .ok()
+                .map(|d| (id, d.metadata.title))
+        })
+        .collect()
+}
+
+/// Node id for focus-on-release when clicking a shard (card) in the constellation.
+fn constellation_hit_node_id(hit: &crate::ui::chat_window::ChatHit) -> Option<String> {
+    use crate::ui::chat_window::ChatHit;
+    match hit {
+        ChatHit::ConstellationNode(id) => Some(id.clone()),
+        ChatHit::ConstellationUserBubbleContent(id) => Some(id.clone()),
+        ChatHit::ConstellationAssistantBubbleContent(id) => Some(id.clone()),
+        ChatHit::ConstellationCitation(id, _) => Some(id.clone()),
+        ChatHit::ConstellationEditNote(id, _) => Some(id.clone()),
+        _ => None,
+    }
+}
+
+/// Tooltip text for constellation hit (citations, icons, etc.). Returns None for no tooltip.
+fn constellation_tooltip_text(hit: &crate::ui::chat_window::ChatHit, graph_state: &GraphState) -> Option<String> {
+    use crate::ui::chat_window::ChatHit;
+    match hit {
+        ChatHit::ConstellationCitation(node_id, citation_idx) => graph_state.get_node(node_id).and_then(|n| {
+            n.shard.citations.get(*citation_idx).map(|c| {
+                let title = c.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                let source = c.get("source").and_then(|v| v.as_str()).unwrap_or("");
+                if title.is_empty() && source.is_empty() {
+                    "Citation".to_string()
+                } else if title.is_empty() {
+                    source.to_string()
+                } else {
+                    format!("{} – {}", title, source)
+                }
+            })
+        }),
+        ChatHit::ConstellationPinButton(_) => Some("Pin to insights".to_string()),
+        ChatHit::ConstellationHideButton(_) => Some("Hide message".to_string()),
+        ChatHit::ConstellationNoteButton(_) => Some("Add note".to_string()),
+        ChatHit::ConstellationAddContextButton(_) => Some("Add context".to_string()),
+        ChatHit::ConstellationMoreButton(_) => Some("More actions".to_string()),
+        _ => None,
+    }
+}
+
+fn compact_line(s: &str, max_len: usize) -> String {
+    let t = s.replace('\n', " ").trim().to_string();
+    if t.len() > max_len {
+        format!("{}...", &t[..max_len])
+    } else {
+        t
+    }
+}
+
+fn macro_constellation_tooltip(
+    hit: &crate::ui::chat_window::ChatHit,
+    graph_state: &GraphState,
+    position: Vec2,
+) -> Option<ConstellationTooltip> {
+    use crate::ui::chat_window::ChatHit;
+    let (ChatHit::ConstellationNode(node_id)
+    | ChatHit::ConstellationUserBubbleContent(node_id)
+    | ChatHit::ConstellationAssistantBubbleContent(node_id)
+    | ChatHit::ConstellationCitation(node_id, _)
+    | ChatHit::ConstellationEditNote(node_id, _)) = hit else {
+        return None;
+    };
+    let node = graph_state.get_node(node_id)?;
+    let title = compact_line(node.shard.user_content.as_deref().unwrap_or("(No user query)"), 100);
+    let answer = compact_line(
+        node.shard.assistant_content.as_deref().unwrap_or("(No assistant answer)"),
+        88,
+    );
+    let plus_line = "+ ...".to_string();
+    let meta_line = format!(
+        "{} · {} citations · {} contexts · {} notes",
+        answer,
+        node.shard.citations.len(),
+        node.shard.contexts.len(),
+        node.shard.notes.len()
+    );
+    Some(ConstellationTooltip::MacroNode {
+        title,
+        plus_line,
+        meta_line,
+        position,
+    })
 }
 
 impl App {
@@ -219,6 +477,7 @@ impl App {
             Some(SettingsWindow::new(
                 Vec2::new(sidebar.current_width, header_height),
                 Vec2::new(settings_width, settings_height),
+                &settings_state.theme,
             ))
         } else {
             None
@@ -267,18 +526,21 @@ impl App {
             chat_state.conversations.iter().find(|c| c.id == *cid).and_then(|c| c.graph_id.clone())
         });
 
-        Self {
+        let app = Self {
             windows: Vec::new(),  // No demo windows
             header,
             sidebar,
             chat_window,
             library_window,
             ingest_window,
-            settings_window,
+            settings_window: RefCell::new(settings_window),
             notepad_window,
             insight_modal: InsightModal::new(),
             shard_modal: ShardModal::new(),
+            system_prompts_modal: SystemPromptsModal::new(),
+            ingest_import_failures_modal: IngestImportFailuresModal::new(),
             pdf_modal: PdfModal::new(),
+            collection_modal: CollectionModal::new(),
             chat_info_dialog: ChatInfoDialog::new(),
             global_search_modal: GlobalSearchModal::new(),
             toast_manager: ToastManager::new(),
@@ -320,6 +582,7 @@ impl App {
             graph_send_receiver,
             graph_send_sender,
             collections_loaded: false,
+            papers_cache: Vec::new(),
             papers_loaded: false,
             insights_loaded: false,
             conversation_ensured: false,
@@ -337,7 +600,8 @@ impl App {
             cursor_position_animation: crate::utils::animation::SpringAnimation::with_preset(
                 0.0,
                 crate::utils::animation::AnimationPreset::TightBounce,
-            ),
+            )
+            .with_max_bounce(0.25),  // ~2px at 8px/char
             last_click_time: std::time::Instant::now(),
             last_click_position: Vec2::ZERO,
             click_count: 0,
@@ -391,17 +655,30 @@ impl App {
             accessibility_focused_component: None,
             pending_notepad_click: None,
             pending_constellation_click: None,
+            constellation_tooltip: None,
+            desired_cursor_icon: CursorIcon::Default,
+            constellation_context_menu: None,
+            text_edit_context_menu: None,
+            shard_move_drag: None,
+            shard_resize_drag: None,
             layout_save_timer: 0.0,
-            physics_settle_frames: 0,
-            physics_dt_accumulator: 0.0,
-            physics_idle_timer: 0.0,
             layout_generation: 0,
             debug_text_stats: false,
+            debug_text_pipeline: notebook_env_flag("NOTEBOOK_DEBUG_TEXT_PIPELINE"),
+            debug_text_pipeline_force_full_main_blit: notebook_env_flag(
+                "NOTEBOOK_DEBUG_TEXT_FORCE_FULL_MAIN_BLIT",
+            ),
             // Build component tree
             root: {
                 use crate::ui::components::{Root, HeaderComponent, SidebarComponent, SidebarContentComponent, ChatComponent, LibraryComponent, DataComponent, SettingsComponent, NotepadComponent};
+                use crate::gfx::components::background::BACKGROUND_VIEWPORT;
+                use crate::gfx::components::glow::GLOW_VIEWPORT;
+                use crate::gfx::components::toasts::TOASTS_VIEWPORT;
                 let mut root = Root::new(viewport);
                 
+                // Background / glow / toasts are Renderables (z 0, 5, 90) so Root batches align with the main tree.
+                root.add_child(Box::new(BACKGROUND_VIEWPORT));
+                root.add_child(Box::new(GLOW_VIEWPORT));
                 // Add window components in z-order (lower z-order renders first/behind)
                 // Order: content (chat, library, etc.) first, then sidebar above main, then header above all
                 root.add_child(Box::new(ChatComponent::new()));
@@ -411,13 +688,21 @@ impl App {
                 root.add_child(Box::new(NotepadComponent::new()));
                 root.add_child(Box::new(SidebarComponent::new()));
                 root.add_child(Box::new(SidebarContentComponent::new()));
+                root.add_child(Box::new(TOASTS_VIEWPORT));
                 root.add_child(Box::new(HeaderComponent::new())); // Header last (highest z-order)
                 
                 root
             },
+        };
+        if app.debug_text_pipeline {
+            crate::gfx::debug_text_pipeline_log::append_session_header();
+            crate::gfx::debug_text_pipeline_log::append_line(
+                "[debug_text_pipeline] enabled (NOTEBOOK_DEBUG_TEXT_PIPELINE). Log file: NOTEBOOK_DEBUG_TEXT_LOG_PATH or data/debug_text_pipeline.log. Optional: NOTEBOOK_DEBUG_TEXT_FORCE_FULL_MAIN_BLIT=1, NOTEBOOK_DEBUG_TEXT_LOG_TRUNCATE=1.",
+            );
         }
+        app
     }
-    
+
     pub fn set_window_proxy(&mut self, proxy: EventLoopProxy<WindowControlEvent>) {
         self.window_proxy = Some(proxy);
     }
@@ -438,14 +723,40 @@ impl App {
         let content_y = header_height;
         let open_content_width = self.viewport_size.x - SidebarWindow::OPEN_WIDTH;
         let (chat_x, chat_width) = if self.sidebar.is_open {
-            (self.sidebar.current_width, self.viewport_size.x - self.sidebar.current_width)
+            let available = self.viewport_size.x - self.sidebar.current_width;
+            let w = 800.0f32.min(available);
+            (self.sidebar.current_width + (available - w) * 0.5, w)
         } else {
-            ((self.viewport_size.x - open_content_width) / 2.0, open_content_width)
+            let w = 800.0f32.min(open_content_width);
+            ((self.viewport_size.x - w) * 0.5, w)
         };
         if let Some(ref mut chat) = self.chat_window {
+            chat.graph_viewport_full_bleed = self.graph_state.constellation_view_active();
             chat.position = Vec2::new(chat_x, content_y);
             chat.size = Vec2::new(chat_width, content_height);
             chat.update_layout();
+            if self.graph_state.constellation_view_active() {
+                let old_center = chat.constellation_view.viewport_center();
+                let scale = chat.constellation_view.scale_animated;
+                chat.constellation_view.position = Vec2::ZERO;
+                chat.constellation_view.size = self.viewport_size;
+                let new_center = chat.constellation_view.viewport_center();
+                let delta = (new_center - old_center) / scale;
+                chat.constellation_view.camera_position += delta;
+                chat.constellation_view.camera_position_animated += delta;
+                let header_h = self.header.size.y;
+                let sidebar_w = if self.sidebar.is_open {
+                    self.sidebar.current_width
+                } else {
+                    0.0
+                };
+                let w = (self.viewport_size.x - sidebar_w).max(0.0);
+                let h = (chat.composer_top_y - header_h).max(0.0);
+                chat.constellation_interactive_rect =
+                    crate::ui::core::Rect::new(sidebar_w, header_h, w, h);
+            } else {
+                chat.constellation_interactive_rect = crate::ui::core::Rect::new(0.0, 0.0, 0.0, 0.0);
+            }
         }
         let sidebar_width = self.sidebar.current_width;
         let content_width = self.viewport_size.x - sidebar_width;
@@ -462,7 +773,7 @@ impl App {
             ingest.update_layout();
         }
         
-        if let Some(ref mut settings) = self.settings_window {
+        if let Some(settings) = self.settings_window.get_mut().as_mut() {
             settings.position = Vec2::new(sidebar_width, content_y);
             settings.size = Vec2::new(content_width, content_height);
             settings.update_layout(&self.settings_state.provider);
@@ -493,6 +804,141 @@ impl App {
                 // Only process left-click for the main interaction logic
                 if button != MouseButton::Left {
                     return;
+                }
+
+                // Text edit context menu (Cut / Copy / Paste)
+                if let Some(menu) = self.text_edit_context_menu.take() {
+                    const MENU_WIDTH: f32 = 180.0;
+                    const ITEM_H: f32 = 28.0;
+                    const MENU_PAD: f32 = 4.0;
+                    let n = 3usize;
+                    let menu_h = n as f32 * ITEM_H + MENU_PAD * 2.0;
+                    let menu_w = MENU_WIDTH + MENU_PAD * 2.0;
+                    let mx = menu.position.x;
+                    let my = menu.position.y;
+                    if self.mouse_pos.x >= mx
+                        && self.mouse_pos.x <= mx + menu_w
+                        && self.mouse_pos.y >= my
+                        && self.mouse_pos.y <= my + menu_h
+                    {
+                        let inner_top = my + MENU_PAD;
+                        let rel_y = self.mouse_pos.y - inner_top;
+                        if rel_y >= 0.0 && self.mouse_pos.x >= mx + MENU_PAD
+                            && self.mouse_pos.x <= mx + MENU_PAD + MENU_WIDTH
+                        {
+                            let item_idx = (rel_y / ITEM_H).floor() as usize;
+                            if item_idx < n {
+                                match item_idx {
+                                    0 => self.clipboard_apply_cut(),
+                                    1 => self.clipboard_apply_copy(),
+                                    2 => self.clipboard_apply_paste(),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // Constellation context menu: click on item or outside to close
+                if let Some(menu) = self.constellation_context_menu.take() {
+                    const MENU_INNER_W: f32 = 180.0;
+                    const ITEM_H: f32 = 28.0;
+                    const MENU_PAD: f32 = 4.0;
+                    let (mx, my, menu_w, menu_h, item_count) = self.constellation_context_menu_frame(&menu);
+                    if self.mouse_pos.x >= mx
+                        && self.mouse_pos.x <= mx + menu_w
+                        && self.mouse_pos.y >= my
+                        && self.mouse_pos.y <= my + menu_h
+                    {
+                        let inner_top = my + MENU_PAD;
+                        let rel_y = self.mouse_pos.y - inner_top;
+                        if rel_y >= 0.0
+                            && self.mouse_pos.x >= mx + MENU_PAD
+                            && self.mouse_pos.x <= mx + MENU_PAD + MENU_INNER_W
+                        {
+                            let item_idx = (rel_y / ITEM_H).floor() as usize;
+                            if item_idx < item_count {
+                                match &menu {
+                                ConstellationContextMenu::Shard { node_id, .. } => {
+                                    if let Some(ref mut chat) = self.chat_window {
+                                        match item_idx {
+                                            0 => {
+                                                self.set_shard_visibility_and_sync(node_id, false);
+                                            }
+                                            1 => {
+                                                let id_opt = self.insights_state.insights.iter().find(|i| i.id == *node_id).map(|i| i.id.clone());
+                                                if let Some(id) = id_opt {
+                                                    self.insights_state.remove_insight(&id);
+                                                    let base_url = self.api_client.base_url.clone();
+                                                    tokio::spawn(async move {
+                                                        let api_client = crate::api::ApiClient::new(Some(base_url));
+                                                        let _ = api_client.delete_shard(&id).await;
+                                                    });
+                                                } else if let Some(node) = self.graph_state.get_node(node_id) {
+                                                    let content = node.shard.assistant_content.clone().unwrap_or_default();
+                                                    let title = if content.len() > 60 { format!("{}...", &content[..60]) } else { content.clone() };
+                                                    let base_url = self.api_client.base_url.clone();
+                                                    let conv_id = self.chat_state.current_conversation_id.clone();
+                                                    let node_id_clone = node_id.clone();
+                                                    tokio::spawn(async move {
+                                                        let api_client = crate::api::ApiClient::new(Some(base_url));
+                                                        let _ = api_client.create_or_update_shard(
+                                                            &node_id_clone, &content, vec![], Some(title), conv_id, None, None,
+                                                        ).await;
+                                                    });
+                                                    self.insights_loaded = false;
+                                                    self.load_insights();
+                                                }
+                                            }
+                                            2 => {
+                                                self.graph_state.set_current_leaf(node_id.clone());
+                                                if let Some(node) = self.graph_state.get_node(node_id) {
+                                                    let center = node.position + node.size * 0.5;
+                                                    chat.constellation_view.center_camera_on(center);
+                                                    chat.constellation_view.reset_zoom_to_normal();
+                                                }
+                                            }
+                                            3 => {
+                                                if let Some(node) = self.graph_state.get_node(node_id) {
+                                                    self.shard_modal.open(node_id.clone(), node.shard.clone());
+                                                }
+                                            }
+                                            4 => {
+                                                let node = self.graph_state.get_node(node_id).expect("context menu shard");
+                                                let text = node.shard.clipboard_plain_text();
+                                                crate::clipboard::set_text(&text);
+                                                self.clipboard_text = text;
+                                            }
+                                            5 => {
+                                                if let Some(ref mut cw) = self.chat_window {
+                                                    cw.toggle_mute_shard(node_id);
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                    ConstellationContextMenu::Background { .. } => {
+                                        if item_idx == 0 {
+                                            if let Some(ref mut chat) = self.chat_window {
+                                                if let Some((min, max)) = self.graph_state.compute_bbox() {
+                                                    chat.constellation_view.fit_in_view(min, max, 40.0);
+                                                }
+                                            }
+                                        } else if item_idx == 1 {
+                                            self.toast_manager.show(
+                                                "Use the graph toolbar for layout and zoom.".to_string(),
+                                                crate::ui::toast::ToastType::Info,
+                                                self.viewport_size,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return;
+                    }
                 }
                 
                 // Start drag operation tracking
@@ -547,7 +993,7 @@ impl App {
                                 if let Some(ref mut ingest) = self.ingest_window {
                                     ingest.pdf_dir_input.on_blur();
                                 }
-                                if let Some(ref mut settings) = self.settings_window {
+                                if let Some(settings) = self.settings_window.get_mut().as_mut() {
                                     settings.model_id_input.on_blur();
                                     settings.hf_token_input.on_blur();
                                     settings.openai_model_input.on_blur();
@@ -566,6 +1012,8 @@ impl App {
                                 match new_tab {
                                     Tab::Notepad => {
                                         if let Some(ref mut notepad) = self.notepad_window {
+                                            notepad.title_input.on_blur();
+                                            use crate::ui::TextEditor;
                                             notepad.editor.focus();
                                             // Focus the first block if no block is focused
                                             if notepad.editor.cursor.is_none() && !notepad.editor.document.blocks.is_empty() {
@@ -582,6 +1030,7 @@ impl App {
                                         }
                                     }
                                     Tab::Library => {
+                                        self.refresh_library_data();
                                         if let Some(ref mut library) = self.library_window {
                                             library.search_input.on_focus();
                                             self.focused_input = Some(1);
@@ -635,6 +1084,17 @@ impl App {
                 
                 // ===== Z-INDEX 50: Modals, dialogs =====
                 // Test modals before other content so they capture clicks
+                if self.ingest_import_failures_modal.is_open {
+                    if !self.ingest_import_failures_modal.contains(self.mouse_pos) {
+                        self.ingest_import_failures_modal.close();
+                        return;
+                    }
+                    if self.ingest_import_failures_modal.close_button.contains(self.mouse_pos) {
+                        self.ingest_import_failures_modal.close();
+                        return;
+                    }
+                }
+
                 if self.pdf_modal.is_open {
                     if !self.pdf_modal.contains(self.mouse_pos) {
                         self.pdf_modal.close();
@@ -659,6 +1119,112 @@ impl App {
                             return;
                         }
                     }
+                    if self.pdf_modal.zoom_in_button.contains(self.mouse_pos) {
+                        self.pdf_modal.zoom_in();
+                        return;
+                    }
+                    if self.pdf_modal.zoom_out_button.contains(self.mouse_pos) {
+                        self.pdf_modal.zoom_out();
+                        return;
+                    }
+                    if self.pdf_modal.zoom_reset_button.contains(self.mouse_pos) {
+                        self.pdf_modal.zoom_reset();
+                        return;
+                    }
+                    return;
+                }
+
+                if self.collection_modal.is_open {
+                    if !self.collection_modal.search_input.contains(self.mouse_pos)
+                        && !self.collection_modal.papers_list.contains(self.mouse_pos)
+                        && !self.collection_modal.close_button.contains(self.mouse_pos)
+                        && !self.collection_modal.delete_button.contains(self.mouse_pos)
+                        && !self.collection_modal.remove_from_collection_button.contains(self.mouse_pos)
+                        && !(self.mouse_pos.x >= self.collection_modal.position.x
+                            && self.mouse_pos.x <= self.collection_modal.position.x + self.collection_modal.size.x
+                            && self.mouse_pos.y >= self.collection_modal.position.y
+                            && self.mouse_pos.y <= self.collection_modal.position.y + self.collection_modal.size.y)
+                    {
+                        self.collection_modal.close();
+                        return;
+                    }
+                    if self.collection_modal.close_button.contains(self.mouse_pos) {
+                        self.collection_modal.close();
+                        return;
+                    }
+                    if self.collection_modal.search_input.contains(self.mouse_pos) {
+                        self.collection_modal.search_input.on_focus();
+                        self.focused_input = Some(1);
+                        self.collection_modal.search_input.on_mouse_down(self.mouse_pos, self.click_count);
+                        return;
+                    }
+                    if self.collection_modal.delete_button.contains(self.mouse_pos) {
+                        if self.collection_modal.delete_confirm {
+                            let ids: Vec<i32> = self.collection_modal.selected_papers.iter().cloned().collect();
+                            if !ids.is_empty() {
+                                let base_url = self.api_client.base_url.clone();
+                                let sender = self.papers_sender.clone();
+                                tokio::spawn(async move {
+                                    let api_client = crate::api::ApiClient::new(Some(base_url.clone()));
+                                    for paper_id in ids {
+                                        let _ = api_client.delete_note(paper_id).await;
+                                    }
+                                    let client = reqwest::Client::new();
+                                    let url = format!("{}/papers", base_url);
+                                    if let Ok(resp) = client.get(&url).send().await {
+                                        if resp.status().is_success() {
+                                            if let Ok(papers) = resp.json::<Vec<crate::api::models::ApiPaper>>().await {
+                                                let _ = sender.send(Ok(papers));
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                            self.collection_modal.delete_confirm = false;
+                            return;
+                        }
+                        self.collection_modal.delete_confirm = true;
+                        return;
+                    }
+                    if self.collection_modal.remove_from_collection_button.contains(self.mouse_pos) {
+                        let ids: Vec<i32> = self.collection_modal.selected_papers.iter().cloned().collect();
+                        if !ids.is_empty() {
+                            let coll_id = self.collection_modal.collection_id.unwrap();
+                            let base_url = self.api_client.base_url.clone();
+                            let sender = self.collections_sender.clone();
+                            tokio::spawn(async move {
+                                let api = crate::api::ApiClient::new(Some(base_url.clone()));
+                                let _ = api.remove_papers_from_collection(coll_id, &ids).await;
+                                if let Ok(coll) = api.list_collections().await {
+                                    let _ = sender.send(Ok(coll));
+                                }
+                            });
+                        }
+                        return;
+                    }
+                    if self.collection_modal.papers_list.contains(self.mouse_pos) {
+                        if let Some(index) = self.collection_modal.get_paper_at(self.mouse_pos) {
+                            let paper = self.collection_modal.filtered_papers[index].clone();
+                            let row_y = self.collection_modal.papers_list.position.y - self.collection_modal.papers_list.scroll_offset + 8.0 + index as f32 * 48.0;
+                            let checkbox_x = self.collection_modal.papers_list.position.x + 16.0;
+                            let checkbox_y = row_y + 12.0;
+                            if self.mouse_pos.x >= checkbox_x && self.mouse_pos.x <= checkbox_x + 16.0 &&
+                               self.mouse_pos.y >= checkbox_y && self.mouse_pos.y <= checkbox_y + 16.0 {
+                                if self.collection_modal.selected_papers.contains(&paper.id) {
+                                    self.collection_modal.selected_papers.remove(&paper.id);
+                                } else {
+                                    self.collection_modal.selected_papers.insert(paper.id);
+                                }
+                                self.collection_modal.delete_confirm = false;
+                                return;
+                            }
+                            if paper.exists {
+                                self.open_document_preview(paper.filename);
+                            }
+                            return;
+                        }
+                    }
+                    return;
                 }
                 
                 if self.chat_info_dialog.is_open {
@@ -730,29 +1296,11 @@ impl App {
                                     if icon_rect.contains_point(self.mouse_pos) {
                                         let citation = citations[item_index];
                                         // Open PDF modal with the citation source
-                                        if citation.source.to_lowercase().ends_with(".pdf") {
-                                            let page = citation.page.unwrap_or(1);
-                                            let filename = format!("{}#page={}", citation.source, page);
-                                            self.pdf_modal.open(filename, Some(page));
-                                            self.pdf_modal.loading = true;
-                                            
-                                            // Load PDF from backend
-                                            let base_url = self.api_client.base_url.clone();
-                                            let client = self.api_client.client.clone();
-                                            let source = citation.source.clone();
-                                            tokio::spawn(async move {
-                                                let url = format!("{}/papers/{}", base_url, source);
-                                                match client.get(&url).send().await {
-                                                    Ok(resp) => {
-                                                        if resp.status().is_success() {
-                                                            if let Ok(_bytes) = resp.bytes().await {
-                                                                // PDF bytes received
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(e) => eprintln!("Failed to fetch PDF: {}", e),
-                                                }
-                                            });
+                                        let page = citation.page.unwrap_or(1);
+                                        self.open_document_preview(citation.source.clone());
+                                        self.pdf_modal.current_page = page;
+                                        if let Err(e) = self.pdf_modal.render_current_page() {
+                                            self.pdf_modal.set_error(format!("Failed to render page {}: {}", page, e));
                                         }
                                         return;
                                     }
@@ -788,8 +1336,53 @@ impl App {
                         self.focused_input = Some(8);
                         return;
                     }
+                    return;
                 }
                 
+                if self.system_prompts_modal.is_open {
+                    if !self.system_prompts_modal.contains(self.mouse_pos) {
+                        self.settings_state.system_prompts = self.system_prompts_modal.prompts.clone();
+                        let _ = SettingsPersistence::save_settings(&self.settings_state);
+                        self.system_prompts_modal.close();
+                        self.focused_input = None;
+                        return;
+                    }
+                    if self.system_prompts_modal.close_button.contains(self.mouse_pos) {
+                        self.settings_state.system_prompts = self.system_prompts_modal.prompts.clone();
+                        let _ = SettingsPersistence::save_settings(&self.settings_state);
+                        self.system_prompts_modal.close();
+                        self.focused_input = None;
+                        return;
+                    }
+                    if self.system_prompts_modal.save_button.contains(self.mouse_pos) {
+                        self.system_prompts_modal.add_from_inputs();
+                        self.settings_state.system_prompts = self.system_prompts_modal.prompts.clone();
+                        let _ = SettingsPersistence::save_settings(&self.settings_state);
+                        return;
+                    }
+                    for (i, db) in self.system_prompts_modal.delete_buttons.iter().enumerate() {
+                        if db.contains(self.mouse_pos) {
+                            self.system_prompts_modal.remove_at(i);
+                            self.settings_state.system_prompts = self.system_prompts_modal.prompts.clone();
+                            let _ = SettingsPersistence::save_settings(&self.settings_state);
+                            return;
+                        }
+                    }
+                    if self.system_prompts_modal.name_input.contains(self.mouse_pos) {
+                        self.system_prompts_modal.name_input.on_focus();
+                        self.system_prompts_modal.name_input.on_mouse_down(self.mouse_pos, self.click_count);
+                        self.focused_input = Some(22);
+                        return;
+                    }
+                    if self.system_prompts_modal.content_input.contains(self.mouse_pos) {
+                        self.system_prompts_modal.content_input.on_focus();
+                        self.system_prompts_modal.content_input.on_mouse_down(self.mouse_pos, self.click_count);
+                        self.focused_input = Some(23);
+                        return;
+                    }
+                    return;
+                }
+
                 if self.shard_modal.is_open {
                     if !self.shard_modal.contains(self.mouse_pos) {
                         self.shard_modal.close();
@@ -803,6 +1396,7 @@ impl App {
                         let graph_id_opt = self.graph_state.graph_id.clone();
                         let shard_id_opt = self.shard_modal.shard_id.clone();
                         if let (Some(graph_id), Some(shard_id)) = (graph_id_opt, shard_id_opt) {
+                            let reload_graph_id = graph_id.clone();
                             let base_url = self.api_client.base_url.clone();
                             let shard_id_clone = shard_id.clone();
                             tokio::spawn(async move {
@@ -814,44 +1408,9 @@ impl App {
                             });
                             self.graph_state.nodes.remove(&shard_id);
                             self.graph_state.bump_content_version();
-                            if let Some(ref mut chat) = self.chat_window {
-                                chat.messages = self.graph_state.node_ids_bfs_order()
-                                    .into_iter()
-                                    .filter_map(|id| self.graph_state.get_node(&id))
-                                    .flat_map(|node| {
-                                        let id = node.shard.id.clone();
-                                        let contexts = node.shard.contexts.clone();
-                                        let mut msgs = Vec::new();
-                                        if let Some(ref u) = node.shard.user_content {
-                                            if !u.is_empty() {
-                                                msgs.push(crate::ui::chat_window::ChatMessage {
-                                                    shard_id: Some(id.clone()),
-                                                    role: crate::ui::chat_window::MessageRole::User,
-                                                    content: u.clone(),
-                                                    contexts: contexts.clone(),
-                                                    citations: Vec::new(),
-                                                    notes: Vec::new(),
-                                                });
-                                            }
-                                        }
-                                        if let Some(ref a) = node.shard.assistant_content {
-                                            if !a.is_empty() {
-                                                msgs.push(crate::ui::chat_window::ChatMessage {
-                                                    shard_id: Some(id.clone()),
-                                                    role: crate::ui::chat_window::MessageRole::Assistant,
-                                                    content: a.clone(),
-                                                    contexts: contexts.clone(),
-                                                    citations: Vec::new(),
-                                                    notes: node.shard.notes.clone(),
-                                                });
-                                            }
-                                        }
-                                        msgs
-                                    })
-                                    .collect();
-                            }
-                            self.chat_state.set_current_messages(self.chat_window.as_ref().unwrap().messages.clone());
+                            self.apply_graph_messages_to_chat_and_state();
                             self.save_chat_state();
+                            self.request_graph_load(reload_graph_id);
                             self.shard_modal.close();
                             self.show_success_toast("Removed from graph".to_string());
                         }
@@ -882,22 +1441,17 @@ impl App {
                     }
                     if self.shard_modal.user_input.contains(self.mouse_pos) {
                         self.shard_modal.user_input.on_focus();
-                        self.shard_modal.user_input.on_mouse_down(self.mouse_pos, |text, size| {
-                            let char_count = text.chars().count();
-                            glam::Vec2::new(char_count as f32 * size * 0.66, size)
-                        }, self.click_count);
+                        self.shard_modal.user_input.on_mouse_down(self.mouse_pos, self.click_count);
                         self.focused_input = Some(20);
                         return;
                     }
                     if self.shard_modal.assistant_input.contains(self.mouse_pos) {
                         self.shard_modal.assistant_input.on_focus();
-                        self.shard_modal.assistant_input.on_mouse_down(self.mouse_pos, |text, size| {
-                            let char_count = text.chars().count();
-                            glam::Vec2::new(char_count as f32 * size * 0.66, size)
-                        }, self.click_count);
+                        self.shard_modal.assistant_input.on_mouse_down(self.mouse_pos, self.click_count);
                         self.focused_input = Some(21);
                         return;
                     }
+                    return;
                 }
                 
                 if self.insight_modal.is_open {
@@ -967,7 +1521,7 @@ impl App {
                            self.mouse_pos.y >= title_rect.1 && self.mouse_pos.y <= title_rect.3 {
                             self.insight_modal.is_editing_title = true;
                             self.insight_modal.title_input.on_focus();
-                            self.focused_input = Some(6);
+                            self.focused_input = Some(14);
                             return;
                         }
                     }
@@ -986,6 +1540,7 @@ impl App {
                             return;
                         }
                     }
+                    return;
                 }
                 
                 // Old notepad_modal handling removed - now using NotepadWindow's modal
@@ -1001,13 +1556,9 @@ impl App {
                     if self.ui_state.active_tab == Tab::Chat {
                         // When constellation (graph) view is active, skip linear list hit tests
                         // and go straight to hit_test which handles constellation nodes
-                        let use_linear_list = self.graph_state.graph_id.is_none();
+                        let use_linear_list = !self.graph_state.constellation_view_active();
                         let bubbles = if use_linear_list {
-                            Some(chat.get_message_bubbles(|text, size| {
-                                let char_width = size * 0.6;
-                                let chars = text.chars().count();
-                                Vec2::new(chars as f32 * char_width, size * 1.2)
-                            }))
+                            Some(chat.linear_message_bubbles_cache.as_slice())
                         } else {
                             None
                         };
@@ -1019,26 +1570,7 @@ impl App {
                                 if citation_idx < msg.citations.len() {
                                     let citation = &msg.citations[citation_idx];
                                     let source = citation.source.clone();
-                                    self.pdf_modal.open(source.clone(), None);
-                                    let base_url = self.api_client.base_url.clone();
-                                    let client = self.api_client.client.clone();
-                                    self.pdf_modal.loading = true;
-                                    tokio::spawn(async move {
-                                        let url = format!("{}/papers/{}", base_url, source);
-                                        match client.get(&url).send().await {
-                                            Ok(resp) => {
-                                                let status = resp.status();
-                                                if status.is_success() {
-                                                    if let Err(e) = resp.bytes().await {
-                                                        eprintln!("Failed to read PDF bytes: {}", e);
-                                                    }
-                                                } else {
-                                                    eprintln!("Failed to load PDF: HTTP {}", status);
-                                                }
-                                            }
-                                            Err(e) => eprintln!("Failed to fetch PDF: {}", e),
-                                        }
-                                    });
+                                    self.open_document_preview(source);
                                     return;
                                 }
                             }
@@ -1104,6 +1636,21 @@ impl App {
                         
                         let hit = chat.hit_test(self.mouse_pos, &self.graph_state);
                         match hit {
+                            crate::ui::chat_window::ChatHit::MentionItem(idx) => {
+                                chat.apply_mention_row_selection(
+                                    idx,
+                                    &self.papers_cache,
+                                    &self.graph_state,
+                                    &self.chat_state.conversations,
+                                );
+                                chat.sync_mention_popup_from_input(
+                                    &self.papers_cache,
+                                    &self.graph_state,
+                                    &self.chat_state.conversations,
+                                    &notepad_documents_for_mentions(),
+                                );
+                                return;
+                            }
                             crate::ui::chat_window::ChatHit::EditButton(msg_idx) => {
                                 chat.start_editing_message(msg_idx);
                                 self.focused_input = Some(10); // Use index 10 for edit textarea
@@ -1111,12 +1658,30 @@ impl App {
                             }
                             crate::ui::chat_window::ChatHit::DeleteButton(msg_idx) => {
                                 if chat.delete_confirm_idx == Some(msg_idx) {
-                                    // Confirm deletion
-                                    chat.delete_message(msg_idx);
-                                    // Also remove from chat_state
-                                    self.chat_state.delete_message(msg_idx);
-                                    self.save_chat_state();
-                                    self.show_success_toast("Message deleted".to_string());
+                                    let graph_id = self.graph_state.graph_id.clone();
+                                    let shard_id = chat.messages.get(msg_idx).and_then(|m| m.shard_id.clone());
+                                    if let (Some(graph_id), Some(shard_id)) = (graph_id, shard_id) {
+                                        let reload_graph_id = graph_id.clone();
+                                        let base_url = self.api_client.base_url.clone();
+                                        let shard_id_clone = shard_id.clone();
+                                        tokio::spawn(async move {
+                                            let api_client = crate::api::ApiClient::new(Some(base_url));
+                                            let _ = api_client.remove_shard_from_graph(&graph_id, &shard_id_clone).await;
+                                        });
+                                        self.graph_state.nodes.remove(&shard_id);
+                                        self.graph_state.bump_content_version();
+                                        self.apply_graph_messages_to_chat_and_state();
+                                        self.save_chat_state();
+                                        self.request_graph_load(reload_graph_id);
+                                        self.show_success_toast("Shard removed from graph".to_string());
+                                    } else {
+                                        // Confirm deletion
+                                        chat.delete_message(msg_idx);
+                                        // Also remove from chat_state
+                                        self.chat_state.delete_message(msg_idx);
+                                        self.save_chat_state();
+                                        self.show_success_toast("Message deleted".to_string());
+                                    }
                                 } else {
                                     // Start delete confirmation
                                     chat.delete_confirm_idx = Some(msg_idx);
@@ -1134,7 +1699,23 @@ impl App {
                             }
                             crate::ui::chat_window::ChatHit::RemoveNote(msg_idx, note_idx) => {
                                 chat.remove_note(msg_idx, note_idx);
-                                self.chat_state.set_current_messages(chat.messages.clone());
+                                if let Some(shard_id) = chat.messages.get(msg_idx).and_then(|m| m.shard_id.clone()) {
+                                    if let Some(node) = self.graph_state.get_node_mut(&shard_id) {
+                                        node.shard.notes = chat.messages[msg_idx].notes.clone();
+                                        self.graph_state.bump_content_version();
+                                    }
+                                    self.apply_graph_messages_to_chat_and_state();
+                                    if let Some(graph_id) = self.graph_state.graph_id.clone() {
+                                        let notes = self.graph_state.get_node(&shard_id).map(|n| n.shard.notes.clone()).unwrap_or_default();
+                                        let base_url = self.api_client.base_url.clone();
+                                        tokio::spawn(async move {
+                                            let api_client = crate::api::ApiClient::new(Some(base_url));
+                                            let _ = api_client.patch_shard(&graph_id, &shard_id, None, Some(notes)).await;
+                                        });
+                                    }
+                                } else {
+                                    self.chat_state.set_current_messages(chat.messages.clone());
+                                }
                                 self.save_chat_state();
                                 return;
                             }
@@ -1143,15 +1724,156 @@ impl App {
                                 self.focused_input = Some(13);
                                 return;
                             }
+                            crate::ui::chat_window::ChatHit::SystemPromptMenu => {
+                                return;
+                            }
+                            crate::ui::chat_window::ChatHit::SystemPromptItem(index) => {
+                                if let Some(item) = chat.system_prompt_dropdown.items.get(index) {
+                                    if let Some(name) = &item.slash_name {
+                                        if let Some(prompt) = self
+                                            .settings_state
+                                            .system_prompts
+                                            .iter()
+                                            .find(|p| p.name.to_lowercase() == name.to_lowercase())
+                                        {
+                                            chat.pending_system_prompt =
+                                                Some(crate::ui::chat_window::PendingSystemPrompt {
+                                                    name: prompt.name.clone(),
+                                                    content: prompt.content.clone(),
+                                                });
+                                        }
+                                        chat.strip_leading_slash_token();
+                                        chat.input_field.clear_selection();
+                                        chat.system_prompt_dropdown.close();
+                                    }
+                                }
+                                return;
+                            }
+                            crate::ui::chat_window::ChatHit::ComposerSystemPromptPillClose => {
+                                chat.pending_system_prompt = None;
+                                return;
+                            }
+                            crate::ui::chat_window::ChatHit::ComposerSystemPromptPillBody => {
+                                self.system_prompts_modal.open(
+                                    self.settings_state.system_prompts.clone(),
+                                );
+                                return;
+                            }
+                            crate::ui::chat_window::ChatHit::ComposerMentionPillClose(i) => {
+                                if i < chat.pending_mentions.len() {
+                                    chat.pending_mentions.remove(i);
+                                }
+                                return;
+                            }
+                            crate::ui::chat_window::ChatHit::ComposerMentionPillBody(i) => {
+                                if i < chat.pending_mentions.len() {
+                                    let m = chat.pending_mentions[i].mention.clone();
+                                    match m {
+                                        crate::api::models::GraphMention::Paper { paper_id } => {
+                                            if let Some(p) =
+                                                self.papers_cache.iter().find(|p| p.id == paper_id)
+                                            {
+                                                self.open_document_preview(p.filename.clone());
+                                            } else {
+                                                self.show_error_toast(
+                                                    "Paper not loaded in cache".to_string(),
+                                                );
+                                            }
+                                        }
+                                        crate::api::models::GraphMention::Shard {
+                                            graph_id,
+                                            shard_id,
+                                        } => {
+                                            if self.graph_state.graph_id.as_ref() == Some(&graph_id) {
+                                                if let Some(node) =
+                                                    self.graph_state.get_node(&shard_id)
+                                                {
+                                                    self.shard_modal.open(
+                                                        shard_id.clone(),
+                                                        node.shard.clone(),
+                                                    );
+                                                } else {
+                                                    self.show_error_toast(
+                                                        "Shard not in current graph".to_string(),
+                                                    );
+                                                }
+                                            } else {
+                                                self.show_error_toast(
+                                                    "Open this graph to view the shard".to_string(),
+                                                );
+                                            }
+                                        }
+                                        crate::api::models::GraphMention::Graph { graph_id } => {
+                                            let found = self
+                                                .chat_state
+                                                .conversations
+                                                .iter()
+                                                .position(|c| c.graph_id.as_ref() == Some(&graph_id));
+                                            if let Some(index) = found {
+                                                let conv_id =
+                                                    self.chat_state.conversations[index].id.clone();
+                                                self.chat_state.switch_conversation(&conv_id);
+                                                self.sidebar.selected_conversation_id =
+                                                    Some(conv_id.clone());
+                                                self.request_graph_load(graph_id.clone());
+                                                self.ui_state.set_active_tab(Tab::Chat);
+                                                if let Some(ref mut c) = self.chat_window {
+                                                    let use_shards = self
+                                                        .chat_state
+                                                        .current_conversation_id
+                                                        .as_ref()
+                                                        .and_then(|cid| {
+                                                            self.chat_state
+                                                                .conversations
+                                                                .iter()
+                                                                .find(|c| &c.id == cid)
+                                                        })
+                                                        .map(|c| c.graph_id.is_none())
+                                                        .unwrap_or(true);
+                                                    if use_shards {
+                                                        c.messages = self
+                                                            .chat_state
+                                                            .get_current_messages();
+                                                    }
+                                                }
+                                            } else {
+                                                self.show_error_toast(
+                                                    "No conversation for this graph".to_string(),
+                                                );
+                                            }
+                                        }
+                                        crate::api::models::GraphMention::Notepad {
+                                            document_id,
+                                        } => {
+                                            self.ui_state.set_active_tab(Tab::Notepad);
+                                            if let Some(ref mut notepad) = self.notepad_window {
+                                                let _ = notepad.load_note(&document_id);
+                                                notepad.title_input.on_blur();
+                                                notepad.editor.focus();
+                                                if notepad.editor.cursor.is_none()
+                                                    && !notepad.editor.document.blocks.is_empty()
+                                                {
+                                                    let first_block_id =
+                                                        notepad.editor.document.blocks[0].id.clone();
+                                                    notepad.editor.focus_block(&first_block_id);
+                                                }
+                                                self.focused_input = Some(5);
+                                            }
+                                        }
+                                    }
+                                }
+                                return;
+                            }
                             crate::ui::chat_window::ChatHit::ContextPoolButton => {
+                                chat.system_prompt_dropdown.close();
                                 chat.context_pool_dropdown.toggle();
                                 return; // Consume click - something clickable was hit
                             }
                             crate::ui::chat_window::ChatHit::ContextPoolItem(index) => {
+                                chat.system_prompt_dropdown.close();
                                 chat.context_pool_dropdown.select(index);
                                 let collection_id = chat.context_pool_dropdown.get_selected_id();
-                                chat.selected_collection_id = collection_id;
-                                self.set_context_pool(collection_id);
+                                self.propagate_context_pool_selection(collection_id);
                                 return; // Consume click - something clickable was hit
                             }
                             crate::ui::chat_window::ChatHit::ContextPoolMenu => {
@@ -1162,7 +1884,10 @@ impl App {
                                 chat.context_pool_dropdown.close();
                                 if let Some(ref mut library) = self.library_window {
                                     library.is_creating_collection = true;
+                                    library.rename_target_collection_id = None;
+                                    library.new_collection_input.text = "New Collection".to_string();
                                     library.new_collection_input.on_focus();
+                                    library.new_collection_input.select_all();
                                     self.focused_input = Some(9);
                                 }
                                 return;
@@ -1170,12 +1895,9 @@ impl App {
                             crate::ui::chat_window::ChatHit::Input => {
                                 chat.input_field.on_focus();
                                 chat.context_pool_dropdown.close();
+                                chat.system_prompt_dropdown.close();
                                 self.focused_input = Some(0);
-                                chat.input_field.on_mouse_down(self.mouse_pos, |text, size| {
-                                    let char_count = text.chars().count();
-                                    let approx_width = char_count as f32 * size * 0.6;
-                                    glam::Vec2::new(approx_width, size * 1.2)
-                                }, self.click_count);
+                                chat.input_field.on_mouse_down(self.mouse_pos, self.click_count);
                                 return; // Consume click - input field is clickable
                             }
                             crate::ui::chat_window::ChatHit::MessageList => {
@@ -1184,11 +1906,7 @@ impl App {
                                     if chat.edit_textarea.contains(self.mouse_pos) {
                                         chat.edit_textarea.on_focus();
                                         self.focused_input = Some(10);
-                                        chat.edit_textarea.on_mouse_down(self.mouse_pos, |text, size| {
-                                            let char_count = text.chars().count();
-                                            let approx_width = char_count as f32 * size * 0.6;
-                                            glam::Vec2::new(approx_width, size * 1.2)
-                                        }, self.click_count);
+                                        chat.edit_textarea.on_mouse_down(self.mouse_pos, self.click_count);
                                         return;
                                     }
                                 }
@@ -1197,11 +1915,7 @@ impl App {
                                     if chat.note_input.contains(self.mouse_pos) {
                                         chat.note_input.on_focus();
                                         self.focused_input = Some(13);
-                                        chat.note_input.on_mouse_down(self.mouse_pos, |text, size| {
-                                            let char_count = text.chars().count();
-                                            let approx_width = char_count as f32 * size * 0.6;
-                                            glam::Vec2::new(approx_width, size * 1.2)
-                                        }, self.click_count);
+                                        chat.note_input.on_mouse_down(self.mouse_pos, self.click_count);
                                         return;
                                     }
                                 }
@@ -1209,10 +1923,11 @@ impl App {
                                 // Don't consume click, let it fall through to sidebar
                                 chat.input_field.on_blur();
                                 chat.context_pool_dropdown.close();
+                                chat.system_prompt_dropdown.close();
                                 self.focused_input = None;
                             }
                             crate::ui::chat_window::ChatHit::SendButton => {
-                                if let Some(text) = chat.send_message() {
+                                if let Some((text, system_prompt, mentions)) = chat.send_message(&self.settings_state.system_prompts) {
                                     if self.graph_state.graph_id.is_some() {
                                         let graph_id = self.graph_state.graph_id.clone().unwrap();
                                         let leaf_id = self.graph_state.current_leaf_id.clone().unwrap_or_default();
@@ -1225,6 +1940,8 @@ impl App {
                                             temperature: None,
                                             max_tokens: None,
                                             model_token_limit: None,
+                                            system_prompt,
+                                            mentions,
                                         };
                                         let user_msg = crate::ui::chat_window::ChatMessage::from_legacy(
                                             crate::ui::chat_window::MessageRole::User,
@@ -1244,22 +1961,59 @@ impl App {
                             crate::ui::chat_window::ChatHit::ConstellationEditTextarea => {
                                 chat.edit_textarea.on_focus();
                                 self.focused_input = Some(10);
-                                chat.edit_textarea.on_mouse_down(self.mouse_pos, |text, size| {
-                                    let char_count = text.chars().count();
-                                    glam::Vec2::new(char_count as f32 * size * 0.66, size)
-                                }, self.click_count);
+                                chat.edit_textarea.on_mouse_down(self.mouse_pos, self.click_count);
                                 return;
                             }
                             crate::ui::chat_window::ChatHit::ConstellationNoteInput => {
                                 chat.note_input.on_focus();
                                 self.focused_input = Some(13);
-                                chat.note_input.on_mouse_down(self.mouse_pos, |text, size| {
-                                    let char_count = text.chars().count();
-                                    glam::Vec2::new(char_count as f32 * size * 0.66, size)
-                                }, self.click_count);
+                                chat.note_input.on_mouse_down(self.mouse_pos, self.click_count);
+                                return;
+                            }
+                            crate::ui::chat_window::ChatHit::ConstellationNoteSendButton => {
+                                if chat.adding_note_msg_idx.is_some() || chat.editing_note.is_some() {
+                                    let msg_idx = chat
+                                        .adding_note_msg_idx
+                                        .or(chat.editing_note.map(|(m, _)| m))
+                                        .unwrap();
+                                    let shard_id = chat.messages.get(msg_idx).and_then(|m| m.shard_id.clone());
+                                    if chat.save_note() {
+                                        let msgs = chat.messages.clone();
+                                        self.chat_state.set_current_messages(msgs.clone());
+                                        self.save_chat_state();
+                                        self.focused_input = None;
+                                        if let Some(ref sid) = shard_id {
+                                            if self.graph_state.graph_id.is_some() {
+                                                let notes = msgs[msg_idx].notes.clone();
+                                                if let Some(node) = self.graph_state.get_node_mut(sid) {
+                                                    node.shard.notes = notes.clone();
+                                                    self.graph_state.bump_content_version();
+                                                }
+                                                let base_url = self.api_client.base_url.clone();
+                                                let graph_id = self.graph_state.graph_id.clone().unwrap();
+                                                let sid = sid.clone();
+                                                tokio::spawn(async move {
+                                                    let api_client = crate::api::ApiClient::new(Some(base_url));
+                                                    let _ = api_client.patch_shard(&graph_id, &sid, None, Some(notes)).await;
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                                return;
+                            }
+                            crate::ui::chat_window::ChatHit::ConstellationMoveHandle(node_id) => {
+                                self.shard_move_drag = Some((node_id.clone(), self.mouse_pos));
+                                return;
+                            }
+                            crate::ui::chat_window::ChatHit::ConstellationResizeHandle(node_id) => {
+                                if let Some(node) = self.graph_state.get_node(&node_id) {
+                                    self.shard_resize_drag = Some((node_id.clone(), node.size, self.mouse_pos));
+                                }
                                 return;
                             }
                             crate::ui::chat_window::ChatHit::ConstellationPinButton(node_id) => {
+                                chat.constellation_view.pan_drag_start = Some(self.mouse_pos);
                                 let existing = self.insights_state.insights.iter().find(|i| i.id == node_id);
                                 if let Some(insight) = existing {
                                     let id = insight.id.clone();
@@ -1297,52 +2051,72 @@ impl App {
                                 return;
                             }
                             crate::ui::chat_window::ChatHit::ConstellationHideButton(node_id) => {
-                                if let Some(node) = self.graph_state.get_node_mut(&node_id) {
-                                    node.shard.user_visible = false;
-                                    node.shard.assistant_visible = false;
-                                }
+                                chat.constellation_view.pan_drag_start = Some(self.mouse_pos);
+                                let next_visible = self
+                                    .graph_state
+                                    .get_node(&node_id)
+                                    .map(|n| !n.shard.visible)
+                                    .unwrap_or(true);
+                                self.set_shard_visibility_and_sync(&node_id, next_visible);
                                 return;
                             }
                             crate::ui::chat_window::ChatHit::ConstellationNoteButton(node_id) => {
-                                if let Some(msg_idx) = chat.messages.iter().position(|m| m.shard_id.as_ref() == Some(&node_id)) {
-                                    chat.start_adding_note(msg_idx);
-                                    self.focused_input = Some(13);
-                                }
+                                chat.constellation_view.pan_drag_start = Some(self.mouse_pos);
+                                let msg_idx = chat.messages.iter().position(|m| {
+                                    m.shard_id.as_deref() == Some(node_id.as_str())
+                                        && m.role == crate::ui::chat_window::MessageRole::Assistant
+                                }).expect("ConstellationNoteButton: no assistant ChatMessage for shard");
+                                chat.start_adding_note(msg_idx);
+                                self.focused_input = Some(13);
                                 return;
                             }
                             crate::ui::chat_window::ChatHit::ConstellationAddContextButton(node_id) => {
-                                if let Some(msg_idx) = chat.messages.iter().position(|m| m.shard_id.as_ref() == Some(&node_id)) {
-                                    let msg = &chat.messages[msg_idx];
-                                    let content = msg.content.clone();
-                                    let title = if content.len() > 60 { format!("{}...", &content[..60]) } else { content.clone() };
-                                    let shard_id = msg.shard_id.clone().unwrap_or_else(|| node_id.clone());
-                                    let base_url = self.api_client.base_url.clone();
-                                    let conv_id = self.chat_state.current_conversation_id.clone();
-                                    let contexts = self.graph_state.get_node(&node_id).map(|n| n.shard.contexts.clone()).unwrap_or_default();
-                                    tokio::spawn(async move {
-                                        let api_client = crate::api::ApiClient::new(Some(base_url));
-                                        let _ = api_client.create_or_update_shard(
-                                            &shard_id,
-                                            &content,
-                                            contexts,
-                                            Some(title),
-                                            conv_id,
-                                            None,
-                                            None,
-                                        ).await;
-                                    });
-                                    self.insights_loaded = false;
-                                    self.load_insights();
-                                }
+                                chat.constellation_view.pan_drag_start = Some(self.mouse_pos);
+                                let node = self.graph_state.get_node(&node_id).expect("node");
+                                let content = chat
+                                    .messages
+                                    .iter()
+                                    .find(|m| {
+                                        m.shard_id.as_deref() == Some(node_id.as_str())
+                                            && m.role == crate::ui::chat_window::MessageRole::Assistant
+                                    })
+                                    .map(|m| m.content.clone())
+                                    .unwrap_or_else(|| node.shard.assistant_content.clone().unwrap_or_default());
+                                let title = if content.len() > 60 {
+                                    format!("{}...", &content[..60])
+                                } else {
+                                    content.clone()
+                                };
+                                let shard_id = node_id.clone();
+                                let base_url = self.api_client.base_url.clone();
+                                let conv_id = self.chat_state.current_conversation_id.clone();
+                                let contexts = node.shard.contexts.clone();
+                                tokio::spawn(async move {
+                                    let api_client = crate::api::ApiClient::new(Some(base_url));
+                                    let _ = api_client.create_or_update_shard(
+                                        &shard_id,
+                                        &content,
+                                        contexts,
+                                        Some(title),
+                                        conv_id,
+                                        None,
+                                        None,
+                                    )
+                                    .await;
+                                });
+                                self.insights_loaded = false;
+                                self.load_insights();
                                 return;
                             }
                             crate::ui::chat_window::ChatHit::ConstellationMoreButton(node_id) => {
+                                chat.constellation_view.pan_drag_start = Some(self.mouse_pos);
                                 if let Some(node) = self.graph_state.get_node(&node_id) {
                                     self.shard_modal.open(node_id.clone(), node.shard.clone());
                                 }
                                 return;
                             }
                             crate::ui::chat_window::ChatHit::ConstellationMessageEditButton(node_id, part) => {
+                                chat.constellation_view.pan_drag_start = Some(self.mouse_pos);
                                 let role = match part {
                                     crate::ui::chat_window::MessagePart::User => crate::ui::chat_window::MessageRole::User,
                                     crate::ui::chat_window::MessagePart::Assistant => crate::ui::chat_window::MessageRole::Assistant,
@@ -1355,51 +2129,47 @@ impl App {
                                 }
                                 return;
                             }
-                            crate::ui::chat_window::ChatHit::ConstellationMessageHideButton(node_id, part) => {
-                                if let Some(node) = self.graph_state.get_node_mut(&node_id) {
-                                    match part {
-                                        crate::ui::chat_window::MessagePart::User => {
-                                            node.shard.user_visible = !node.shard.user_visible;
-                                        }
-                                        crate::ui::chat_window::MessagePart::Assistant => {
-                                            node.shard.assistant_visible = !node.shard.assistant_visible;
-                                        }
-                                    }
-                                }
+                            crate::ui::chat_window::ChatHit::ConstellationMessageHideButton(node_id, _part) => {
+                                chat.constellation_view.pan_drag_start = Some(self.mouse_pos);
+                                let next_visible = self
+                                    .graph_state
+                                    .get_node(&node_id)
+                                    .map(|n| !n.shard.visible)
+                                    .unwrap_or(true);
+                                self.set_shard_visibility_and_sync(&node_id, next_visible);
                                 return;
                             }
                             crate::ui::chat_window::ChatHit::ConstellationCitation(node_id, citation_idx) => {
+                                self.pending_constellation_click = Some(PendingConstellationClick {
+                                    node_id: Some(node_id.clone()),
+                                    start_pos: self.mouse_pos,
+                                });
+                                chat.constellation_view.pan_drag_start = Some(self.mouse_pos);
+                                if !chat.constellation_citations_expanded(&node_id) {
+                                    chat.toggle_constellation_citations(&node_id);
+                                    return;
+                                }
                                 if let Some(node) = self.graph_state.get_node(&node_id) {
                                     if let Some(citation) = node.shard.citations.get(citation_idx) {
                                         let source = citation.get("source").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                        if !source.is_empty() && source.to_lowercase().ends_with(".pdf") {
+                                        if !source.is_empty() {
                                             let page = citation.get("page").and_then(|v| v.as_u64()).map(|p| p as u32).unwrap_or(1);
-                                            let filename = format!("{}#page={}", source, page);
-                                            self.pdf_modal.open(filename, Some(page));
-                                            self.pdf_modal.loading = true;
-                                            let base_url = self.api_client.base_url.clone();
-                                            let client = self.api_client.client.clone();
-                                            tokio::spawn(async move {
-                                                let url = format!("{}/papers/{}", base_url, source);
-                                                match client.get(&url).send().await {
-                                                    Ok(resp) => {
-                                                        if resp.status().is_success() {
-                                                            if let Err(e) = resp.bytes().await {
-                                                                eprintln!("Failed to read PDF bytes: {}", e);
-                                                            }
-                                                        } else {
-                                                            eprintln!("Failed to load PDF: HTTP {}", resp.status());
-                                                        }
-                                                    }
-                                                    Err(e) => eprintln!("Failed to fetch PDF: {}", e),
-                                                }
-                                            });
+                                            self.open_document_preview(source);
+                                            self.pdf_modal.current_page = page;
+                                            if let Err(e) = self.pdf_modal.render_current_page() {
+                                                self.pdf_modal.set_error(format!("Failed to render page {}: {}", page, e));
+                                            }
                                         }
                                     }
                                 }
                                 return;
                             }
                             crate::ui::chat_window::ChatHit::ConstellationEditNote(node_id, note_idx) => {
+                                self.pending_constellation_click = Some(PendingConstellationClick {
+                                    node_id: Some(node_id.clone()),
+                                    start_pos: self.mouse_pos,
+                                });
+                                chat.constellation_view.pan_drag_start = Some(self.mouse_pos);
                                 if let Some(msg_idx) = chat.messages.iter().position(|m| m.shard_id.as_deref() == Some(node_id.as_str())) {
                                     chat.start_editing_note(msg_idx, note_idx);
                                     self.focused_input = Some(13);
@@ -1407,35 +2177,54 @@ impl App {
                                 return;
                             }
                             crate::ui::chat_window::ChatHit::ConstellationRemoveNote(node_id, note_idx) => {
+                                chat.constellation_view.pan_drag_start = Some(self.mouse_pos);
                                 if let Some(msg_idx) = chat.messages.iter().position(|m| m.shard_id.as_deref() == Some(node_id.as_str())) {
                                     chat.remove_note(msg_idx, note_idx);
                                     if let Some(node) = self.graph_state.get_node_mut(&node_id) {
                                         node.shard.notes = chat.messages[msg_idx].notes.clone();
+                                        self.graph_state.bump_content_version();
                                     }
-                                    self.chat_state.set_current_messages(chat.messages.clone());
+                                    self.apply_graph_messages_to_chat_and_state();
                                     self.save_chat_state();
-                                    let base_url = self.api_client.base_url.clone();
-                                    let node_id_clone = node_id.clone();
-                                    let notes = self.graph_state.get_node(&node_id).map(|n| n.shard.notes.clone()).unwrap_or_default();
-                                    tokio::spawn(async move {
-                                        let api_client = crate::api::ApiClient::new(Some(base_url));
-                                        let _ = api_client.update_shard(&node_id_clone, None, None, None, Some(notes)).await;
-                                    });
+                                    if let Some(graph_id) = self.graph_state.graph_id.clone() {
+                                        let base_url = self.api_client.base_url.clone();
+                                        let node_id_clone = node_id.clone();
+                                        let notes = self.graph_state.get_node(&node_id).map(|n| n.shard.notes.clone()).unwrap_or_default();
+                                        tokio::spawn(async move {
+                                            let api_client = crate::api::ApiClient::new(Some(base_url));
+                                            let _ = api_client.patch_shard(&graph_id, &node_id_clone, None, Some(notes)).await;
+                                        });
+                                    }
                                 }
                                 return;
                             }
                             crate::ui::chat_window::ChatHit::ConstellationNode(node_id) => {
                                 if self.click_count == 2 {
-                                    if let Some(node) = self.graph_state.get_node(&node_id) {
+                                    if chat.constellation_macro_active() {
+                                        self.graph_state.set_current_leaf(node_id.clone());
+                                        if let Some(node) = self.graph_state.get_node(&node_id) {
+                                            let center = node.position + node.size * 0.5;
+                                            chat.constellation_view.center_camera_on(center);
+                                            chat.constellation_view.reset_zoom_to_normal();
+                                        }
+                                        chat.macro_selected_node_ids.clear();
+                                        chat.macro_selected_node_ids.insert(node_id.clone());
+                                        chat.macro_selection_anchor = Some(node_id.clone());
+                                    } else if let Some(node) = self.graph_state.get_node(&node_id) {
                                         self.shard_modal.open(node_id.clone(), node.shard.clone());
                                     }
                                 } else {
-                                    self.graph_state.current_leaf_id = Some(node_id.clone());
-                                    if let Some(node) = self.graph_state.get_node(&node_id) {
-                                        let center = node.position + node.size * 0.5;
-                                        chat.constellation_view.center_camera_on(center);
-                                        chat.constellation_view.reset_zoom_to_normal();
+                                    if chat.constellation_macro_active()
+                                        && chat.last_active_node_before_macro.is_none()
+                                    {
+                                        chat.last_active_node_before_macro =
+                                            self.graph_state.current_leaf_id.clone();
                                     }
+                                    self.pending_constellation_click = Some(PendingConstellationClick {
+                                        node_id: Some(node_id.clone()),
+                                        start_pos: self.mouse_pos,
+                                    });
+                                    chat.constellation_view.pan_drag_start = Some(self.mouse_pos);
                                     chat.input_field.on_blur();
                                     chat.context_pool_dropdown.close();
                                     self.focused_input = None;
@@ -1443,8 +2232,33 @@ impl App {
                                 return;
                             }
                             crate::ui::chat_window::ChatHit::ConstellationBackground => {
+                                self.pending_constellation_click = Some(PendingConstellationClick {
+                                    node_id: None,
+                                    start_pos: self.mouse_pos,
+                                });
                                 chat.constellation_view.pan_drag_start = Some(self.mouse_pos);
-                                self.physics_idle_timer = 0.0;
+                                chat.input_field.on_blur();
+                                chat.context_pool_dropdown.close();
+                                self.focused_input = None;
+                                return;
+                            }
+                            crate::ui::chat_window::ChatHit::ConstellationUserBubbleContent(node_id) => {
+                                self.pending_constellation_click = Some(PendingConstellationClick {
+                                    node_id: Some(node_id.clone()),
+                                    start_pos: self.mouse_pos,
+                                });
+                                chat.constellation_view.pan_drag_start = Some(self.mouse_pos);
+                                chat.input_field.on_blur();
+                                chat.context_pool_dropdown.close();
+                                self.focused_input = None;
+                                return;
+                            }
+                            crate::ui::chat_window::ChatHit::ConstellationAssistantBubbleContent(node_id) => {
+                                self.pending_constellation_click = Some(PendingConstellationClick {
+                                    node_id: Some(node_id.clone()),
+                                    start_pos: self.mouse_pos,
+                                });
+                                chat.constellation_view.pan_drag_start = Some(self.mouse_pos);
                                 chat.input_field.on_blur();
                                 chat.context_pool_dropdown.close();
                                 self.focused_input = None;
@@ -1517,14 +2331,23 @@ impl App {
                         if let Some(ref mut notepad) = self.notepad_window {
                             let hit = notepad.hit_test(self.mouse_pos);
                             match hit {
+                                crate::ui::notepad_window::NotepadHit::MentionItem(idx) => {
+                                    notepad.apply_mention_row_selection(idx);
+                                    notepad.sync_mention_popup_from_editor(
+                                        &self.papers_cache,
+                                        &self.graph_state,
+                                        &self.chat_state.conversations,
+                                        &notepad_documents_for_mentions(),
+                                    );
+                                    self.focused_input = Some(5);
+                                    return;
+                                }
                                 crate::ui::notepad_window::NotepadHit::TitleInput => {
+                                    use crate::ui::TextEditor;
+                                    TextEditor::blur(&mut notepad.editor);
                                     notepad.title_input.on_focus();
                                     self.focused_input = Some(12); // New index for title input
-                                    notepad.title_input.on_mouse_down(self.mouse_pos, |text, size| {
-                                        let char_count = text.chars().count();
-                                        let approx_width = char_count as f32 * size * 0.6;
-                                        glam::Vec2::new(approx_width, size * 1.2)
-                                    }, self.click_count);
+                                    notepad.title_input.on_mouse_down(self.mouse_pos, self.click_count);
                                     return;
                                 }
                                 crate::ui::notepad_window::NotepadHit::NewButton => {
@@ -1559,6 +2382,14 @@ impl App {
                                     return;
                                 }
                                 crate::ui::notepad_window::NotepadHit::ToolbarButton(button) => {
+                                    use crate::ui::TextEditor;
+                                    notepad.title_input.on_blur();
+                                    notepad.editor.focus();
+                                    if notepad.editor.cursor.is_none() && !notepad.editor.document.blocks.is_empty() {
+                                        let first_block_id = notepad.editor.document.blocks[0].id.clone();
+                                        notepad.editor.focus_block(&first_block_id);
+                                    }
+                                    self.focused_input = Some(5);
                                     use crate::ui::ToolbarButton;
                                     use crate::stylus::formatting::TextFormat;
                                     match button {
@@ -1658,6 +2489,7 @@ impl App {
                                 return;
                             }
                             crate::ui::notepad_window::NotepadHit::Editor => {
+                                notepad.title_input.on_blur();
                                 self.pending_notepad_click = Some(self.mouse_pos);
                                 // Start text selection on mouse down
                                 use crate::ui::TextEditor;
@@ -1686,10 +2518,39 @@ impl App {
                     if success { self.show_success_toast(msg); } else { self.show_error_toast(msg); }
                 }
                 if notepad_handled_with_toast { return; }
+
+                // Close settings panel when clicking outside the sidebar
+                if self.sidebar.settings_panel_open && !self.sidebar.hit_test(self.mouse_pos) {
+                    self.sidebar.settings_panel_open = false;
+                }
                 
                 // ===== Z-INDEX 11: Sidebar content =====
                 if self.sidebar.hit_test(self.mouse_pos) {
                     use crate::persistence::DocumentPersistence;
+
+                    // Settings panel item clicks (check before button so panel rows take priority)
+                    if self.sidebar.settings_panel_open {
+                        if let Some(item_idx) = self.sidebar.get_settings_panel_item_at(self.mouse_pos) {
+                            self.sidebar.settings_panel_open = false;
+                            self.dispatch_constellation_settings_action(item_idx);
+                            return;
+                        }
+                        // Click anywhere outside the panel (but still in sidebar) closes it
+                        let (panel_pos, panel_size) = self.sidebar.settings_panel_rect();
+                        let in_panel = self.mouse_pos.x >= panel_pos.x
+                            && self.mouse_pos.x <= panel_pos.x + panel_size.x
+                            && self.mouse_pos.y >= panel_pos.y
+                            && self.mouse_pos.y <= panel_pos.y + panel_size.y;
+                        if !in_panel && !self.sidebar.get_settings_button_at(self.mouse_pos) {
+                            self.sidebar.settings_panel_open = false;
+                        }
+                    }
+
+                    // Settings button toggle
+                    if self.sidebar.get_settings_button_at(self.mouse_pos) {
+                        self.sidebar.settings_panel_open = !self.sidebar.settings_panel_open;
+                        return;
+                    }
                     
                     // Check buttons first
                     if self.sidebar.get_new_conversation_button_at(self.mouse_pos) {
@@ -1876,6 +2737,82 @@ impl App {
                             }
                         }
                     }
+
+                    if let Some(ref library) = self.library_window {
+                        let collection_ids: Vec<i32> = library.collections.iter().map(|c| c.id).collect();
+                        if let Some(index) = self.sidebar.get_collection_at(self.mouse_pos, &collection_ids) {
+                            if index < library.collections.len() {
+                                let item_height = 40.0;
+                                let start_y = self.sidebar.collections_list.scroll_view.position.y;
+                                let scroll_offset = self.sidebar.collections_list.scroll_view.scroll_offset;
+                                let y = start_y + (index as f32 * item_height) - scroll_offset;
+                                let padding = crate::ui::style::padding::MEDIUM;
+                                let handle_size = 24.0;
+                                let handle_x = self.sidebar.position.x + self.sidebar.current_width - padding - handle_size - padding;
+                                let handle_y = y + (item_height - handle_size) / 2.0;
+                                let button_size = crate::ui::style::font_size::SMALL + crate::ui::style::padding::TINY * 2.0;
+                                let button_spacing = crate::ui::style::padding::TINY;
+                                let is_expanded = self.sidebar.collections_list.expanded_index == Some(index);
+                                if is_expanded {
+                                    let info_x = handle_x - button_size - button_spacing;
+                                    let delete_x = info_x - button_size - button_spacing;
+                                    if self.mouse_pos.x >= info_x && self.mouse_pos.x <= info_x + button_size &&
+                                       self.mouse_pos.y >= handle_y && self.mouse_pos.y <= handle_y + button_size {
+                                        let coll = &library.collections[index];
+                                        let papers = coll.papers.iter().map(|p| crate::ui::library_window::Paper {
+                                            id: p.id,
+                                            filename: p.filename.clone(),
+                                            title: p.title.clone(),
+                                            authors: p.authors.clone(),
+                                            year: p.year,
+                                            exists: p.exists,
+                                        }).collect();
+                                        self.collection_modal.open(coll.id, coll.name.clone(), papers);
+                                        self.sidebar.collections_list.expanded_index = None;
+                                        return;
+                                    }
+                                    if self.mouse_pos.x >= delete_x && self.mouse_pos.x <= delete_x + button_size &&
+                                       self.mouse_pos.y >= handle_y && self.mouse_pos.y <= handle_y + button_size {
+                                        let coll_id = library.collections[index].id;
+                                        let base_url = self.api_client.base_url.clone();
+                                        let sender = self.collections_sender.clone();
+                                        tokio::spawn(async move {
+                                            let api = crate::api::ApiClient::new(Some(base_url.clone()));
+                                            if let Err(e) = api.delete_collection(coll_id).await {
+                                                eprintln!("Delete collection: {}", e);
+                                            }
+                                            if let Ok(coll) = api.list_collections().await {
+                                                let _ = sender.send(Ok(coll));
+                                            }
+                                        });
+                                        self.sidebar.collections_list.expanded_index = None;
+                                        return;
+                                    }
+                                }
+                                if self.mouse_pos.x >= handle_x && self.mouse_pos.x <= handle_x + handle_size &&
+                                   self.mouse_pos.y >= handle_y && self.mouse_pos.y <= handle_y + handle_size {
+                                    if self.sidebar.collections_list.expanded_index == Some(index) {
+                                        self.sidebar.collections_list.expanded_index = None;
+                                    } else {
+                                        self.sidebar.collections_list.expanded_index = Some(index);
+                                    }
+                                    return;
+                                }
+                                let coll = &library.collections[index];
+                                let papers = coll.papers.iter().map(|p| crate::ui::library_window::Paper {
+                                    id: p.id,
+                                    filename: p.filename.clone(),
+                                    title: p.title.clone(),
+                                    authors: p.authors.clone(),
+                                    year: p.year,
+                                    exists: p.exists,
+                                }).collect();
+                                self.sidebar.selected_collection_id = Some(coll.id);
+                                self.collection_modal.open(coll.id, coll.name.clone(), papers);
+                                return;
+                            }
+                        }
+                    }
                     
                     // Check if clicked on insights list
                     if let Some(index) = self.sidebar.get_insight_at(self.mouse_pos, &self.insights_state.insights) {
@@ -1963,18 +2900,17 @@ impl App {
                 // These are at z-index 20 (same as chat) but only active when their tab is selected
                 
                 // Handle library window interactions
+                let mut pending_library_preview: Option<String> = None;
                 if let Some(ref mut library) = self.library_window {
                     if self.ui_state.active_tab == Tab::Library {
                         // New collection button
                         if library.new_collection_button.contains(self.mouse_pos) {
-                            library.is_creating_collection = !library.is_creating_collection;
-                            if library.is_creating_collection {
-                                library.new_collection_input.on_focus();
-                                self.focused_input = Some(9);
-                            } else {
-                                library.new_collection_input.on_blur();
-                                self.focused_input = None;
-                            }
+                            library.is_creating_collection = true;
+                            library.rename_target_collection_id = None;
+                            library.new_collection_input.text = "New Collection".to_string();
+                            library.new_collection_input.on_focus();
+                            library.new_collection_input.select_all();
+                            self.focused_input = Some(9);
                             return;
                         }
                         
@@ -1982,88 +2918,243 @@ impl App {
                         if library.is_creating_collection && library.new_collection_input.contains(self.mouse_pos) {
                             library.new_collection_input.on_focus();
                             self.focused_input = Some(9);
-                            library.new_collection_input.on_mouse_down(self.mouse_pos, |text, size| {
-                                let char_count = text.chars().count();
-                                let approx_width = char_count as f32 * size * 0.6;
-                                glam::Vec2::new(approx_width, size * 1.2)
-                            }, self.click_count);
+                            library.new_collection_input.on_mouse_down(self.mouse_pos, self.click_count);
                             return;
                         }
                         
                         if library.search_input.contains(self.mouse_pos) {
                             library.search_input.on_focus();
                             self.focused_input = Some(1);
-                            library.search_input.on_mouse_down(self.mouse_pos, |text, size| {
-                                let char_count = text.chars().count();
-                                let approx_width = char_count as f32 * size * 0.6;
-                                glam::Vec2::new(approx_width, size * 1.2)
-                            }, self.click_count);
+                            library.search_input.on_mouse_down(self.mouse_pos, self.click_count);
                             return;
-                        } else if library.collections_list.contains(self.mouse_pos - library.position) {
-                            // Clicked on collections list
+                        } else if library.collections_list.contains(self.mouse_pos) {
+                            // Clicked on collections list (inline sync: cannot call self.propagate_context_pool_selection while holding &mut library)
                             if let Some(index) = library.get_collection_at(self.mouse_pos) {
                                 if index == usize::MAX {
-                                    // "All papers" option
+                                    if let Some(ref mut chat) = self.chat_window {
+                                        chat.selected_collection_id = None;
+                                        chat.context_pool_dropdown.set_selected_by_id(None);
+                                    }
                                     library.select_collection(None);
+                                    let base_url = self.api_client.base_url.clone();
+                                    let client = self.api_client.client.clone();
+                                    let sender = self.context_pool_response_sender.clone();
+                                    tokio::spawn(async move {
+                                        let request = crate::api::models::ContextPoolRequest {
+                                            collection_id: None,
+                                            model_id: None,
+                                        };
+                                        let url = format!("{}/context_pool", base_url);
+                                        let response = client.post(&url).json(&request).send().await;
+                                        match response {
+                                            Ok(resp) => {
+                                                let status = resp.status();
+                                                if status.is_success() {
+                                                    let _ = sender.send(Ok(()));
+                                                } else {
+                                                    let error_text = resp.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                                                    let _ = sender.send(Err(format!("API error {}: {}", status, error_text)));
+                                                }
+                                            }
+                                            Err(e) => {
+                                                let _ = sender.send(Err(format!("API request failed: {:?}", e)));
+                                            }
+                                        }
+                                    });
                                 } else if index < library.collections.len() {
-                                    let collection = &library.collections[index];
-                                    library.select_collection(Some(collection.id));
+                                    let (handle_pos, handle_size) = library.get_collection_handle_rect(index);
+                                    let handle_hit = self.mouse_pos.x >= handle_pos.x
+                                        && self.mouse_pos.x <= handle_pos.x + handle_size.x
+                                        && self.mouse_pos.y >= handle_pos.y
+                                        && self.mouse_pos.y <= handle_pos.y + handle_size.y;
+                                    let rename_pos = Vec2::new(handle_pos.x - 44.0, handle_pos.y);
+                                    let delete_pos = Vec2::new(handle_pos.x - 22.0, handle_pos.y);
+                                    let rename_hit = self.mouse_pos.x >= rename_pos.x
+                                        && self.mouse_pos.x <= rename_pos.x + handle_size.x
+                                        && self.mouse_pos.y >= rename_pos.y
+                                        && self.mouse_pos.y <= rename_pos.y + handle_size.y;
+                                    let delete_hit = self.mouse_pos.x >= delete_pos.x
+                                        && self.mouse_pos.x <= delete_pos.x + handle_size.x
+                                        && self.mouse_pos.y >= delete_pos.y
+                                        && self.mouse_pos.y <= delete_pos.y + handle_size.y;
+
+                                    if library.expanded_collection_index == Some(index) && rename_hit {
+                                        library.is_creating_collection = true;
+                                        library.rename_target_collection_id = Some(library.collections[index].id);
+                                        library.new_collection_input.text = library.collections[index].name.clone();
+                                        library.new_collection_input.on_focus();
+                                        library.new_collection_input.select_all();
+                                        self.focused_input = Some(9);
+                                        return;
+                                    }
+                                    if library.expanded_collection_index == Some(index) && delete_hit {
+                                        let coll_id = library.collections[index].id;
+                                        let base_url = self.api_client.base_url.clone();
+                                        let sender = self.collections_sender.clone();
+                                        tokio::spawn(async move {
+                                            let api = crate::api::ApiClient::new(Some(base_url.clone()));
+                                            if let Err(e) = api.delete_collection(coll_id).await {
+                                                eprintln!("Delete collection: {}", e);
+                                            }
+                                            if let Ok(coll) = api.list_collections().await {
+                                                let _ = sender.send(Ok(coll));
+                                            }
+                                        });
+                                        library.expanded_collection_index = None;
+                                        return;
+                                    }
+                                    if handle_hit {
+                                        if library.expanded_collection_index == Some(index) {
+                                            library.expanded_collection_index = None;
+                                        } else {
+                                            library.expanded_collection_index = Some(index);
+                                        }
+                                        return;
+                                    }
+                                    let collection_id = library.collections[index].id;
+                                    let collection_name = library.collections[index].name.clone();
+                                    let collection_papers = library.collections[index].papers.clone();
+                                    if let Some(ref mut chat) = self.chat_window {
+                                        chat.selected_collection_id = Some(collection_id);
+                                        chat.context_pool_dropdown.set_selected_by_id(Some(collection_id));
+                                    }
+                                    library.select_collection(Some(collection_id));
+                                    let base_url = self.api_client.base_url.clone();
+                                    let client = self.api_client.client.clone();
+                                    let sender = self.context_pool_response_sender.clone();
+                                    tokio::spawn(async move {
+                                        let request = crate::api::models::ContextPoolRequest {
+                                            collection_id: Some(collection_id),
+                                            model_id: None,
+                                        };
+                                        let url = format!("{}/context_pool", base_url);
+                                        let response = client.post(&url).json(&request).send().await;
+                                        match response {
+                                            Ok(resp) => {
+                                                let status = resp.status();
+                                                if status.is_success() {
+                                                    let _ = sender.send(Ok(()));
+                                                } else {
+                                                    let error_text = resp.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                                                    let _ = sender.send(Err(format!("API error {}: {}", status, error_text)));
+                                                }
+                                            }
+                                            Err(e) => {
+                                                let _ = sender.send(Err(format!("API request failed: {:?}", e)));
+                                            }
+                                        }
+                                    });
+                                    let modal_papers = collection_papers.into_iter().map(|p| crate::ui::library_window::Paper {
+                                        id: p.id,
+                                        filename: p.filename,
+                                        title: p.title,
+                                        authors: p.authors,
+                                        year: p.year,
+                                        exists: p.exists,
+                                    }).collect();
+                                    self.collection_modal.open(collection_id, collection_name, modal_papers);
+                                    library.expanded_collection_index = None;
                                 }
                             }
                             library.search_input.on_blur();
                             library.new_collection_input.on_blur();
                             self.focused_input = None;
                             return;
-                        } else if library.papers_list.contains(self.mouse_pos - library.position) {
-                            // Check if clicking on delete button
-                            if library.delete_button.contains(self.mouse_pos) {
-                                if library.delete_confirm {
-                                    // Confirm deletion
-                                    let selected_ids = library.get_selected_paper_ids();
-                                    if !selected_ids.is_empty() {
-                                        let base_url = self.api_client.base_url.clone();
-                                        let selected_ids_clone = selected_ids.clone();
-                                        let sender = self.papers_sender.clone();
-                                        tokio::spawn(async move {
-                                            let api_client = crate::api::ApiClient::new(Some(base_url.clone()));
-                                            let mut errors = Vec::new();
-                                            for paper_id in selected_ids_clone {
-                                                if let Err(e) = api_client.delete_note(paper_id).await {
-                                                    errors.push(format!("Failed to delete paper {}: {}", paper_id, e));
+                        } else if library.add_to_collection_button.contains(self.mouse_pos) {
+                            if let Some(cid) = library.selected_collection_id {
+                                let ids = library.get_selected_paper_ids();
+                                if !ids.is_empty() {
+                                    let base_url = self.api_client.base_url.clone();
+                                    let sender = self.collections_sender.clone();
+                                    tokio::spawn(async move {
+                                        let api = crate::api::ApiClient::new(Some(base_url.clone()));
+                                        if let Err(e) = api.add_papers_to_collection(cid, &ids).await {
+                                            eprintln!("Add to collection: {}", e);
+                                            return;
+                                        }
+                                        let client = reqwest::Client::new();
+                                        let url = format!("{}/collections", base_url);
+                                        if let Ok(resp) = client.get(&url).send().await {
+                                            if resp.status().is_success() {
+                                                if let Ok(coll) = resp.json::<Vec<crate::api::models::Collection>>().await {
+                                                    let _ = sender.send(Ok(coll));
                                                 }
                                             }
-                                            
-                                            // Reload papers after deletion
-                                            let client = reqwest::Client::new();
-                                            let url = format!("{}/papers", base_url);
-                                            if let Ok(resp) = client.get(&url).send().await {
-                                                if resp.status().is_success() {
-                                                    if let Ok(papers) = resp.json::<Vec<crate::api::models::ApiPaper>>().await {
-                                                        let _ = sender.send(Ok(papers));
-                                                    }
-                                                }
-                                            }
-                                            
-                                            if !errors.is_empty() {
-                                                eprintln!("Deletion errors: {:?}", errors);
-                                            }
-                                        });
-                                        
-                                        library.clear_selection();
-                                        library.delete_confirm = false;
-                                        self.show_success_toast(format!("Deleting {} paper(s)...", selected_ids.len()));
-                                    }
-                                } else {
-                                    // Start delete confirmation
-                                    library.delete_confirm = true;
+                                        }
+                                    });
+                                    self.show_success_toast("Added papers to collection".to_string());
                                 }
-                                return;
-                            } else if library.delete_confirm {
-                                // Clicked elsewhere while in confirm mode - cancel confirmation
+                            }
+                            return;
+                        } else if library.delete_button.contains(self.mouse_pos) {
+                            if library.delete_confirm {
+                                let selected_ids = library.get_selected_paper_ids();
+                                if !selected_ids.is_empty() {
+                                    let base_url = self.api_client.base_url.clone();
+                                    let selected_ids_clone = selected_ids.clone();
+                                    let sender = self.papers_sender.clone();
+                                    tokio::spawn(async move {
+                                        let api_client = crate::api::ApiClient::new(Some(base_url.clone()));
+                                        let mut errors = Vec::new();
+                                        for paper_id in selected_ids_clone {
+                                            if let Err(e) = api_client.delete_note(paper_id).await {
+                                                errors.push(format!("Failed to delete paper {}: {}", paper_id, e));
+                                            }
+                                        }
+                                        let client = reqwest::Client::new();
+                                        let url = format!("{}/papers", base_url);
+                                        if let Ok(resp) = client.get(&url).send().await {
+                                            if resp.status().is_success() {
+                                                if let Ok(papers) = resp.json::<Vec<crate::api::models::ApiPaper>>().await {
+                                                    let _ = sender.send(Ok(papers));
+                                                }
+                                            }
+                                        }
+                                        if !errors.is_empty() {
+                                            eprintln!("Deletion errors: {:?}", errors);
+                                        }
+                                    });
+                                    library.clear_selection();
+                                    library.delete_confirm = false;
+                                    self.show_success_toast(format!("Deleting {} paper(s)...", selected_ids.len()));
+                                }
+                            } else {
+                                library.delete_confirm = true;
+                            }
+                            return;
+                        } else if library.remove_from_collection_button.contains(self.mouse_pos) {
+                            if let Some(cid) = library.selected_collection_id {
+                                let ids = library.get_selected_paper_ids();
+                                if !ids.is_empty() {
+                                    let base_url = self.api_client.base_url.clone();
+                                    let sender = self.collections_sender.clone();
+                                    tokio::spawn(async move {
+                                        let api = crate::api::ApiClient::new(Some(base_url.clone()));
+                                        if let Err(e) = api.remove_papers_from_collection(cid, &ids).await {
+                                            eprintln!("Remove from collection: {}", e);
+                                            return;
+                                        }
+                                        let client = reqwest::Client::new();
+                                        let url = format!("{}/collections", base_url);
+                                        if let Ok(resp) = client.get(&url).send().await {
+                                            if resp.status().is_success() {
+                                                if let Ok(coll) = resp.json::<Vec<crate::api::models::Collection>>().await {
+                                                    let _ = sender.send(Ok(coll));
+                                                }
+                                            }
+                                        }
+                                    });
+                                    self.show_success_toast("Removed papers from collection".to_string());
+                                }
+                            }
+                            return;
+                        } else if library.papers_list.contains(self.mouse_pos) {
+                            // Cancel any pending delete confirmation when clicking the list
+                            if library.delete_confirm {
                                 library.delete_confirm = false;
                                 return;
                             }
-                            
+
                             // Check if clicking on checkbox
                             if let Some(index) = library.get_paper_at(self.mouse_pos) {
                                 if index < library.filtered_papers.len() {
@@ -2080,40 +3171,26 @@ impl App {
                                         library.delete_confirm = false;  // Reset confirmation when selection changes
                                         return;
                                     }
-                                    
-                                    // Open PDF modal for PDF files (if not clicking checkbox)
-                                    if paper.filename.to_lowercase().ends_with(".pdf") {
-                                        self.pdf_modal.open(paper.filename.clone(), None);
-                                        self.pdf_modal.loading = true;
-                                        let base_url = self.api_client.base_url.clone();
-                                        let client = self.api_client.client.clone();
-                                        let filename = paper.filename.clone();
-                                        tokio::spawn(async move {
-                                            let url = format!("{}/papers/{}", base_url, filename);
-                                            match client.get(&url).send().await {
-                                                Ok(resp) => {
-                                                    if resp.status().is_success() {
-                                                        if let Ok(_bytes) = resp.bytes().await {
-                                                            // PDF bytes received
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => eprintln!("Failed to fetch PDF: {}", e),
-                                            }
-                                        });
+
+                                    if paper.exists {
+                                        pending_library_preview = Some(paper.filename.clone());
                                     }
                                 }
                             }
                             library.search_input.on_blur();
                             library.new_collection_input.on_blur();
                             self.focused_input = None;
-                            return;
+                            // No return here – fall through so pending_library_preview is consumed below.
                         } else {
                             library.search_input.on_blur();
                             library.new_collection_input.on_blur();
                             self.focused_input = None;
                         }
                     }
+                }
+                if let Some(filename) = pending_library_preview {
+                    self.open_document_preview(filename);
+                    return;
                 }
 
                 // Handle ingest window interactions
@@ -2122,11 +3199,16 @@ impl App {
                         if ingest.pdf_dir_input.contains(self.mouse_pos) {
                             ingest.pdf_dir_input.on_focus();
                             self.focused_input = Some(2);
-                            ingest.pdf_dir_input.on_mouse_down(self.mouse_pos, |text, size| {
-                                let char_count = text.chars().count();
-                                let approx_width = char_count as f32 * size * 0.6;
-                                glam::Vec2::new(approx_width, size * 1.2)
-                            }, self.click_count);
+                            ingest.pdf_dir_input.on_mouse_down(self.mouse_pos, self.click_count);
+                        } else if ingest.is_view_failures_button_clicked(self.mouse_pos) {
+                            ingest.view_failures_button.on_press();
+                            self.ingest_import_failures_modal.open(ingest.failure_lines.clone());
+                        } else if ingest.submit_button.contains(self.mouse_pos) {
+                            ingest.submit_button.on_press();
+                            self.start_ingestion();
+                        } else if ingest.is_bib_upload_button_clicked(self.mouse_pos) {
+                            ingest.bib_upload_button.on_press();
+                            self.open_bibtex_picker_and_import();
                         } else if ingest.is_browse_button_clicked(self.mouse_pos) {
                             ingest.browse_button.on_press();
                             self.open_file_picker();
@@ -2141,34 +3223,30 @@ impl App {
                 }
 
                 // Handle settings window interactions
-                if let Some(ref mut settings) = self.settings_window {
+                if let Some(settings) = self.settings_window.get_mut().as_mut() {
                     if self.ui_state.active_tab == Tab::Settings {
-                        // Theme selection area (click to cycle through themes)
-                        let theme_area = crate::ui::core::Rect::new(
-                            settings.position.x + 20.0,
-                            settings.position.y + 400.0, // Approximate position based on rendering
-                            300.0,
-                            30.0,
-                        );
-                        if theme_area.contains_point(self.mouse_pos) {
-                            // Cycle to next theme
-                            settings.selected_theme = (settings.selected_theme + 1) % 8;
-                            let theme_names = [
-                                "standard",
-                                "sakura-light",
-                                "springtime-light",
-                                "forest-dark",
-                                "toadstool-light",
-                                "acorn-dark",
-                                "light",
-                                "dark",
-                            ];
-                            if settings.selected_theme < theme_names.len() {
-                                self.settings_state.theme = theme_names[settings.selected_theme].to_string();
-                                use crate::persistence::SettingsPersistence;
-                                if let Err(e) = SettingsPersistence::save_settings(&self.settings_state) {
-                                    eprintln!("Failed to save settings: {}", e);
+                        let dd = &mut settings.theme_dropdown;
+                        if dd.is_open {
+                            if dd.contains_menu(self.mouse_pos) {
+                                if let Some(ix) = dd.get_menu_item_at(self.mouse_pos) {
+                                    dd.select(ix);
+                                    let tid = crate::ui::theme::theme_id_for_index(ix);
+                                    self.settings_state.theme = tid.to_string();
+                                    use crate::persistence::SettingsPersistence;
+                                    if let Err(e) = SettingsPersistence::save_settings(&self.settings_state) {
+                                        eprintln!("Failed to save settings: {}", e);
+                                    }
                                 }
+                                return;
+                            }
+                            if !dd.contains(self.mouse_pos) {
+                                dd.close();
+                            }
+                        }
+                        if dd.contains(self.mouse_pos) {
+                            dd.toggle();
+                            if dd.is_open {
+                                dd.update_layout();
                             }
                             return;
                         } else if settings.provider_selector_rect.contains_point(self.mouse_pos) {
@@ -2181,30 +3259,21 @@ impl App {
                             if let Err(e) = SettingsPersistence::save_settings(&self.settings_state) {
                                 eprintln!("Failed to save settings: {}", e);
                             }
+                        } else if settings.manage_system_prompts_button.contains(self.mouse_pos) {
+                            self.system_prompts_modal.open(self.settings_state.system_prompts.clone());
+                            return;
                         } else if settings.hf_token_input.contains(self.mouse_pos) && self.settings_state.provider == "local" {
                             settings.hf_token_input.on_focus();
                             self.focused_input = Some(3);
-                            settings.hf_token_input.on_mouse_down(self.mouse_pos, |text, size| {
-                                let char_count = text.chars().count();
-                                let approx_width = char_count as f32 * size * 0.6;
-                                glam::Vec2::new(approx_width, size * 1.2)
-                            }, self.click_count);
+                            settings.hf_token_input.on_mouse_down(self.mouse_pos, self.click_count);
                         } else if settings.model_id_input.contains(self.mouse_pos) && self.settings_state.provider == "local" {
                             settings.model_id_input.on_focus();
                             self.focused_input = Some(4);
-                            settings.model_id_input.on_mouse_down(self.mouse_pos, |text, size| {
-                                let char_count = text.chars().count();
-                                let approx_width = char_count as f32 * size * 0.6;
-                                glam::Vec2::new(approx_width, size * 1.2)
-                            }, self.click_count);
+                            settings.model_id_input.on_mouse_down(self.mouse_pos, self.click_count);
                         } else if settings.openai_model_input.contains(self.mouse_pos) && self.settings_state.provider == "openai" {
                             settings.openai_model_input.on_focus();
                             self.focused_input = Some(6);
-                            settings.openai_model_input.on_mouse_down(self.mouse_pos, |text, size| {
-                                let char_count = text.chars().count();
-                                let approx_width = char_count as f32 * size * 0.6;
-                                glam::Vec2::new(approx_width, size * 1.2)
-                            }, self.click_count);
+                            settings.openai_model_input.on_mouse_down(self.mouse_pos, self.click_count);
                         } else {
                             if settings.hf_token_input.focused {
                                 settings.hf_token_input.on_blur();
@@ -2235,7 +3304,7 @@ impl App {
                     }
                 }
                 
-                if let Some(ref mut settings) = self.settings_window {
+                if let Some(settings) = self.settings_window.get_mut().as_mut() {
                     settings.hf_token_input.text = self.settings_state.hf_token.clone();
                     settings.model_id_input.text = self.settings_state.model_id.clone();
                     settings.openai_model_input.text = self.settings_state.openai_model.clone();
@@ -2273,8 +3342,49 @@ impl App {
         }
     }
     
+    /// Screen rect for the open constellation context menu (`mx`, `my`, `menu_w`, `menu_h`) and item count.
+    /// Matches clamp + padding in [`crate::gfx::components::chat::window::render_chat_window`].
+    fn constellation_context_menu_frame(&self, menu: &ConstellationContextMenu) -> (f32, f32, f32, f32, usize) {
+        const MENU_INNER_W: f32 = 180.0;
+        const ITEM_H: f32 = 28.0;
+        const MENU_PAD: f32 = 4.0;
+        let (position, item_count) = match menu {
+            ConstellationContextMenu::Shard { position, .. } => (*position, 6usize),
+            ConstellationContextMenu::Background { position } => (*position, 2usize),
+        };
+        let menu_h = item_count as f32 * ITEM_H + MENU_PAD * 2.0;
+        let menu_w = MENU_INNER_W + MENU_PAD * 2.0;
+        let mx = position.x.min(self.viewport_size.x - menu_w - 4.0).max(4.0);
+        let my = position.y.min(self.viewport_size.y - menu_h - 4.0).max(4.0);
+        (mx, my, menu_w, menu_h, item_count)
+    }
+
     /// Handle right mouse button click (context menu)
     pub fn on_mouse_right_click(&mut self) {
+        self.text_edit_context_menu = None;
+        if self.focused_input.is_some() && self.focused_text_contains(self.mouse_pos) {
+            const MENU_WIDTH: f32 = 180.0;
+            const ITEM_H: f32 = 28.0;
+            const MENU_PAD: f32 = 4.0;
+            let n = 3usize;
+            let menu_h = n as f32 * ITEM_H + MENU_PAD * 2.0;
+            let menu_w = MENU_WIDTH + MENU_PAD * 2.0;
+            let mx = self
+                .mouse_pos
+                .x
+                .min(self.viewport_size.x - menu_w - 4.0)
+                .max(4.0);
+            let my = self
+                .mouse_pos
+                .y
+                .min(self.viewport_size.y - menu_h - 4.0)
+                .max(4.0);
+            self.text_edit_context_menu = Some(TextEditContextMenu {
+                position: Vec2::new(mx, my),
+            });
+            return;
+        }
+
         // Route to component under cursor for context menu
         use crate::ui::tab_bar::Tab;
         
@@ -2296,10 +3406,33 @@ impl App {
         // Windows based on active tab
         match self.ui_state.active_tab {
             Tab::Chat => {
-                if let Some(ref chat) = self.chat_window {
+                if let Some(ref mut chat) = self.chat_window {
                     if self.mouse_pos.x >= chat.position.x && self.mouse_pos.x <= chat.position.x + chat.size.x &&
-                       self.mouse_pos.y >= chat.position.y && self.mouse_pos.y <= chat.position.y + chat.size.y {
-                        self.on_context_menu(self.mouse_pos, "chat_window");
+                       self.mouse_pos.y >= chat.position.y && self.mouse_pos.y <= chat.position.y + chat.size.y
+                    {
+                        if self.graph_state.constellation_view_active() && chat.constellation_view.contains_screen(self.mouse_pos) {
+                            let hit = chat.hit_test(self.mouse_pos, &self.graph_state);
+                            use crate::ui::chat_window::ChatHit;
+                            match &hit {
+                                ChatHit::ConstellationBackground => {
+                                    self.constellation_context_menu = Some(ConstellationContextMenu::Background {
+                                        position: self.mouse_pos,
+                                    });
+                                }
+                                _ => {
+                                    if let Some(node_id) = constellation_hit_node_id(&hit) {
+                                        self.constellation_context_menu = Some(ConstellationContextMenu::Shard {
+                                            position: self.mouse_pos,
+                                            node_id,
+                                        });
+                                    } else {
+                                        self.on_context_menu(self.mouse_pos, "chat_window");
+                                    }
+                                }
+                            }
+                        } else {
+                            self.on_context_menu(self.mouse_pos, "chat_window");
+                        }
                         return;
                     }
                 }
@@ -2419,11 +3552,76 @@ impl App {
             }
         }
 
-        // Clear constellation pan
+        // Constellation: focus shard on release if it was a click (small movement)
         if let Some(ref mut chat) = self.chat_window {
+            if self.ui_state.active_tab == Tab::Chat
+                && self.graph_state.constellation_view_active()
+                && chat.constellation_view.contains_screen(position)
+            {
+                if let Some(ref pending) = self.pending_constellation_click {
+                    let dist = (position - pending.start_pos).length();
+                    if dist < CLICK_VS_DRAG_THRESHOLD {
+                        let release_hit = chat.hit_test(position, &self.graph_state);
+                        let release_node_id = constellation_hit_node_id(&release_hit);
+                        if pending.node_id.as_deref() == release_node_id.as_deref() && release_node_id.is_some() {
+                            let id = release_node_id.unwrap();
+                            if chat.constellation_macro_active() {
+                                let ctrl = self.modifiers.contains(ModifiersState::SUPER)
+                                    || self.modifiers.contains(ModifiersState::CONTROL);
+                                let shift = self.modifiers.contains(ModifiersState::SHIFT);
+                                if shift {
+                                    let mut ordered_ids: Vec<String> =
+                                        self.graph_state.nodes.keys().cloned().collect();
+                                    ordered_ids.sort();
+                                    let anchor = chat
+                                        .macro_selection_anchor
+                                        .clone()
+                                        .unwrap_or_else(|| id.clone());
+                                    let anchor_idx = ordered_ids
+                                        .iter()
+                                        .position(|x| x == &anchor)
+                                        .unwrap_or(0);
+                                    let id_idx =
+                                        ordered_ids.iter().position(|x| x == &id).unwrap_or(anchor_idx);
+                                    let start = anchor_idx.min(id_idx);
+                                    let end = anchor_idx.max(id_idx);
+                                    chat.macro_selected_node_ids.clear();
+                                    for selected_id in &ordered_ids[start..=end] {
+                                        chat.macro_selected_node_ids.insert(selected_id.clone());
+                                    }
+                                } else if ctrl {
+                                    if chat.macro_selected_node_ids.contains(&id) {
+                                        chat.macro_selected_node_ids.remove(&id);
+                                    } else {
+                                        chat.macro_selected_node_ids.insert(id.clone());
+                                    }
+                                    chat.macro_selection_anchor = Some(id.clone());
+                                } else {
+                                    chat.macro_selected_node_ids.clear();
+                                    chat.macro_selected_node_ids.insert(id.clone());
+                                    chat.macro_selection_anchor = Some(id.clone());
+                                }
+                            } else {
+                                self.graph_state.set_current_leaf(id.clone());
+                                if let Some(node) = self.graph_state.get_node(&id) {
+                                    let center = node.position + node.size * 0.5;
+                                    chat.constellation_view.center_camera_on(center);
+                                    chat.constellation_view.reset_zoom_to_normal();
+                                }
+                            }
+                            chat.input_field.on_blur();
+                            chat.context_pool_dropdown.close();
+                            self.focused_input = None;
+                        }
+                    }
+                }
+            }
             chat.constellation_view.pan_drag_start = None;
         }
-        
+        self.pending_constellation_click = None;
+        self.shard_move_drag = None;
+        self.shard_resize_drag = None;
+
         self.is_dragging = false;
         self.drag_button = None;
         self.drag_state = crate::ui::events::DragState::None;
@@ -2432,6 +3630,8 @@ impl App {
     pub fn on_cursor_moved(&mut self, pos: winit::dpi::PhysicalPosition<f64>) {
         let old_pos = self.mouse_pos;
         self.mouse_pos = Vec2::new(pos.x as f32, pos.y as f32);
+
+        self.desired_cursor_icon = CursorIcon::Default;
         
         // Handle drag operations
         if self.is_dragging {
@@ -2455,6 +3655,69 @@ impl App {
 
         // Update hover state (mouse enter/leave tracking)
         self.update_hover_state(old_pos);
+
+        // Constellation hover: track which shard is under the cursor and tooltip
+        if let Some(ref mut chat) = self.chat_window {
+            if self.ui_state.active_tab == Tab::Chat && self.graph_state.constellation_view_active() {
+                let hit = chat.hit_test(self.mouse_pos, &self.graph_state);
+                let track_hover = chat.constellation_interactive_rect.contains_point(self.mouse_pos)
+                    || constellation_hit_node_id(&hit).is_some()
+                    || constellation_tooltip_text(&hit, &self.graph_state).is_some();
+                if track_hover {
+                    chat.hovered_node_id = constellation_hit_node_id(&hit);
+                    self.constellation_tooltip = if chat.constellation_macro_active() {
+                        macro_constellation_tooltip(&hit, &self.graph_state, self.mouse_pos)
+                    } else {
+                        constellation_tooltip_text(&hit, &self.graph_state).map(|s| {
+                            ConstellationTooltip::Simple {
+                                text: s,
+                                position: self.mouse_pos,
+                            }
+                        })
+                    };
+                    let ctrl = self.modifiers.contains(ModifiersState::SUPER)
+                        || self.modifiers.contains(ModifiersState::CONTROL);
+                    use crate::ui::chat_window::ChatHit;
+                    self.desired_cursor_icon = if chat.constellation_view.pan_drag_start.is_some() {
+                        CursorIcon::Grabbing
+                    } else if self.shard_move_drag.is_some() {
+                        CursorIcon::Grabbing
+                    } else if self.shard_resize_drag.is_some() {
+                        CursorIcon::AllScroll
+                    } else if matches!(hit, ChatHit::ConstellationMoveHandle(_)) {
+                        CursorIcon::Move
+                    } else if matches!(hit, ChatHit::ConstellationResizeHandle(_)) {
+                        CursorIcon::AllScroll
+                    } else if ctrl {
+                        CursorIcon::ZoomIn
+                    } else if matches!(hit, ChatHit::ConstellationEditTextarea | ChatHit::ConstellationNoteInput) {
+                        CursorIcon::Text
+                    } else {
+                        CursorIcon::Default
+                    };
+                } else {
+                    chat.hovered_node_id = None;
+                    self.constellation_tooltip = None;
+                }
+            } else {
+                chat.hovered_node_id = None;
+                self.constellation_tooltip = None;
+            }
+        }
+
+        if self.ui_state.active_tab == Tab::Data {
+            if let Some(ref ingest) = self.ingest_window {
+                if ingest.submit_button.contains(self.mouse_pos)
+                    || ingest.bib_upload_button.contains(self.mouse_pos)
+                    || ingest.browse_button.contains(self.mouse_pos)
+                    || ingest.ingest_button.contains(self.mouse_pos)
+                    || (ingest.show_view_failures_button
+                        && ingest.view_failures_button.contains(self.mouse_pos))
+                {
+                    self.desired_cursor_icon = CursorIcon::Pointer;
+                }
+            }
+        }
 
         self.header.on_mouse_move(self.mouse_pos);
         
@@ -2534,10 +3797,13 @@ impl App {
         use winit::event::MouseScrollDelta;
         use crate::ui::tab_bar::Tab;
 
-        let scroll_amount = match delta {
-            MouseScrollDelta::LineDelta(_, y) => y * 20.0,
-            MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
+        let (scroll_amount, scroll_amount_x) = match delta {
+            MouseScrollDelta::LineDelta(x, y) => (y * 20.0, x * 20.0),
+            MouseScrollDelta::PixelDelta(pos) => (pos.y as f32, pos.x as f32),
         };
+        let ctrl = self.modifiers.contains(winit::keyboard::ModifiersState::SUPER)
+            || self.modifiers.contains(winit::keyboard::ModifiersState::CONTROL);
+        let shift = self.modifiers.contains(winit::keyboard::ModifiersState::SHIFT);
 
         // Handle scrolling for sidebar conversations and documents
         if self.sidebar.hit_test(self.mouse_pos) {
@@ -2546,10 +3812,12 @@ impl App {
                 // Update highlight bar position after scrolling
                 use crate::persistence::DocumentPersistence;
                 let document_ids = DocumentPersistence::list_documents().unwrap_or_default();
+                let collection_ids = self.library_window.as_ref().map(|w| w.collections.iter().map(|c| c.id).collect::<Vec<i32>>()).unwrap_or_default();
                 self.sidebar.update_hover_state(
                     self.mouse_pos,
                     &self.chat_state.conversations,
                     &document_ids,
+                    &collection_ids,
                     &self.insights_state.insights,
                 );
             } else if self.sidebar.documents_list.contains(self.mouse_pos - self.sidebar.position) {
@@ -2557,20 +3825,36 @@ impl App {
                 // Update highlight bar position after scrolling
                 use crate::persistence::DocumentPersistence;
                 let document_ids = DocumentPersistence::list_documents().unwrap_or_default();
+                let collection_ids = self.library_window.as_ref().map(|w| w.collections.iter().map(|c| c.id).collect::<Vec<i32>>()).unwrap_or_default();
                 self.sidebar.update_hover_state(
                     self.mouse_pos,
                     &self.chat_state.conversations,
                     &document_ids,
+                    &collection_ids,
+                    &self.insights_state.insights,
+                );
+            } else if self.sidebar.collections_list.contains(self.mouse_pos - self.sidebar.position) {
+                self.sidebar.collections_list.scroll(-scroll_amount);
+                use crate::persistence::DocumentPersistence;
+                let document_ids = DocumentPersistence::list_documents().unwrap_or_default();
+                let collection_ids = self.library_window.as_ref().map(|w| w.collections.iter().map(|c| c.id).collect::<Vec<i32>>()).unwrap_or_default();
+                self.sidebar.update_hover_state(
+                    self.mouse_pos,
+                    &self.chat_state.conversations,
+                    &document_ids,
+                    &collection_ids,
                     &self.insights_state.insights,
                 );
             } else if self.sidebar.insights_panel.insights_list.contains(self.mouse_pos) {
                 self.sidebar.insights_panel.insights_list.scroll(-scroll_amount);
                 use crate::persistence::DocumentPersistence;
                 let document_ids = DocumentPersistence::list_documents().unwrap_or_default();
+                let collection_ids = self.library_window.as_ref().map(|w| w.collections.iter().map(|c| c.id).collect::<Vec<i32>>()).unwrap_or_default();
                 self.sidebar.update_hover_state(
                     self.mouse_pos,
                     &self.chat_state.conversations,
                     &document_ids,
+                    &collection_ids,
                     &self.insights_state.insights,
                 );
             }
@@ -2580,18 +3864,18 @@ impl App {
         if let Some(ref mut library) = self.library_window {
             if self.ui_state.active_tab == Tab::Library {
                 // Check if mouse is over collections list
-                if library.collections_list.contains(self.mouse_pos - library.position) {
+                if library.collections_list.contains(self.mouse_pos) {
                     library.collections_list.scroll(-scroll_amount);
                 }
                 // Check if mouse is over papers list
-                else if library.papers_list.contains(self.mouse_pos - library.position) {
+                else if library.papers_list.contains(self.mouse_pos) {
                     library.papers_list.scroll(-scroll_amount);
                 }
             }
         }
 
         // Handle scrolling for Settings tab
-        if let Some(ref mut settings) = self.settings_window {
+        if let Some(settings) = self.settings_window.get_mut().as_mut() {
             if self.ui_state.active_tab == Tab::Settings && settings.scroll_view.contains(self.mouse_pos - settings.position) {
                 settings.scroll_view.scroll(-scroll_amount);
             }
@@ -2600,53 +3884,124 @@ impl App {
         // Handle scrolling for Chat tab
         if let Some(ref mut chat) = self.chat_window {
             if self.ui_state.active_tab == Tab::Chat {
-                if self.graph_state.graph_id.is_some() && chat.constellation_view.contains_screen(self.mouse_pos) {
-                    use crate::ui::chat_window::ChatHit;
+                if self.graph_state.constellation_view_active() && chat.constellation_view.contains_screen(self.mouse_pos) {
+                    use crate::ui::chat_window::{BubbleScroll, ChatHit};
                     let hit = chat.hit_test(self.mouse_pos, &self.graph_state);
-                    let scale = chat.constellation_view.scale_animated;
-                    const PAD: f32 = 8.0;
-                    const ACTION_ROW: f32 = 28.0;
-                    const BUBBLE_SPACING: f32 = 6.0;
-                    const MSG_BUTTON_RESERVE: f32 = 22.0;
-                    let visible_text_height = |node: &crate::state::ConstellationNode| {
-                        let content_h = (node.size.y - PAD * 2.0 - ACTION_ROW - BUBBLE_SPACING).max(0.0) * 0.5;
-                        (content_h - PAD * 2.0 - MSG_BUTTON_RESERVE).max(0.0)
-                    };
-                    match hit {
-                        ChatHit::ConstellationUserBubbleContent(node_id) => {
-                            let node = self.graph_state.get_node(&node_id).expect("node");
-                            let visible = visible_text_height(node);
-                            let overflow_screen = ((node.user_text_height - visible).max(0.0)) * scale;
-                            if overflow_screen > 0.0 {
-                                let mut targets = chat.constellation_scroll_targets.borrow_mut();
-                                let (u, a) = targets.get(&node_id).copied().unwrap_or((0.0, 0.0));
-                                let new_u = (u + scroll_amount * 20.0).clamp(0.0, overflow_screen);
-                                targets.insert(node_id, (new_u, a));
-                            } else {
+                    if hit.is_constellation_wheel_viewport_target() {
+                        let scale = chat.constellation_view.scale_animated;
+                        const PAD: f32 = 8.0;
+                        const SHARD_INSET: f32 = 10.0;
+                        const ACTION_ROW: f32 = 28.0;
+                        const BUBBLE_SPACING: f32 = 6.0;
+                        const MSG_BUTTON_RESERVE: f32 = 22.0;
+                        let visible_text_height = |node: &crate::state::ConstellationNode| {
+                            let content_h = (node.size.y - PAD * 2.0 - ACTION_ROW - BUBBLE_SPACING).max(0.0) * 0.5;
+                            (content_h - PAD * 2.0 - MSG_BUTTON_RESERVE).max(0.0)
+                        };
+                        // Visible inner text width (world units) inside a bubble, bounded by shard width.
+                        let visible_text_width = |node: &crate::state::ConstellationNode| {
+                            (node.size.x - PAD * 2.0 - SHARD_INSET * 2.0).max(0.0)
+                        };
+                        let do_viewport_pan_or_zoom = |chat: &mut ChatWindow| {
+                            if ctrl {
                                 let factor = if scroll_amount > 0.0 { 1.1 } else { 1.0 / 1.1 };
                                 chat.constellation_view.zoom(factor);
-                            }
-                        }
-                        ChatHit::ConstellationAssistantBubbleContent(node_id) => {
-                            let node = self.graph_state.get_node(&node_id).expect("node");
-                            let visible = visible_text_height(node);
-                            let overflow_screen = ((node.assistant_text_height - visible).max(0.0)) * scale;
-                            if overflow_screen > 0.0 {
-                                let mut targets = chat.constellation_scroll_targets.borrow_mut();
-                                let (u, a) = targets.get(&node_id).copied().unwrap_or((0.0, 0.0));
-                                let new_a = (a + scroll_amount * 20.0).clamp(0.0, overflow_screen);
-                                targets.insert(node_id, (u, new_a));
+                            } else if shift {
+                                chat.constellation_view.pan(Vec2::new(-scroll_amount, 0.0));
                             } else {
-                                let factor = if scroll_amount > 0.0 { 1.1 } else { 1.0 / 1.1 };
-                                chat.constellation_view.zoom(factor);
+                                chat.constellation_view.pan(Vec2::new(0.0, scroll_amount));
                             }
-                        }
-                        ChatHit::ConstellationNode(_) | _ => {
-                            let factor = if scroll_amount > 0.0 { 1.1 } else { 1.0 / 1.1 };
-                            chat.constellation_view.zoom(factor);
+                        };
+                        // Horizontal delta: trackpad native x + shift+wheel treats y as x.
+                        let raw_h_delta = scroll_amount_x + if shift { scroll_amount } else { 0.0 };
+                        // Vertical delta: regular wheel when not shift/ctrl.
+                        let raw_v_delta = if !shift && !ctrl { scroll_amount } else { 0.0 };
+                        // Scroll a bubble's x/y offset; returns (consumed_x, consumed_y).
+                        let mut scroll_bubble =
+                            |chat: &mut ChatWindow,
+                             node: &crate::state::ConstellationNode,
+                             node_id: &str,
+                             is_user: bool,
+                             dx: f32,
+                             dy: f32|
+                             -> (bool, bool) {
+                                let text_h = if is_user {
+                                    node.user_text_height
+                                } else {
+                                    node.assistant_text_height
+                                };
+                                let text_w = if is_user {
+                                    node.user_text_width
+                                } else {
+                                    node.assistant_text_width
+                                };
+                                let visible_h = visible_text_height(node);
+                                let visible_w = visible_text_width(node);
+                                let overflow_y_screen =
+                                    ((text_h - visible_h).max(0.0)) * scale;
+                                let overflow_x_screen =
+                                    ((text_w - visible_w).max(0.0)) * scale;
+                                let mut targets = chat.constellation_scroll_targets.borrow_mut();
+                                let mut current = targets
+                                    .get(node_id)
+                                    .copied()
+                                    .unwrap_or(BubbleScroll::default());
+                                let mut consumed_x = false;
+                                let mut consumed_y = false;
+                                if is_user {
+                                    if overflow_x_screen > 0.0 && dx.abs() > 0.0 {
+                                        current.user.x = (current.user.x + dx * 20.0)
+                                            .clamp(0.0, overflow_x_screen);
+                                        consumed_x = true;
+                                    }
+                                    if overflow_y_screen > 0.0 && dy.abs() > 0.0 {
+                                        current.user.y = (current.user.y + dy * 20.0)
+                                            .clamp(0.0, overflow_y_screen);
+                                        consumed_y = true;
+                                    }
+                                } else {
+                                    if overflow_x_screen > 0.0 && dx.abs() > 0.0 {
+                                        current.assistant.x = (current.assistant.x + dx * 20.0)
+                                            .clamp(0.0, overflow_x_screen);
+                                        consumed_x = true;
+                                    }
+                                    if overflow_y_screen > 0.0 && dy.abs() > 0.0 {
+                                        current.assistant.y = (current.assistant.y + dy * 20.0)
+                                            .clamp(0.0, overflow_y_screen);
+                                        consumed_y = true;
+                                    }
+                                }
+                                targets.insert(node_id.to_string(), current);
+                                (consumed_x, consumed_y)
+                            };
+                        let bubble_hit = match hit {
+                            ChatHit::ConstellationUserBubbleContent(id) => Some((id, true)),
+                            ChatHit::ConstellationAssistantBubbleContent(id) => Some((id, false)),
+                            _ => None,
+                        };
+                        match bubble_hit {
+                            Some((node_id, is_user)) if !ctrl => {
+                                let node = self.graph_state.get_node(&node_id).expect("node");
+                                let (cx, cy) = scroll_bubble(
+                                    chat,
+                                    node,
+                                    &node_id,
+                                    is_user,
+                                    raw_h_delta,
+                                    raw_v_delta,
+                                );
+                                if !cy && raw_v_delta.abs() > 0.0 {
+                                    chat.constellation_view
+                                        .pan(Vec2::new(0.0, raw_v_delta));
+                                }
+                                if !cx && raw_h_delta.abs() > 0.0 {
+                                    chat.constellation_view
+                                        .pan(Vec2::new(-raw_h_delta, 0.0));
+                                }
+                            }
+                            _ => do_viewport_pan_or_zoom(chat),
                         }
                     }
-                    self.physics_idle_timer = 0.0;
                 } else if chat.message_list.contains(self.mouse_pos - chat.position) {
                     chat.message_list.scroll(-scroll_amount);
                     chat.message_list.scroll_velocity = scroll_amount;
@@ -2756,13 +4111,13 @@ impl App {
                         if chat.adding_note_msg_idx.is_some() || chat.editing_note.is_some() {
                             let msg_idx = chat.adding_note_msg_idx.or(chat.editing_note.map(|(m, _)| m)).unwrap();
                             let shard_id = chat.messages.get(msg_idx).and_then(|m| m.shard_id.clone());
-                            if chat.save_note() {
-                                let msgs = chat.messages.clone();
-                                send_messages_after = Some(msgs.clone());
-                                send_note_sync_after = shard_id.as_ref().map(|sid| (sid.clone(), msgs[msg_idx].notes.clone()));
+                            if !chat.save_note() {
                                 return;
                             }
-                            return;
+                            let msgs = chat.messages.clone();
+                            send_messages_after = Some(msgs.clone());
+                            send_note_sync_after =
+                                shard_id.as_ref().map(|sid| (sid.clone(), msgs[msg_idx].notes.clone()));
                         }
                     }
                     let had_note_save = send_messages_after.is_some();
@@ -2777,10 +4132,12 @@ impl App {
                                 node.shard.notes = notes.clone();
                                 self.graph_state.bump_content_version();
                             }
+                            self.apply_graph_messages_to_chat_and_state();
                             let base_url = self.api_client.base_url.clone();
+                            let graph_id = self.graph_state.graph_id.clone().unwrap();
                             tokio::spawn(async move {
                                 let api_client = crate::api::ApiClient::new(Some(base_url));
-                                let _ = api_client.update_shard(&sid, None, None, None, Some(notes)).await;
+                                let _ = api_client.patch_shard(&graph_id, &sid, None, Some(notes)).await;
                             });
                         }
                     }
@@ -2791,42 +4148,57 @@ impl App {
                     // Handle new collection creation
                     if let Some(ref mut library) = self.library_window {
                         if self.ui_state.active_tab == Tab::Library && library.is_creating_collection {
-                            let collection_name = library.new_collection_input.text.trim().to_string();
-                            if !collection_name.is_empty() {
-                                let _base_url = self.api_client.base_url.clone();
-                                let _client = self.api_client.client.clone();
-                                let collection_name_clone = collection_name.clone();
-                                let base_url_clone = self.api_client.base_url.clone();
-                                let sender = self.collections_sender.clone();
-                                tokio::spawn(async move {
-                                    let api_client = crate::api::ApiClient::new(Some(base_url_clone.clone()));
-                                    match api_client.create_collection(&collection_name_clone).await {
-                                        Ok(_) => {
-                                            // Reload collections after creation
-                                            let client = reqwest::Client::new();
-                                            let url = format!("{}/collections", base_url_clone);
-                                            if let Ok(resp) = client.get(&url).send().await {
-                                                if resp.status().is_success() {
-                                                    if let Ok(collections) = resp.json::<Vec<Collection>>().await {
-                                                        let _ = sender.send(Ok(collections));
-                                                    }
+                            let mut collection_name = library.new_collection_input.text.trim().to_string();
+                            if collection_name.is_empty() {
+                                collection_name = "New Collection".to_string();
+                            }
+                            let collection_name_clone = collection_name.clone();
+                            let base_url_clone = self.api_client.base_url.clone();
+                            let sender = self.collections_sender.clone();
+                            let rename_target = library.rename_target_collection_id;
+                            tokio::spawn(async move {
+                                let api_client = crate::api::ApiClient::new(Some(base_url_clone.clone()));
+                                let op_result = if let Some(collection_id) = rename_target {
+                                    api_client.update_collection(collection_id, &collection_name_clone).await
+                                } else {
+                                    api_client.create_collection(&collection_name_clone).await.map(|_| ())
+                                };
+                                match op_result {
+                                    Ok(_) => {
+                                        let client = reqwest::Client::new();
+                                        let url = format!("{}/collections", base_url_clone);
+                                        if let Ok(resp) = client.get(&url).send().await {
+                                            if resp.status().is_success() {
+                                                if let Ok(collections) = resp.json::<Vec<Collection>>().await {
+                                                    let _ = sender.send(Ok(collections));
                                                 }
                                             }
                                         }
-                                        Err(e) => {
-                                            eprintln!("Failed to create collection: {}", e);
-                                            let _ = sender.send(Err(format!("Failed to create collection: {}", e)));
-                                        }
                                     }
-                                });
-                                library.new_collection_input.text.clear();
-                                library.is_creating_collection = false;
-                                library.new_collection_input.on_blur();
-                                self.focused_input = None;
-                                self.show_success_toast(format!("Creating collection: {}", collection_name));
-                            }
+                                    Err(e) => {
+                                        eprintln!("Failed to save collection: {}", e);
+                                        let _ = sender.send(Err(format!("Failed to save collection: {}", e)));
+                                    }
+                                }
+                            });
+                            library.new_collection_input.text.clear();
+                            library.is_creating_collection = false;
+                            library.rename_target_collection_id = None;
+                            library.new_collection_input.on_blur();
+                            self.focused_input = None;
+                            self.show_success_toast(format!("Saving collection: {}", collection_name));
                             return;
                         }
+                    }
+
+                    if self.ui_state.active_tab == Tab::Data && self.focused_input == Some(2) {
+                        if let Some(ref ingest) = self.ingest_window {
+                            if ingest.is_ingesting {
+                                return;
+                            }
+                        }
+                        self.start_ingestion();
+                        return;
                     }
                     
                     // Handle notepad modal - Enter to load selected note
@@ -2889,13 +4261,57 @@ impl App {
                         return;
                     }
                     
+                    if self.ui_state.active_tab == Tab::Notepad {
+                        if let Some(ref mut notepad) = self.notepad_window {
+                            if notepad.mention_popup_open && !notepad.mention_rows.is_empty() {
+                                let idx = notepad.mention_selected_index;
+                                notepad.apply_mention_row_selection(idx);
+                                notepad.sync_mention_popup_from_editor(
+                                    &self.papers_cache,
+                                    &self.graph_state,
+                                    &self.chat_state.conversations,
+                                    &notepad_documents_for_mentions(),
+                                );
+                                return;
+                            }
+                        }
+                    }
+
+                    // Notepad editor: Enter inserts a newline within the current block.
+                    // Each block is treated as a mini-document page; Enter does not create new blocks.
+                    if self.ui_state.active_tab == Tab::Notepad && self.focused_input == Some(5) {
+                        if let Some(ref mut notepad) = self.notepad_window {
+                            notepad.editor.insert_text("\n");
+                        }
+                        return;
+                    }
+                    
+                    if let Some(ref mut chat) = self.chat_window {
+                        if chat.mention_popup_open && !chat.mention_rows.is_empty() {
+                            let idx = chat.mention_selected_index;
+                            chat.apply_mention_row_selection(
+                                idx,
+                                &self.papers_cache,
+                                &self.graph_state,
+                                &self.chat_state.conversations,
+                            );
+                            chat.sync_mention_popup_from_input(
+                                &self.papers_cache,
+                                &self.graph_state,
+                                &self.chat_state.conversations,
+                                &notepad_documents_for_mentions(),
+                            );
+                            return;
+                        }
+                    }
+                    
                     let enter_send_provider = self.settings_state.provider.clone();
                     let enter_send_model_id = self.settings_state.model_id_for_send();
                     let enter_send_openai_model = self.settings_state.openai_model_for_send();
                     let mut enter_send_pending: Option<(String, crate::api::models::GraphSendRequest, String)> = None;
                     if let Some(ref mut chat) = self.chat_window {
                         if self.ui_state.active_tab == Tab::Chat && chat.input_field.focused {
-                            if let Some(text) = chat.send_message() {
+                            if let Some((text, system_prompt, mentions)) = chat.send_message(&self.settings_state.system_prompts) {
                                 if self.graph_state.graph_id.is_some() {
                                     let graph_id = self.graph_state.graph_id.clone().unwrap();
                                     let leaf_id = self.graph_state.current_leaf_id.clone().unwrap_or_default();
@@ -2908,6 +4324,8 @@ impl App {
                                         temperature: None,
                                         max_tokens: None,
                                         model_token_limit: None,
+                                        system_prompt,
+                                        mentions,
                                     };
                                     let user_msg = crate::ui::chat_window::ChatMessage::from_legacy(
                                         crate::ui::chat_window::MessageRole::User,
@@ -2971,6 +4389,13 @@ impl App {
                 }
                 KeyCode::Escape => {
                     // Handle escape key for all modals
+                    if self.system_prompts_modal.is_open {
+                        self.settings_state.system_prompts = self.system_prompts_modal.prompts.clone();
+                        let _ = SettingsPersistence::save_settings(&self.settings_state);
+                        self.system_prompts_modal.close();
+                        self.focused_input = None;
+                        return;
+                    }
                     if self.shard_modal.is_open {
                         self.shard_modal.close();
                         self.focused_input = None;
@@ -3033,6 +4458,28 @@ impl App {
                         }
                         return;
                     }
+
+                    if let Some(ref mut chat) = self.chat_window {
+                        if self.ui_state.active_tab == Tab::Chat && chat.constellation_macro_active() {
+                            let restore_id = chat
+                                .last_active_node_before_macro
+                                .clone()
+                                .or_else(|| self.graph_state.current_leaf_id.clone());
+                            if let Some(id) = restore_id {
+                                self.graph_state.set_current_leaf(id.clone());
+                                if let Some(node) = self.graph_state.get_node(&id) {
+                                    let center = node.position + node.size * 0.5;
+                                    chat.constellation_view.center_camera_on(center);
+                                    chat.constellation_view.reset_zoom_to_normal();
+                                }
+                                chat.macro_selected_node_ids.clear();
+                                chat.macro_selected_node_ids.insert(id);
+                                chat.macro_selection_anchor = chat.macro_selected_node_ids.iter().next().cloned();
+                                chat.last_active_node_before_macro = None;
+                                return;
+                            }
+                        }
+                    }
                 }
                     KeyCode::Backspace => {
                     let ctrl_pressed = self.modifiers.contains(ModifiersState::CONTROL);
@@ -3070,22 +4517,38 @@ impl App {
                                 eprintln!("Failed to save settings: {}", e);
                             }
                         }
+                        Some(0) => {
+                            if let Some(ref mut chat) = self.chat_window {
+                                chat.sync_mention_popup_from_input(
+                                    &self.papers_cache,
+                                    &self.graph_state,
+                                    &self.chat_state.conversations,
+                                    &notepad_documents_for_mentions(),
+                                );
+                            }
+                        }
                         _ => {}
                     }
                 }
                     KeyCode::ArrowLeft => {
                     let shift_pressed = self.modifiers.contains(ModifiersState::SHIFT);
                     let ctrl_pressed = self.modifiers.contains(ModifiersState::CONTROL);
-                    let alt_pressed = self.modifiers.contains(ModifiersState::ALT);
 
-                    // Alt+Arrow: traverse graph (focus hop + center camera)
-                    if alt_pressed && self.ui_state.active_tab == Tab::Chat && self.graph_state.graph_id.is_some() && self.focused_input.is_none() {
-                        if let Some(ref leaf) = self.graph_state.current_leaf_id {
-                            let parents = self.graph_state.parent_ids(leaf);
-                            if let Some(first_parent) = parents.first() {
-                                self.graph_state.current_leaf_id = Some(first_parent.clone());
+                    // Ctrl+Left: Toggle sidebar (global, regardless of input focus)
+                    if ctrl_pressed && !shift_pressed {
+                        self.sidebar.toggle();
+                        self.ui_state.sidebar_open = self.sidebar.is_open;
+                        self.bump_layout_generation();
+                        return;
+                    }
+
+                    // Bare left arrow: previous sibling in constellation
+                    if !ctrl_pressed && !shift_pressed && self.ui_state.active_tab == Tab::Chat && self.graph_state.constellation_view_active() && self.focused_input.is_none() {
+                        if let Some(ref leaf) = self.graph_state.current_leaf_id.clone() {
+                            if let Some(prev) = self.graph_state.prev_sibling_id(leaf) {
+                                self.graph_state.set_current_leaf(prev.clone());
                                 if let Some(chat) = self.chat_window.as_mut() {
-                                    if let Some(node) = self.graph_state.get_node(first_parent) {
+                                    if let Some(node) = self.graph_state.get_node(&prev) {
                                         let center = node.position + node.size * 0.5;
                                         chat.constellation_view.center_camera_on(center);
                                         chat.constellation_view.reset_zoom_to_normal();
@@ -3095,17 +4558,7 @@ impl App {
                         }
                         return;
                     }
-                    
-                    // Ctrl+Left: Close sidebar (if no input is focused)
-                    if ctrl_pressed && self.focused_input.is_none() && !shift_pressed {
-                        if self.sidebar.is_open {
-                            self.sidebar.toggle();
-                            self.ui_state.sidebar_open = self.sidebar.is_open;
-                            self.bump_layout_generation();
-                        }
-                        return;
-                    }
-                    
+
                     // Use router for arrow key navigation
                     self.route_to_focused_editor(|editor| {
                         editor.on_arrow_left(shift_pressed, ctrl_pressed);
@@ -3114,16 +4567,14 @@ impl App {
                     KeyCode::ArrowRight => {
                     let shift_pressed = self.modifiers.contains(ModifiersState::SHIFT);
                     let ctrl_pressed = self.modifiers.contains(ModifiersState::CONTROL);
-                    let alt_pressed = self.modifiers.contains(ModifiersState::ALT);
 
-                    // Alt+Arrow: traverse graph
-                    if alt_pressed && self.ui_state.active_tab == Tab::Chat && self.graph_state.graph_id.is_some() && self.focused_input.is_none() {
-                        if let Some(ref leaf) = self.graph_state.current_leaf_id {
-                            let children = self.graph_state.children_ids(leaf);
-                            if let Some(first_child) = children.first() {
-                                self.graph_state.current_leaf_id = Some(first_child.clone());
+                    // Bare right arrow: next sibling in constellation
+                    if !ctrl_pressed && !shift_pressed && self.ui_state.active_tab == Tab::Chat && self.graph_state.constellation_view_active() && self.focused_input.is_none() {
+                        if let Some(ref leaf) = self.graph_state.current_leaf_id.clone() {
+                            if let Some(next) = self.graph_state.next_sibling_id(leaf) {
+                                self.graph_state.set_current_leaf(next.clone());
                                 if let Some(chat) = self.chat_window.as_mut() {
-                                    if let Some(node) = self.graph_state.get_node(first_child) {
+                                    if let Some(node) = self.graph_state.get_node(&next) {
                                         let center = node.position + node.size * 0.5;
                                         chat.constellation_view.center_camera_on(center);
                                         chat.constellation_view.reset_zoom_to_normal();
@@ -3133,17 +4584,7 @@ impl App {
                         }
                         return;
                     }
-                    
-                    // Ctrl+Right: Open sidebar (if no input is focused)
-                    if ctrl_pressed && self.focused_input.is_none() && !shift_pressed {
-                        if !self.sidebar.is_open {
-                            self.sidebar.toggle();
-                            self.ui_state.sidebar_open = self.sidebar.is_open;
-                            self.bump_layout_generation();
-                        }
-                        return;
-                    }
-                    
+
                     // Use router for arrow key navigation
                     self.route_to_focused_editor(|editor| {
                         editor.on_arrow_right(shift_pressed, ctrl_pressed);
@@ -3153,7 +4594,7 @@ impl App {
                     let shift_pressed = self.modifiers.contains(ModifiersState::SHIFT);
                     let alt_pressed = self.modifiers.contains(ModifiersState::ALT);
                     // Alt+Home: center camera on active node (constellation)
-                    if alt_pressed && self.ui_state.active_tab == Tab::Chat && self.graph_state.graph_id.is_some() {
+                    if alt_pressed && self.ui_state.active_tab == Tab::Chat && self.graph_state.constellation_view_active() {
                         if let Some(ref leaf) = self.graph_state.current_leaf_id {
                             if let Some(chat) = self.chat_window.as_mut() {
                                 if let Some(node) = self.graph_state.get_node(leaf) {
@@ -3173,7 +4614,7 @@ impl App {
                     KeyCode::KeyF => {
                     let alt_pressed = self.modifiers.contains(ModifiersState::ALT);
                     // Alt+F: fit graph in view (constellation)
-                    if alt_pressed && self.ui_state.active_tab == Tab::Chat && self.graph_state.graph_id.is_some() {
+                    if alt_pressed && self.ui_state.active_tab == Tab::Chat && self.graph_state.constellation_view_active() {
                         if let Some(chat) = self.chat_window.as_mut() {
                             if let Some((min, max)) = self.graph_state.compute_bbox() {
                                 chat.constellation_view.fit_in_view(min, max, 40.0);
@@ -3191,7 +4632,7 @@ impl App {
                 }
                 KeyCode::KeyA => {
                     // Ctrl+A for select all
-                    if self.modifiers.contains(ModifiersState::CONTROL) {
+                    if self.clipboard_shortcut_mod() {
                         match self.focused_input {
                             Some(0) => {
                                 if let Some(ref mut chat) = self.chat_window {
@@ -3208,7 +4649,7 @@ impl App {
                                     ingest.pdf_dir_input.select_all();
                                 }
                             }
-                            Some(6) => {
+                            Some(14) => {
                                 if self.insight_modal.is_editing_title {
                                     self.insight_modal.title_input.select_all();
                                 }
@@ -3229,13 +4670,77 @@ impl App {
                                     notepad.editor.select_all();
                                 }
                             }
+                            Some(3) => {
+                                if let Some(settings) = self.settings_window.get_mut().as_mut() {
+                                    settings.hf_token_input.select_all();
+                                }
+                            }
+                            Some(4) => {
+                                if let Some(settings) = self.settings_window.get_mut().as_mut() {
+                                    settings.model_id_input.select_all();
+                                }
+                            }
+                            Some(6) => {
+                                if let Some(settings) = self.settings_window.get_mut().as_mut() {
+                                    settings.openai_model_input.select_all();
+                                }
+                            }
+                            Some(9) => {
+                                if let Some(ref mut library) = self.library_window {
+                                    if library.is_creating_collection {
+                                        library.new_collection_input.select_all();
+                                    }
+                                }
+                            }
+                            Some(10) => {
+                                if let Some(ref mut chat) = self.chat_window {
+                                    if chat.editing_message_idx.is_some() {
+                                        chat.edit_textarea.select_all();
+                                    }
+                                }
+                            }
+                            Some(11) => {
+                                self.global_search_modal.search_input.select_all();
+                            }
+                            Some(12) => {
+                                if let Some(ref mut notepad) = self.notepad_window {
+                                    notepad.title_input.select_all();
+                                }
+                            }
+                            Some(13) => {
+                                if let Some(ref mut chat) = self.chat_window {
+                                    if chat.adding_note_msg_idx.is_some() || chat.editing_note.is_some() {
+                                        chat.note_input.select_all();
+                                    }
+                                }
+                            }
+                            Some(20) => {
+                                if self.shard_modal.is_open {
+                                    self.shard_modal.user_input.select_all();
+                                }
+                            }
+                            Some(21) => {
+                                if self.shard_modal.is_open {
+                                    self.shard_modal.assistant_input.select_all();
+                                }
+                            }
+                            Some(22) => {
+                                if self.system_prompts_modal.is_open {
+                                    self.system_prompts_modal.name_input.select_all();
+                                }
+                            }
+                            Some(23) => {
+                                if self.system_prompts_modal.is_open {
+                                    self.system_prompts_modal.content_input.select_all();
+                                }
+                            }
                             _ => {}
                         }
                     }
                 }
                 KeyCode::KeyZ => {
                     // Ctrl+Z for undo
-                    if self.modifiers.contains(ModifiersState::CONTROL) {
+                    if self.clipboard_shortcut_mod() {
                         match self.focused_input {
                             Some(0) => {
                                 if let Some(ref mut chat) = self.chat_window {
@@ -3273,7 +4778,7 @@ impl App {
                                     }
                                 }
                             }
-                            Some(6) => {
+                            Some(14) => {
                                 if self.insight_modal.is_editing_title {
                                     let current_text = self.insight_modal.title_input.text.clone();
                                     if let Some(previous_text) = self.undo_history.pop() {
@@ -3312,13 +4817,165 @@ impl App {
                                     }
                                 }
                             }
+                            Some(3) => {
+                                if let Some(settings) = self.settings_window.get_mut().as_mut() {
+                                    let current_text = settings.hf_token_input.text.clone();
+                                    if let Some(previous_text) = self.undo_history.pop() {
+                                        self.redo_history.push(current_text);
+                                        settings.hf_token_input.text = previous_text;
+                                        settings.hf_token_input.cursor_position = settings.hf_token_input.text.chars().count();
+                                        settings.hf_token_input.clear_selection();
+                                        settings.hf_token_input.ensure_cursor_valid();
+                                        self.settings_state.hf_token = settings.hf_token_input.text.clone();
+                                    }
+                                }
+                            }
+                            Some(4) => {
+                                if let Some(settings) = self.settings_window.get_mut().as_mut() {
+                                    let current_text = settings.model_id_input.text.clone();
+                                    if let Some(previous_text) = self.undo_history.pop() {
+                                        self.redo_history.push(current_text);
+                                        settings.model_id_input.text = previous_text;
+                                        settings.model_id_input.cursor_position = settings.model_id_input.text.chars().count();
+                                        settings.model_id_input.clear_selection();
+                                        settings.model_id_input.ensure_cursor_valid();
+                                        self.settings_state.model_id = settings.model_id_input.text.clone();
+                                    }
+                                }
+                            }
+                            Some(6) => {
+                                if let Some(settings) = self.settings_window.get_mut().as_mut() {
+                                    let current_text = settings.openai_model_input.text.clone();
+                                    if let Some(previous_text) = self.undo_history.pop() {
+                                        self.redo_history.push(current_text);
+                                        settings.openai_model_input.text = previous_text;
+                                        settings.openai_model_input.cursor_position = settings.openai_model_input.text.chars().count();
+                                        settings.openai_model_input.clear_selection();
+                                        settings.openai_model_input.ensure_cursor_valid();
+                                        self.settings_state.openai_model = settings.openai_model_input.text.clone();
+                                    }
+                                }
+                            }
+                            Some(9) => {
+                                if let Some(ref mut library) = self.library_window {
+                                    if library.is_creating_collection {
+                                        let current_text = library.new_collection_input.text.clone();
+                                        if let Some(previous_text) = self.undo_history.pop() {
+                                            self.redo_history.push(current_text);
+                                            library.new_collection_input.text = previous_text;
+                                            library.new_collection_input.cursor_position = library.new_collection_input.text.chars().count();
+                                            library.new_collection_input.clear_selection();
+                                            library.new_collection_input.ensure_cursor_valid();
+                                        }
+                                    }
+                                }
+                            }
+                            Some(10) => {
+                                if let Some(ref mut chat) = self.chat_window {
+                                    if chat.editing_message_idx.is_some() {
+                                        let current_text = chat.edit_textarea.text.clone();
+                                        if let Some(previous_text) = self.undo_history.pop() {
+                                            self.redo_history.push(current_text);
+                                            chat.edit_textarea.text = previous_text;
+                                            chat.edit_textarea.cursor_position = chat.edit_textarea.text.chars().count();
+                                            chat.edit_textarea.clear_selection();
+                                            chat.edit_textarea.ensure_cursor_valid();
+                                        }
+                                    }
+                                }
+                            }
+                            Some(11) => {
+                                let current_text = self.global_search_modal.search_input.text.clone();
+                                if let Some(previous_text) = self.undo_history.pop() {
+                                    self.redo_history.push(current_text);
+                                    self.global_search_modal.search_input.text = previous_text;
+                                    self.global_search_modal.search_input.cursor_position = self.global_search_modal.search_input.text.chars().count();
+                                    self.global_search_modal.search_input.clear_selection();
+                                    self.global_search_modal.search_input.ensure_cursor_valid();
+                                }
+                            }
+                            Some(12) => {
+                                if let Some(ref mut notepad) = self.notepad_window {
+                                    let current_text = notepad.title_input.text.clone();
+                                    if let Some(previous_text) = self.undo_history.pop() {
+                                        self.redo_history.push(current_text);
+                                        notepad.title_input.text = previous_text;
+                                        notepad.title_input.cursor_position = notepad.title_input.text.chars().count();
+                                        notepad.title_input.clear_selection();
+                                        notepad.title_input.ensure_cursor_valid();
+                                        notepad.document_title = notepad.title_input.text.clone();
+                                    }
+                                }
+                            }
+                            Some(13) => {
+                                if let Some(ref mut chat) = self.chat_window {
+                                    if chat.adding_note_msg_idx.is_some() || chat.editing_note.is_some() {
+                                        let current_text = chat.note_input.text.clone();
+                                        if let Some(previous_text) = self.undo_history.pop() {
+                                            self.redo_history.push(current_text);
+                                            chat.note_input.text = previous_text;
+                                            chat.note_input.cursor_position = chat.note_input.text.chars().count();
+                                            chat.note_input.clear_selection();
+                                            chat.note_input.ensure_cursor_valid();
+                                        }
+                                    }
+                                }
+                            }
+                            Some(20) => {
+                                if self.shard_modal.is_open {
+                                    let current_text = self.shard_modal.user_input.text.clone();
+                                    if let Some(previous_text) = self.undo_history.pop() {
+                                        self.redo_history.push(current_text);
+                                        self.shard_modal.user_input.text = previous_text;
+                                        self.shard_modal.user_input.cursor_position = self.shard_modal.user_input.text.chars().count();
+                                        self.shard_modal.user_input.clear_selection();
+                                        self.shard_modal.user_input.ensure_cursor_valid();
+                                    }
+                                }
+                            }
+                            Some(21) => {
+                                if self.shard_modal.is_open {
+                                    let current_text = self.shard_modal.assistant_input.text.clone();
+                                    if let Some(previous_text) = self.undo_history.pop() {
+                                        self.redo_history.push(current_text);
+                                        self.shard_modal.assistant_input.text = previous_text;
+                                        self.shard_modal.assistant_input.cursor_position = self.shard_modal.assistant_input.text.chars().count();
+                                        self.shard_modal.assistant_input.clear_selection();
+                                        self.shard_modal.assistant_input.ensure_cursor_valid();
+                                    }
+                                }
+                            }
+                            Some(22) => {
+                                if self.system_prompts_modal.is_open {
+                                    let current_text = self.system_prompts_modal.name_input.text.clone();
+                                    if let Some(previous_text) = self.undo_history.pop() {
+                                        self.redo_history.push(current_text);
+                                        self.system_prompts_modal.name_input.text = previous_text;
+                                        self.system_prompts_modal.name_input.cursor_position = self.system_prompts_modal.name_input.text.chars().count();
+                                        self.system_prompts_modal.name_input.clear_selection();
+                                        self.system_prompts_modal.name_input.ensure_cursor_valid();
+                                    }
+                                }
+                            }
+                            Some(23) => {
+                                if self.system_prompts_modal.is_open {
+                                    let current_text = self.system_prompts_modal.content_input.text.clone();
+                                    if let Some(previous_text) = self.undo_history.pop() {
+                                        self.redo_history.push(current_text);
+                                        self.system_prompts_modal.content_input.text = previous_text;
+                                        self.system_prompts_modal.content_input.cursor_position = self.system_prompts_modal.content_input.text.chars().count();
+                                        self.system_prompts_modal.content_input.clear_selection();
+                                        self.system_prompts_modal.content_input.ensure_cursor_valid();
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
                 }
                 KeyCode::KeyY => {
                     // Ctrl+Y for redo
-                    if self.modifiers.contains(ModifiersState::CONTROL) {
+                    if self.clipboard_shortcut_mod() {
                         match self.focused_input {
                             Some(0) => {
                                 if let Some(ref mut chat) = self.chat_window {
@@ -3356,7 +5013,7 @@ impl App {
                                     }
                                 }
                             }
-                            Some(6) => {
+                            Some(14) => {
                                 if self.insight_modal.is_editing_title {
                                     let current_text = self.insight_modal.title_input.text.clone();
                                     if let Some(next_text) = self.redo_history.pop() {
@@ -3395,344 +5052,178 @@ impl App {
                                     }
                                 }
                             }
+                            Some(3) => {
+                                if let Some(settings) = self.settings_window.get_mut().as_mut() {
+                                    let current_text = settings.hf_token_input.text.clone();
+                                    if let Some(next_text) = self.redo_history.pop() {
+                                        self.undo_history.push(current_text);
+                                        settings.hf_token_input.text = next_text;
+                                        settings.hf_token_input.cursor_position = settings.hf_token_input.text.chars().count();
+                                        settings.hf_token_input.clear_selection();
+                                        settings.hf_token_input.ensure_cursor_valid();
+                                        self.settings_state.hf_token = settings.hf_token_input.text.clone();
+                                    }
+                                }
+                            }
+                            Some(4) => {
+                                if let Some(settings) = self.settings_window.get_mut().as_mut() {
+                                    let current_text = settings.model_id_input.text.clone();
+                                    if let Some(next_text) = self.redo_history.pop() {
+                                        self.undo_history.push(current_text);
+                                        settings.model_id_input.text = next_text;
+                                        settings.model_id_input.cursor_position = settings.model_id_input.text.chars().count();
+                                        settings.model_id_input.clear_selection();
+                                        settings.model_id_input.ensure_cursor_valid();
+                                        self.settings_state.model_id = settings.model_id_input.text.clone();
+                                    }
+                                }
+                            }
+                            Some(6) => {
+                                if let Some(settings) = self.settings_window.get_mut().as_mut() {
+                                    let current_text = settings.openai_model_input.text.clone();
+                                    if let Some(next_text) = self.redo_history.pop() {
+                                        self.undo_history.push(current_text);
+                                        settings.openai_model_input.text = next_text;
+                                        settings.openai_model_input.cursor_position = settings.openai_model_input.text.chars().count();
+                                        settings.openai_model_input.clear_selection();
+                                        settings.openai_model_input.ensure_cursor_valid();
+                                        self.settings_state.openai_model = settings.openai_model_input.text.clone();
+                                    }
+                                }
+                            }
+                            Some(9) => {
+                                if let Some(ref mut library) = self.library_window {
+                                    if library.is_creating_collection {
+                                        let current_text = library.new_collection_input.text.clone();
+                                        if let Some(next_text) = self.redo_history.pop() {
+                                            self.undo_history.push(current_text);
+                                            library.new_collection_input.text = next_text;
+                                            library.new_collection_input.cursor_position = library.new_collection_input.text.chars().count();
+                                            library.new_collection_input.clear_selection();
+                                            library.new_collection_input.ensure_cursor_valid();
+                                        }
+                                    }
+                                }
+                            }
+                            Some(10) => {
+                                if let Some(ref mut chat) = self.chat_window {
+                                    if chat.editing_message_idx.is_some() {
+                                        let current_text = chat.edit_textarea.text.clone();
+                                        if let Some(next_text) = self.redo_history.pop() {
+                                            self.undo_history.push(current_text);
+                                            chat.edit_textarea.text = next_text;
+                                            chat.edit_textarea.cursor_position = chat.edit_textarea.text.chars().count();
+                                            chat.edit_textarea.clear_selection();
+                                            chat.edit_textarea.ensure_cursor_valid();
+                                        }
+                                    }
+                                }
+                            }
+                            Some(11) => {
+                                let current_text = self.global_search_modal.search_input.text.clone();
+                                if let Some(next_text) = self.redo_history.pop() {
+                                    self.undo_history.push(current_text);
+                                    self.global_search_modal.search_input.text = next_text;
+                                    self.global_search_modal.search_input.cursor_position = self.global_search_modal.search_input.text.chars().count();
+                                    self.global_search_modal.search_input.clear_selection();
+                                    self.global_search_modal.search_input.ensure_cursor_valid();
+                                }
+                            }
+                            Some(12) => {
+                                if let Some(ref mut notepad) = self.notepad_window {
+                                    let current_text = notepad.title_input.text.clone();
+                                    if let Some(next_text) = self.redo_history.pop() {
+                                        self.undo_history.push(current_text);
+                                        notepad.title_input.text = next_text;
+                                        notepad.title_input.cursor_position = notepad.title_input.text.chars().count();
+                                        notepad.title_input.clear_selection();
+                                        notepad.title_input.ensure_cursor_valid();
+                                        notepad.document_title = notepad.title_input.text.clone();
+                                    }
+                                }
+                            }
+                            Some(13) => {
+                                if let Some(ref mut chat) = self.chat_window {
+                                    if chat.adding_note_msg_idx.is_some() || chat.editing_note.is_some() {
+                                        let current_text = chat.note_input.text.clone();
+                                        if let Some(next_text) = self.redo_history.pop() {
+                                            self.undo_history.push(current_text);
+                                            chat.note_input.text = next_text;
+                                            chat.note_input.cursor_position = chat.note_input.text.chars().count();
+                                            chat.note_input.clear_selection();
+                                            chat.note_input.ensure_cursor_valid();
+                                        }
+                                    }
+                                }
+                            }
+                            Some(20) => {
+                                if self.shard_modal.is_open {
+                                    let current_text = self.shard_modal.user_input.text.clone();
+                                    if let Some(next_text) = self.redo_history.pop() {
+                                        self.undo_history.push(current_text);
+                                        self.shard_modal.user_input.text = next_text;
+                                        self.shard_modal.user_input.cursor_position = self.shard_modal.user_input.text.chars().count();
+                                        self.shard_modal.user_input.clear_selection();
+                                        self.shard_modal.user_input.ensure_cursor_valid();
+                                    }
+                                }
+                            }
+                            Some(21) => {
+                                if self.shard_modal.is_open {
+                                    let current_text = self.shard_modal.assistant_input.text.clone();
+                                    if let Some(next_text) = self.redo_history.pop() {
+                                        self.undo_history.push(current_text);
+                                        self.shard_modal.assistant_input.text = next_text;
+                                        self.shard_modal.assistant_input.cursor_position = self.shard_modal.assistant_input.text.chars().count();
+                                        self.shard_modal.assistant_input.clear_selection();
+                                        self.shard_modal.assistant_input.ensure_cursor_valid();
+                                    }
+                                }
+                            }
+                            Some(22) => {
+                                if self.system_prompts_modal.is_open {
+                                    let current_text = self.system_prompts_modal.name_input.text.clone();
+                                    if let Some(next_text) = self.redo_history.pop() {
+                                        self.undo_history.push(current_text);
+                                        self.system_prompts_modal.name_input.text = next_text;
+                                        self.system_prompts_modal.name_input.cursor_position = self.system_prompts_modal.name_input.text.chars().count();
+                                        self.system_prompts_modal.name_input.clear_selection();
+                                        self.system_prompts_modal.name_input.ensure_cursor_valid();
+                                    }
+                                }
+                            }
+                            Some(23) => {
+                                if self.system_prompts_modal.is_open {
+                                    let current_text = self.system_prompts_modal.content_input.text.clone();
+                                    if let Some(next_text) = self.redo_history.pop() {
+                                        self.undo_history.push(current_text);
+                                        self.system_prompts_modal.content_input.text = next_text;
+                                        self.system_prompts_modal.content_input.cursor_position = self.system_prompts_modal.content_input.text.chars().count();
+                                        self.system_prompts_modal.content_input.clear_selection();
+                                        self.system_prompts_modal.content_input.ensure_cursor_valid();
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
                 }
                 KeyCode::KeyX => {
                     // Ctrl+X for cut
-                    if self.modifiers.contains(ModifiersState::CONTROL) {
-                        match self.focused_input {
-                            Some(0) => {
-                                if let Some(ref mut chat) = self.chat_window {
-                                    let selected = chat.input_field.get_selected_text();
-                                    let current_text = chat.input_field.text.clone();
-                                    if !selected.is_empty() {
-                                        self.clipboard_text = selected;
-                                        chat.input_field.delete_selection();
-                                        // Save state after deletion
-                                        self.undo_history.push(current_text);
-                                        self.redo_history.clear();
-                                        if self.undo_history.len() > 50 {
-                                            self.undo_history.remove(0);
-                                        }
-                                    }
-                                }
-                            }
-                            Some(1) => {
-                                if let Some(ref mut library) = self.library_window {
-                                    let selected = library.search_input.get_selected_text();
-                                    let current_text = library.search_input.text.clone();
-                                    if !selected.is_empty() {
-                                        self.clipboard_text = selected;
-                                        library.search_input.delete_selection();
-                                        // Save state for undo
-                                        self.undo_history.push(current_text);
-                                        self.redo_history.clear();
-                                        if self.undo_history.len() > 50 {
-                                            self.undo_history.remove(0);
-                                        }
-                                    }
-                                }
-                            }
-                            Some(2) => {
-                                if let Some(ref mut ingest) = self.ingest_window {
-                                    let selected = ingest.pdf_dir_input.get_selected_text();
-                                    let current_text = ingest.pdf_dir_input.text.clone();
-                                    if !selected.is_empty() {
-                                        self.clipboard_text = selected;
-                                        ingest.pdf_dir_input.delete_selection();
-                                        // Save state for undo
-                                        self.undo_history.push(current_text);
-                                        self.redo_history.clear();
-                                        if self.undo_history.len() > 50 {
-                                            self.undo_history.remove(0);
-                                        }
-                                    }
-                                }
-                            }
-                            Some(6) => {
-                                if self.insight_modal.is_editing_title {
-                                    let selected = self.insight_modal.title_input.get_selected_text();
-                                    let current_text = self.insight_modal.title_input.text.clone();
-                                    if !selected.is_empty() {
-                                        self.clipboard_text = selected;
-                                        self.insight_modal.title_input.delete_selection();
-                                        // Save state for undo
-                                        self.undo_history.push(current_text);
-                                        self.redo_history.clear();
-                                        if self.undo_history.len() > 50 {
-                                            self.undo_history.remove(0);
-                                        }
-                                        self.insight_modal.draft_title = self.insight_modal.title_input.text.clone();
-                                    }
-                                }
-                            }
-                            Some(7) => {
-                                if self.insight_modal.is_editing_text {
-                                    let selected = self.insight_modal.text_input.get_selected_text();
-                                    let current_text = self.insight_modal.text_input.text.clone();
-                                    if !selected.is_empty() {
-                                        self.clipboard_text = selected;
-                                        self.insight_modal.text_input.delete_selection();
-                                        // Save state for undo
-                                        self.undo_history.push(current_text);
-                                        self.redo_history.clear();
-                                        if self.undo_history.len() > 50 {
-                                            self.undo_history.remove(0);
-                                        }
-                                        self.insight_modal.draft_text = self.insight_modal.text_input.text.clone();
-                                    }
-                                }
-                            }
-                            Some(8) => {
-                                if self.chat_info_dialog.is_editing_title {
-                                    let selected = self.chat_info_dialog.title_input.get_selected_text();
-                                    let current_text = self.chat_info_dialog.title_input.text.clone();
-                                    if !selected.is_empty() {
-                                        self.clipboard_text = selected;
-                                        self.chat_info_dialog.title_input.delete_selection();
-                                        // Save state for undo
-                                        self.undo_history.push(current_text);
-                                        self.redo_history.clear();
-                                        if self.undo_history.len() > 50 {
-                                            self.undo_history.remove(0);
-                                        }
-                                        self.chat_info_dialog.draft_title = self.chat_info_dialog.title_input.text.clone();
-                                    }
-                                }
-                            }
-                            Some(5) => {
-                                // Notepad - cut
-                                if let Some(ref mut notepad) = self.notepad_window {
-                                    let selected = notepad.editor.get_selected_text();
-                                    if !selected.is_empty() {
-                                        self.clipboard_text = selected;
-                                        // Delete selection
-                                        if let Some(ref selection) = notepad.editor.selection {
-                                            if let Some(ref cursor) = notepad.editor.cursor {
-                                                if selection.start.block_id == cursor.block_id && selection.end.block_id == cursor.block_id {
-                                                    let start = selection.start.position.min(selection.end.position);
-                                                    let end = selection.start.position.max(selection.end.position);
-                                                    
-                                                    if let Some(block) = notepad.editor.document.get_block_mut(&cursor.block_id) {
-                                                        if let Some(block_text) = block.content.get_text_mut() {
-                                                            if end <= block_text.len() {
-                                                                block_text.drain(start..end);
-                                                                // Remove format spans that are now invalid
-                                                                use crate::stylus::block::BlockContent;
-                                                                if let BlockContent::Text { ref mut formats, .. } = block.content {
-                                                                    formats.retain(|span| {
-                                                                        !(span.start >= start && span.end <= end) && 
-                                                                        !(span.start < end && span.end > start)
-                                                                    });
-                                                                    // Adjust format span positions
-                                                                    for span in formats.iter_mut() {
-                                                                        if span.start > end {
-                                                                            span.start -= end - start;
-                                                                            span.end -= end - start;
-                                                                        } else if span.start > start {
-                                                                            span.start = start;
-                                                                            if span.end > end {
-                                                                                span.end = start;
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                                if let Some(ref mut c) = notepad.editor.cursor {
-                                                                    c.position = start;
-                                                                }
-                                                                notepad.editor.selection = None;
-                                                                notepad.editor.mark_changed();
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
+                    if self.clipboard_shortcut_mod() {
+                        self.clipboard_apply_cut();
                     }
                 }
                 KeyCode::KeyC => {
                     // Ctrl+C for copy
-                    if self.modifiers.contains(ModifiersState::CONTROL) {
-                        match self.focused_input {
-                            Some(0) => {
-                                if let Some(ref chat) = self.chat_window {
-                                    let selected = chat.input_field.get_selected_text();
-                                    if !selected.is_empty() {
-                                        self.clipboard_text = selected;
-                                    }
-                                }
-                            }
-                            Some(1) => {
-                                if let Some(ref library) = self.library_window {
-                                    let selected = library.search_input.get_selected_text();
-                                    if !selected.is_empty() {
-                                        self.clipboard_text = selected;
-                                    }
-                                }
-                            }
-                            Some(2) => {
-                                if let Some(ref ingest) = self.ingest_window {
-                                    let selected = ingest.pdf_dir_input.get_selected_text();
-                                    if !selected.is_empty() {
-                                        self.clipboard_text = selected;
-                                    }
-                                }
-                            }
-                            Some(6) => {
-                                if self.insight_modal.is_editing_title {
-                                    let selected = self.insight_modal.title_input.get_selected_text();
-                                    if !selected.is_empty() {
-                                        self.clipboard_text = selected;
-                                    }
-                                }
-                            }
-                            Some(7) => {
-                                if self.insight_modal.is_editing_text {
-                                    let selected = self.insight_modal.text_input.get_selected_text();
-                                    if !selected.is_empty() {
-                                        self.clipboard_text = selected;
-                                    }
-                                }
-                            }
-                            Some(8) => {
-                                if self.chat_info_dialog.is_editing_title {
-                                    let selected = self.chat_info_dialog.title_input.get_selected_text();
-                                    if !selected.is_empty() {
-                                        self.clipboard_text = selected;
-                                    }
-                                }
-                            }
-                            Some(5) => {
-                                // Notepad - copy
-                                if let Some(ref notepad) = self.notepad_window {
-                                    let selected = notepad.editor.get_selected_text();
-                                    if !selected.is_empty() {
-                                        self.clipboard_text = selected;
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
+                    if self.clipboard_shortcut_mod() {
+                        self.clipboard_apply_copy();
                     }
                 }
                 KeyCode::KeyV => {
                     // Ctrl+V for paste
-                    if self.modifiers.contains(ModifiersState::CONTROL) {
-                        match self.focused_input {
-                            Some(0) => {
-                                if let Some(ref mut chat) = self.chat_window {
-                                    let clipboard = self.clipboard_text.clone();
-                                    let current_text = chat.input_field.text.clone();
-                                    if !clipboard.is_empty() {
-                                        chat.input_field.paste(&clipboard);
-                                        // Save state after paste
-                                        self.undo_history.push(current_text);
-                                        self.redo_history.clear();
-                                        if self.undo_history.len() > 50 {
-                                            self.undo_history.remove(0);
-                                        }
-                                        self.cursor_target_position = chat.input_field.cursor_position;
-                                        self.cursor_blink_timer = 0.0;
-                                        self.cursor_visible = true;
-                                    }
-                                }
-                            }
-                            Some(1) => {
-                                if let Some(ref mut library) = self.library_window {
-                                    let clipboard = self.clipboard_text.clone();
-                                    let current_text = library.search_input.text.clone();
-                                    if !clipboard.is_empty() {
-                                        library.search_input.paste(&clipboard);
-                                        // Save state for undo
-                                        self.undo_history.push(current_text);
-                                        self.redo_history.clear();
-                                        if self.undo_history.len() > 50 {
-                                            self.undo_history.remove(0);
-                                        }
-                                    }
-                                }
-                            }
-                            Some(2) => {
-                                if let Some(ref mut ingest) = self.ingest_window {
-                                    let clipboard = self.clipboard_text.clone();
-                                    let current_text = ingest.pdf_dir_input.text.clone();
-                                    if !clipboard.is_empty() {
-                                        ingest.pdf_dir_input.paste(&clipboard);
-                                        // Save state for undo
-                                        self.undo_history.push(current_text);
-                                        self.redo_history.clear();
-                                        if self.undo_history.len() > 50 {
-                                            self.undo_history.remove(0);
-                                        }
-                                    }
-                                }
-                            }
-                            Some(6) => {
-                                if self.insight_modal.is_editing_title {
-                                    let clipboard = self.clipboard_text.clone();
-                                    let current_text = self.insight_modal.title_input.text.clone();
-                                    if !clipboard.is_empty() {
-                                        self.insight_modal.title_input.paste(&clipboard);
-                                        // Save state for undo
-                                        self.undo_history.push(current_text);
-                                        self.redo_history.clear();
-                                        if self.undo_history.len() > 50 {
-                                            self.undo_history.remove(0);
-                                        }
-                                        self.insight_modal.draft_title = self.insight_modal.title_input.text.clone();
-                                    }
-                                }
-                            }
-                            Some(7) => {
-                                if self.insight_modal.is_editing_text {
-                                    let clipboard = self.clipboard_text.clone();
-                                    let current_text = self.insight_modal.text_input.text.clone();
-                                    if !clipboard.is_empty() {
-                                        self.insight_modal.text_input.paste(&clipboard);
-                                        // Save state for undo
-                                        self.undo_history.push(current_text);
-                                        self.redo_history.clear();
-                                        if self.undo_history.len() > 50 {
-                                            self.undo_history.remove(0);
-                                        }
-                                        self.insight_modal.draft_text = self.insight_modal.text_input.text.clone();
-                                    }
-                                }
-                            }
-                            Some(8) => {
-                                if self.chat_info_dialog.is_editing_title {
-                                    let clipboard = self.clipboard_text.clone();
-                                    let current_text = self.chat_info_dialog.title_input.text.clone();
-                                    if !clipboard.is_empty() {
-                                        self.chat_info_dialog.title_input.paste(&clipboard);
-                                        // Save state for undo
-                                        self.undo_history.push(current_text);
-                                        self.redo_history.clear();
-                                        if self.undo_history.len() > 50 {
-                                            self.undo_history.remove(0);
-                                        }
-                                        self.chat_info_dialog.draft_title = self.chat_info_dialog.title_input.text.clone();
-                                    }
-                                }
-                            }
-                            Some(5) => {
-                                // Notepad - paste
-                                if let Some(ref mut notepad) = self.notepad_window {
-                                    let clipboard = self.clipboard_text.clone();
-                                    if !clipboard.is_empty() {
-                                        notepad.editor.paste(&clipboard);
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
+                    if self.clipboard_shortcut_mod() {
+                        self.clipboard_apply_paste();
                     }
                 }
                 KeyCode::KeyB => {
@@ -3790,15 +5281,35 @@ impl App {
                     });
                 }
                 KeyCode::ArrowUp => {
+                    if self.focused_input == Some(0) {
+                        if let Some(ref mut chat) = self.chat_window {
+                            if chat.mention_popup_open && !chat.mention_rows.is_empty() {
+                                if chat.mention_selected_index > 0 {
+                                    chat.mention_selected_index -= 1;
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    if self.focused_input == Some(5) {
+                        if let Some(ref mut notepad) = self.notepad_window {
+                            if notepad.mention_popup_open && !notepad.mention_rows.is_empty() {
+                                if notepad.mention_selected_index > 0 {
+                                    notepad.mention_selected_index -= 1;
+                                }
+                                return;
+                            }
+                        }
+                    }
                     let shift_pressed = self.modifiers.contains(ModifiersState::SHIFT);
-                    let alt_pressed = self.modifiers.contains(ModifiersState::ALT);
-                    if alt_pressed && self.ui_state.active_tab == Tab::Chat && self.graph_state.graph_id.is_some() && self.focused_input.is_none() {
-                        if let Some(ref leaf) = self.graph_state.current_leaf_id {
+                    if self.ui_state.active_tab == Tab::Chat && self.graph_state.constellation_view_active() && self.focused_input.is_none() {
+                        if let Some(ref leaf) = self.graph_state.current_leaf_id.clone() {
                             let parents = self.graph_state.parent_ids(leaf);
                             if let Some(first_parent) = parents.first() {
-                                self.graph_state.current_leaf_id = Some(first_parent.clone());
+                                let first_parent = first_parent.clone();
+                                self.graph_state.set_current_leaf(first_parent.clone());
                                 if let Some(chat) = self.chat_window.as_mut() {
-                                    if let Some(node) = self.graph_state.get_node(first_parent) {
+                                    if let Some(node) = self.graph_state.get_node(&first_parent) {
                                         let center = node.position + node.size * 0.5;
                                         chat.constellation_view.center_camera_on(center);
                                         chat.constellation_view.reset_zoom_to_normal();
@@ -3813,15 +5324,42 @@ impl App {
                     });
                 }
                 KeyCode::ArrowDown => {
+                    if self.focused_input == Some(0) {
+                        if let Some(ref mut chat) = self.chat_window {
+                            if chat.mention_popup_open && !chat.mention_rows.is_empty() {
+                                let max = chat.mention_rows.len() - 1;
+                                if chat.mention_selected_index < max {
+                                    chat.mention_selected_index += 1;
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    if self.focused_input == Some(5) {
+                        if let Some(ref mut notepad) = self.notepad_window {
+                            if notepad.mention_popup_open && !notepad.mention_rows.is_empty() {
+                                let max = notepad.mention_rows.len() - 1;
+                                if notepad.mention_selected_index < max {
+                                    notepad.mention_selected_index += 1;
+                                }
+                                return;
+                            }
+                        }
+                    }
                     let shift_pressed = self.modifiers.contains(ModifiersState::SHIFT);
-                    let alt_pressed = self.modifiers.contains(ModifiersState::ALT);
-                    if alt_pressed && self.ui_state.active_tab == Tab::Chat && self.graph_state.graph_id.is_some() && self.focused_input.is_none() {
-                        if let Some(ref leaf) = self.graph_state.current_leaf_id {
-                            let children = self.graph_state.children_ids(leaf);
-                            if let Some(first_child) = children.first() {
-                                self.graph_state.current_leaf_id = Some(first_child.clone());
+                    if self.ui_state.active_tab == Tab::Chat && self.graph_state.constellation_view_active() && self.focused_input.is_none() {
+                        if let Some(ref leaf) = self.graph_state.current_leaf_id.clone() {
+                            let mut children = self.graph_state.children_ids(leaf);
+                            children.sort();
+                            // Prefer the most recently visited child; fall back to the first sorted child.
+                            let target = self.graph_state.last_visited_child.get(leaf)
+                                .filter(|lv| children.contains(lv))
+                                .cloned()
+                                .or_else(|| children.into_iter().next());
+                            if let Some(child) = target {
+                                self.graph_state.set_current_leaf(child.clone());
                                 if let Some(chat) = self.chat_window.as_mut() {
-                                    if let Some(node) = self.graph_state.get_node(first_child) {
+                                    if let Some(node) = self.graph_state.get_node(&child) {
                                         let center = node.position + node.size * 0.5;
                                         chat.constellation_view.center_camera_on(center);
                                         chat.constellation_view.reset_zoom_to_normal();
@@ -3889,6 +5427,7 @@ impl App {
                         title: p.title.clone(),
                         authors: None,
                         year: p.year,
+                        exists: p.exists,
                     }).collect()
                 } else {
                     Vec::new()
@@ -3908,8 +5447,1013 @@ impl App {
                     eprintln!("Failed to save settings: {}", e);
                 }
             }
+            Some(0) => {
+                if ch == '@' {
+                    self.load_papers();
+                }
+                if let Some(ref mut chat) = self.chat_window {
+                    if ch == '@' {
+                        chat.mention_popup_open = true;
+                    }
+                    chat.sync_mention_popup_from_input(
+                        &self.papers_cache,
+                        &self.graph_state,
+                        &self.chat_state.conversations,
+                        &notepad_documents_for_mentions(),
+                    );
+                }
+            }
+            Some(5) => {
+                if self.ui_state.active_tab == Tab::Notepad {
+                    if ch == '@' {
+                        self.load_papers();
+                    }
+                    if let Some(ref mut notepad) = self.notepad_window {
+                        if ch == '@' {
+                            notepad.mention_popup_open = true;
+                        }
+                        notepad.sync_mention_popup_from_editor(
+                            &self.papers_cache,
+                            &self.graph_state,
+                            &self.chat_state.conversations,
+                            &notepad_documents_for_mentions(),
+                        );
+                    }
+                }
+            }
             _ => {}
         }
+    }
+
+    #[inline]
+    fn clipboard_shortcut_mod(&self) -> bool {
+        self.modifiers.contains(ModifiersState::SUPER) || self.modifiers.contains(ModifiersState::CONTROL)
+    }
+
+    fn focused_text_contains(&self, pos: Vec2) -> bool {
+        match self.focused_input {
+            Some(0) => self
+                .chat_window
+                .as_ref()
+                .map(|c| c.input_field.contains(pos))
+                .unwrap_or(false),
+            Some(1) => self
+                .library_window
+                .as_ref()
+                .map(|l| l.search_input.contains(pos))
+                .unwrap_or(false),
+            Some(2) => self
+                .ingest_window
+                .as_ref()
+                .map(|i| i.pdf_dir_input.contains(pos))
+                .unwrap_or(false),
+            Some(3) => self
+                .settings_window
+                .borrow()
+                .as_ref()
+                .map(|s| s.hf_token_input.contains(pos))
+                .unwrap_or(false),
+            Some(4) => self
+                .settings_window
+                .borrow()
+                .as_ref()
+                .map(|s| s.model_id_input.contains(pos))
+                .unwrap_or(false),
+            Some(6) => self
+                .settings_window
+                .borrow()
+                .as_ref()
+                .map(|s| s.openai_model_input.contains(pos))
+                .unwrap_or(false),
+            Some(5) => self
+                .notepad_window
+                .as_ref()
+                .map(|n| n.editor.contains(pos))
+                .unwrap_or(false),
+            Some(14) => {
+                self.insight_modal.is_editing_title
+                    && self.insight_modal.title_input.contains(pos)
+            }
+            Some(7) => {
+                self.insight_modal.is_editing_text && self.insight_modal.text_input.contains(pos)
+            }
+            Some(8) => {
+                self.chat_info_dialog.is_editing_title
+                    && self.chat_info_dialog.title_input.contains(pos)
+            }
+            Some(9) => self
+                .library_window
+                .as_ref()
+                .map(|l| l.is_creating_collection && l.new_collection_input.contains(pos))
+                .unwrap_or(false),
+            Some(10) => self
+                .chat_window
+                .as_ref()
+                .map(|c| {
+                    c.editing_message_idx.is_some() && c.edit_textarea.contains(pos)
+                })
+                .unwrap_or(false),
+            Some(11) => self.global_search_modal.search_input.contains(pos),
+            Some(12) => self
+                .notepad_window
+                .as_ref()
+                .map(|n| n.title_input.contains(pos))
+                .unwrap_or(false),
+            Some(13) => self
+                .chat_window
+                .as_ref()
+                .map(|c| {
+                    (c.adding_note_msg_idx.is_some() || c.editing_note.is_some())
+                        && c.note_input.contains(pos)
+                })
+                .unwrap_or(false),
+            Some(20) => {
+                self.shard_modal.is_open && self.shard_modal.user_input.contains(pos)
+            }
+            Some(21) => {
+                self.shard_modal.is_open && self.shard_modal.assistant_input.contains(pos)
+            }
+            Some(22) => {
+                self.system_prompts_modal.is_open
+                    && self.system_prompts_modal.name_input.contains(pos)
+            }
+            Some(23) => {
+                self.system_prompts_modal.is_open
+                    && self.system_prompts_modal.content_input.contains(pos)
+            }
+            _ => false,
+        }
+    }
+
+    /// Shared with keyboard shortcuts and text context menu.
+    pub fn clipboard_apply_cut(&mut self) {
+        match self.focused_input {
+            Some(0) => {
+                if let Some(ref mut chat) = self.chat_window {
+                    let selected = chat.input_field.get_selected_text();
+                    let current_text = chat.input_field.text.clone();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                        chat.input_field.delete_selection();
+                        // Save state after deletion
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                    }
+                }
+            }
+            Some(1) => {
+                if let Some(ref mut library) = self.library_window {
+                    let selected = library.search_input.get_selected_text();
+                    let current_text = library.search_input.text.clone();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                        library.search_input.delete_selection();
+                        // Save state for undo
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                    }
+                }
+            }
+            Some(2) => {
+                if let Some(ref mut ingest) = self.ingest_window {
+                    let selected = ingest.pdf_dir_input.get_selected_text();
+                    let current_text = ingest.pdf_dir_input.text.clone();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                        ingest.pdf_dir_input.delete_selection();
+                        // Save state for undo
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                    }
+                }
+            }
+            Some(3) => {
+                if let Some(settings) = self.settings_window.get_mut().as_mut() {
+                    let selected = settings.hf_token_input.get_selected_text();
+                    let current_text = settings.hf_token_input.text.clone();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                        settings.hf_token_input.delete_selection();
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                        self.settings_state.hf_token = settings.hf_token_input.text.clone();
+                    }
+                }
+            }
+            Some(4) => {
+                if let Some(settings) = self.settings_window.get_mut().as_mut() {
+                    let selected = settings.model_id_input.get_selected_text();
+                    let current_text = settings.model_id_input.text.clone();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                        settings.model_id_input.delete_selection();
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                        self.settings_state.model_id = settings.model_id_input.text.clone();
+                    }
+                }
+            }
+            Some(6) => {
+                if let Some(settings) = self.settings_window.get_mut().as_mut() {
+                    let selected = settings.openai_model_input.get_selected_text();
+                    let current_text = settings.openai_model_input.text.clone();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                        settings.openai_model_input.delete_selection();
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                        self.settings_state.openai_model = settings.openai_model_input.text.clone();
+                    }
+                }
+            }
+            Some(9) => {
+                if let Some(ref mut library) = self.library_window {
+                    if library.is_creating_collection {
+                        let selected = library.new_collection_input.get_selected_text();
+                        let current_text = library.new_collection_input.text.clone();
+                        if !selected.is_empty() {
+                            crate::clipboard::set_text(&selected);
+                            self.clipboard_text = selected;
+                            library.new_collection_input.delete_selection();
+                            self.undo_history.push(current_text);
+                            self.redo_history.clear();
+                            if self.undo_history.len() > 50 {
+                                self.undo_history.remove(0);
+                            }
+                        }
+                    }
+                }
+            }
+            Some(10) => {
+                if let Some(ref mut chat) = self.chat_window {
+                    if chat.editing_message_idx.is_some() {
+                        let selected = chat.edit_textarea.get_selected_text();
+                        let current_text = chat.edit_textarea.text.clone();
+                        if !selected.is_empty() {
+                            crate::clipboard::set_text(&selected);
+                            self.clipboard_text = selected;
+                            chat.edit_textarea.delete_selection();
+                            self.undo_history.push(current_text);
+                            self.redo_history.clear();
+                            if self.undo_history.len() > 50 {
+                                self.undo_history.remove(0);
+                            }
+                        }
+                    }
+                }
+            }
+            Some(11) => {
+                let selected = self.global_search_modal.search_input.get_selected_text();
+                let current_text = self.global_search_modal.search_input.text.clone();
+                if !selected.is_empty() {
+                    crate::clipboard::set_text(&selected);
+                    self.clipboard_text = selected;
+                    self.global_search_modal.search_input.delete_selection();
+                    self.undo_history.push(current_text);
+                    self.redo_history.clear();
+                    if self.undo_history.len() > 50 {
+                        self.undo_history.remove(0);
+                    }
+                }
+            }
+            Some(12) => {
+                if let Some(ref mut notepad) = self.notepad_window {
+                    let selected = notepad.title_input.get_selected_text();
+                    let current_text = notepad.title_input.text.clone();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                        notepad.title_input.delete_selection();
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                        notepad.document_title = notepad.title_input.text.clone();
+                    }
+                }
+            }
+            Some(13) => {
+                if let Some(ref mut chat) = self.chat_window {
+                    if chat.adding_note_msg_idx.is_some() || chat.editing_note.is_some() {
+                        let selected = chat.note_input.get_selected_text();
+                        let current_text = chat.note_input.text.clone();
+                        if !selected.is_empty() {
+                            crate::clipboard::set_text(&selected);
+                            self.clipboard_text = selected;
+                            chat.note_input.delete_selection();
+                            self.undo_history.push(current_text);
+                            self.redo_history.clear();
+                            if self.undo_history.len() > 50 {
+                                self.undo_history.remove(0);
+                            }
+                        }
+                    }
+                }
+            }
+            Some(20) => {
+                if self.shard_modal.is_open {
+                    let selected = self.shard_modal.user_input.get_selected_text();
+                    let current_text = self.shard_modal.user_input.text.clone();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                        self.shard_modal.user_input.delete_selection();
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                    }
+                }
+            }
+            Some(21) => {
+                if self.shard_modal.is_open {
+                    let selected = self.shard_modal.assistant_input.get_selected_text();
+                    let current_text = self.shard_modal.assistant_input.text.clone();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                        self.shard_modal.assistant_input.delete_selection();
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                    }
+                }
+            }
+            Some(22) => {
+                if self.system_prompts_modal.is_open {
+                    let selected = self.system_prompts_modal.name_input.get_selected_text();
+                    let current_text = self.system_prompts_modal.name_input.text.clone();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                        self.system_prompts_modal.name_input.delete_selection();
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                    }
+                }
+            }
+            Some(23) => {
+                if self.system_prompts_modal.is_open {
+                    let selected = self.system_prompts_modal.content_input.get_selected_text();
+                    let current_text = self.system_prompts_modal.content_input.text.clone();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                        self.system_prompts_modal.content_input.delete_selection();
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                    }
+                }
+            }
+            Some(14) => {
+                if self.insight_modal.is_editing_title {
+                    let selected = self.insight_modal.title_input.get_selected_text();
+                    let current_text = self.insight_modal.title_input.text.clone();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                        self.insight_modal.title_input.delete_selection();
+                        // Save state for undo
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                        self.insight_modal.draft_title = self.insight_modal.title_input.text.clone();
+                    }
+                }
+            }
+            Some(7) => {
+                if self.insight_modal.is_editing_text {
+                    let selected = self.insight_modal.text_input.get_selected_text();
+                    let current_text = self.insight_modal.text_input.text.clone();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                        self.insight_modal.text_input.delete_selection();
+                        // Save state for undo
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                        self.insight_modal.draft_text = self.insight_modal.text_input.text.clone();
+                    }
+                }
+            }
+            Some(8) => {
+                if self.chat_info_dialog.is_editing_title {
+                    let selected = self.chat_info_dialog.title_input.get_selected_text();
+                    let current_text = self.chat_info_dialog.title_input.text.clone();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                        self.chat_info_dialog.title_input.delete_selection();
+                        // Save state for undo
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                        self.chat_info_dialog.draft_title = self.chat_info_dialog.title_input.text.clone();
+                    }
+                }
+            }
+            Some(5) => {
+                // Notepad - cut
+                if let Some(ref mut notepad) = self.notepad_window {
+                    let selected = notepad.editor.get_selected_text();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                        // Delete selection
+                        if let Some(ref selection) = notepad.editor.selection {
+                            if let Some(ref cursor) = notepad.editor.cursor {
+                                if selection.start.block_id == cursor.block_id && selection.end.block_id == cursor.block_id {
+                                    let start = selection.start.position.min(selection.end.position);
+                                    let end = selection.start.position.max(selection.end.position);
+                                                    
+                                    if let Some(block) = notepad.editor.document.get_block_mut(&cursor.block_id) {
+                                        if let Some(block_text) = block.content.get_text_mut() {
+                                            if end <= block_text.len() {
+                                                block_text.drain(start..end);
+                                                // Remove format spans that are now invalid
+                                                use crate::stylus::block::BlockContent;
+                                                if let BlockContent::Text { ref mut formats, .. } = block.content {
+                                                    formats.retain(|span| {
+                                                        !(span.start >= start && span.end <= end) && 
+                                                        !(span.start < end && span.end > start)
+                                                    });
+                                                    // Adjust format span positions
+                                                    for span in formats.iter_mut() {
+                                                        if span.start > end {
+                                                            span.start -= end - start;
+                                                            span.end -= end - start;
+                                                        } else if span.start > start {
+                                                            span.start = start;
+                                                            if span.end > end {
+                                                                span.end = start;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if let Some(ref mut c) = notepad.editor.cursor {
+                                                    c.position = start;
+                                                }
+                                                notepad.editor.selection = None;
+                                                notepad.editor.mark_changed();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+    }
+
+    pub fn clipboard_apply_copy(&mut self) {
+        match self.focused_input {
+            Some(0) => {
+                if let Some(ref chat) = self.chat_window {
+                    let selected = chat.input_field.get_selected_text();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                    } else {
+                        let t = chat.serialize_composer_for_clipboard();
+                        crate::clipboard::set_text(&t);
+                        self.clipboard_text = t;
+                    }
+                }
+            }
+            Some(1) => {
+                if let Some(ref library) = self.library_window {
+                    let selected = library.search_input.get_selected_text();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                    }
+                }
+            }
+            Some(2) => {
+                if let Some(ref ingest) = self.ingest_window {
+                    let selected = ingest.pdf_dir_input.get_selected_text();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                    }
+                }
+            }
+            Some(3) => {
+                if let Some(settings) = self.settings_window.get_mut().as_mut() {
+                    let selected = settings.hf_token_input.get_selected_text();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                    }
+                }
+            }
+            Some(4) => {
+                if let Some(settings) = self.settings_window.get_mut().as_mut() {
+                    let selected = settings.model_id_input.get_selected_text();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                    }
+                }
+            }
+            Some(6) => {
+                if let Some(settings) = self.settings_window.get_mut().as_mut() {
+                    let selected = settings.openai_model_input.get_selected_text();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                    }
+                }
+            }
+            Some(9) => {
+                if let Some(ref library) = self.library_window {
+                    if library.is_creating_collection {
+                        let selected = library.new_collection_input.get_selected_text();
+                        if !selected.is_empty() {
+                            crate::clipboard::set_text(&selected);
+                            self.clipboard_text = selected;
+                        }
+                    }
+                }
+            }
+            Some(10) => {
+                if let Some(ref chat) = self.chat_window {
+                    if chat.editing_message_idx.is_some() {
+                        let selected = chat.edit_textarea.get_selected_text();
+                        if !selected.is_empty() {
+                            crate::clipboard::set_text(&selected);
+                            self.clipboard_text = selected;
+                        }
+                    }
+                }
+            }
+            Some(11) => {
+                let selected = self.global_search_modal.search_input.get_selected_text();
+                if !selected.is_empty() {
+                    crate::clipboard::set_text(&selected);
+                    self.clipboard_text = selected;
+                }
+            }
+            Some(12) => {
+                if let Some(ref notepad) = self.notepad_window {
+                    let selected = notepad.title_input.get_selected_text();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                    }
+                }
+            }
+            Some(13) => {
+                if let Some(ref chat) = self.chat_window {
+                    if chat.adding_note_msg_idx.is_some() || chat.editing_note.is_some() {
+                        let selected = chat.note_input.get_selected_text();
+                        if !selected.is_empty() {
+                            crate::clipboard::set_text(&selected);
+                            self.clipboard_text = selected;
+                        }
+                    }
+                }
+            }
+            Some(20) => {
+                if self.shard_modal.is_open {
+                    let selected = self.shard_modal.user_input.get_selected_text();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                    }
+                }
+            }
+            Some(21) => {
+                if self.shard_modal.is_open {
+                    let selected = self.shard_modal.assistant_input.get_selected_text();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                    }
+                }
+            }
+            Some(22) => {
+                if self.system_prompts_modal.is_open {
+                    let selected = self.system_prompts_modal.name_input.get_selected_text();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                    }
+                }
+            }
+            Some(23) => {
+                if self.system_prompts_modal.is_open {
+                    let selected = self.system_prompts_modal.content_input.get_selected_text();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                    }
+                }
+            }
+            Some(14) => {
+                if self.insight_modal.is_editing_title {
+                    let selected = self.insight_modal.title_input.get_selected_text();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                    }
+                }
+            }
+            Some(7) => {
+                if self.insight_modal.is_editing_text {
+                    let selected = self.insight_modal.text_input.get_selected_text();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                    }
+                }
+            }
+            Some(8) => {
+                if self.chat_info_dialog.is_editing_title {
+                    let selected = self.chat_info_dialog.title_input.get_selected_text();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                    }
+                }
+            }
+            Some(5) => {
+                // Notepad - copy
+                if let Some(ref notepad) = self.notepad_window {
+                    let selected = notepad.editor.get_selected_text();
+                    if !selected.is_empty() {
+                        crate::clipboard::set_text(&selected);
+                        self.clipboard_text = selected;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+    }
+
+    pub fn clipboard_apply_paste(&mut self) {
+        match self.focused_input {
+            Some(0) => {
+                if let Some(ref mut chat) = self.chat_window {
+                    let clipboard = crate::clipboard::get_text();
+                    self.clipboard_text = clipboard.clone();
+                    let current_text = chat.input_field.text.clone();
+                    if !clipboard.is_empty() {
+                        chat.input_field.paste(&clipboard);
+                        chat.absorb_tokens_from_pasted_text(
+                            &self.settings_state.system_prompts,
+                        );
+                        chat.sync_mention_popup_from_input(
+                            &self.papers_cache,
+                            &self.graph_state,
+                            &self.chat_state.conversations,
+                            &notepad_documents_for_mentions(),
+                        );
+                        chat.sync_system_prompt_dropdown(
+                            &self.settings_state.system_prompts,
+                        );
+                        // Save state after paste
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                        self.cursor_target_position = chat.input_field.cursor_position;
+                        self.cursor_blink_timer = 0.0;
+                        self.cursor_visible = true;
+                    }
+                }
+            }
+            Some(1) => {
+                if let Some(ref mut library) = self.library_window {
+                    let clipboard = crate::clipboard::get_text();
+                    self.clipboard_text = clipboard.clone();
+                    let current_text = library.search_input.text.clone();
+                    if !clipboard.is_empty() {
+                        library.search_input.paste(&clipboard);
+                        // Save state for undo
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                    }
+                }
+            }
+            Some(2) => {
+                if let Some(ref mut ingest) = self.ingest_window {
+                    let clipboard = crate::clipboard::get_text();
+                    self.clipboard_text = clipboard.clone();
+                    let current_text = ingest.pdf_dir_input.text.clone();
+                    if !clipboard.is_empty() {
+                        ingest.pdf_dir_input.paste(&clipboard);
+                        // Save state for undo
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                    }
+                }
+            }
+            Some(3) => {
+                if let Some(settings) = self.settings_window.get_mut().as_mut() {
+                    let clipboard = crate::clipboard::get_text();
+                    self.clipboard_text = clipboard.clone();
+                    let current_text = settings.hf_token_input.text.clone();
+                    if !clipboard.is_empty() {
+                        settings.hf_token_input.paste(&clipboard);
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                        self.settings_state.hf_token = settings.hf_token_input.text.clone();
+                    }
+                }
+            }
+            Some(4) => {
+                if let Some(settings) = self.settings_window.get_mut().as_mut() {
+                    let clipboard = crate::clipboard::get_text();
+                    self.clipboard_text = clipboard.clone();
+                    let current_text = settings.model_id_input.text.clone();
+                    if !clipboard.is_empty() {
+                        settings.model_id_input.paste(&clipboard);
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                        self.settings_state.model_id = settings.model_id_input.text.clone();
+                    }
+                }
+            }
+            Some(6) => {
+                if let Some(settings) = self.settings_window.get_mut().as_mut() {
+                    let clipboard = crate::clipboard::get_text();
+                    self.clipboard_text = clipboard.clone();
+                    let current_text = settings.openai_model_input.text.clone();
+                    if !clipboard.is_empty() {
+                        settings.openai_model_input.paste(&clipboard);
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                        self.settings_state.openai_model = settings.openai_model_input.text.clone();
+                    }
+                }
+            }
+            Some(9) => {
+                if let Some(ref mut library) = self.library_window {
+                    if library.is_creating_collection {
+                        let clipboard = crate::clipboard::get_text();
+                        self.clipboard_text = clipboard.clone();
+                        let current_text = library.new_collection_input.text.clone();
+                        if !clipboard.is_empty() {
+                            library.new_collection_input.paste(&clipboard);
+                            self.undo_history.push(current_text);
+                            self.redo_history.clear();
+                            if self.undo_history.len() > 50 {
+                                self.undo_history.remove(0);
+                            }
+                        }
+                    }
+                }
+            }
+            Some(10) => {
+                if let Some(ref mut chat) = self.chat_window {
+                    if chat.editing_message_idx.is_some() {
+                        let clipboard = crate::clipboard::get_text();
+                        self.clipboard_text = clipboard.clone();
+                        let current_text = chat.edit_textarea.text.clone();
+                        if !clipboard.is_empty() {
+                            chat.edit_textarea.paste(&clipboard);
+                            self.undo_history.push(current_text);
+                            self.redo_history.clear();
+                            if self.undo_history.len() > 50 {
+                                self.undo_history.remove(0);
+                            }
+                        }
+                    }
+                }
+            }
+            Some(11) => {
+                let clipboard = crate::clipboard::get_text();
+                self.clipboard_text = clipboard.clone();
+                let current_text = self.global_search_modal.search_input.text.clone();
+                if !clipboard.is_empty() {
+                    self.global_search_modal.search_input.paste(&clipboard);
+                    self.undo_history.push(current_text);
+                    self.redo_history.clear();
+                    if self.undo_history.len() > 50 {
+                        self.undo_history.remove(0);
+                    }
+                }
+            }
+            Some(12) => {
+                if let Some(ref mut notepad) = self.notepad_window {
+                    let clipboard = crate::clipboard::get_text();
+                    self.clipboard_text = clipboard.clone();
+                    let current_text = notepad.title_input.text.clone();
+                    if !clipboard.is_empty() {
+                        notepad.title_input.paste(&clipboard);
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                        notepad.document_title = notepad.title_input.text.clone();
+                    }
+                }
+            }
+            Some(13) => {
+                if let Some(ref mut chat) = self.chat_window {
+                    if chat.adding_note_msg_idx.is_some() || chat.editing_note.is_some() {
+                        let clipboard = crate::clipboard::get_text();
+                        self.clipboard_text = clipboard.clone();
+                        let current_text = chat.note_input.text.clone();
+                        if !clipboard.is_empty() {
+                            chat.note_input.paste(&clipboard);
+                            self.undo_history.push(current_text);
+                            self.redo_history.clear();
+                            if self.undo_history.len() > 50 {
+                                self.undo_history.remove(0);
+                            }
+                        }
+                    }
+                }
+            }
+            Some(20) => {
+                if self.shard_modal.is_open {
+                    let clipboard = crate::clipboard::get_text();
+                    self.clipboard_text = clipboard.clone();
+                    let current_text = self.shard_modal.user_input.text.clone();
+                    if !clipboard.is_empty() {
+                        self.shard_modal.user_input.paste(&clipboard);
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                    }
+                }
+            }
+            Some(21) => {
+                if self.shard_modal.is_open {
+                    let clipboard = crate::clipboard::get_text();
+                    self.clipboard_text = clipboard.clone();
+                    let current_text = self.shard_modal.assistant_input.text.clone();
+                    if !clipboard.is_empty() {
+                        self.shard_modal.assistant_input.paste(&clipboard);
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                    }
+                }
+            }
+            Some(22) => {
+                if self.system_prompts_modal.is_open {
+                    let clipboard = crate::clipboard::get_text();
+                    self.clipboard_text = clipboard.clone();
+                    let current_text = self.system_prompts_modal.name_input.text.clone();
+                    if !clipboard.is_empty() {
+                        self.system_prompts_modal.name_input.paste(&clipboard);
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                    }
+                }
+            }
+            Some(23) => {
+                if self.system_prompts_modal.is_open {
+                    let clipboard = crate::clipboard::get_text();
+                    self.clipboard_text = clipboard.clone();
+                    let current_text = self.system_prompts_modal.content_input.text.clone();
+                    if !clipboard.is_empty() {
+                        self.system_prompts_modal.content_input.paste(&clipboard);
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                    }
+                }
+            }
+            Some(14) => {
+                if self.insight_modal.is_editing_title {
+                    let clipboard = crate::clipboard::get_text();
+                    self.clipboard_text = clipboard.clone();
+                    let current_text = self.insight_modal.title_input.text.clone();
+                    if !clipboard.is_empty() {
+                        self.insight_modal.title_input.paste(&clipboard);
+                        // Save state for undo
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                        self.insight_modal.draft_title = self.insight_modal.title_input.text.clone();
+                    }
+                }
+            }
+            Some(7) => {
+                if self.insight_modal.is_editing_text {
+                    let clipboard = crate::clipboard::get_text();
+                    self.clipboard_text = clipboard.clone();
+                    let current_text = self.insight_modal.text_input.text.clone();
+                    if !clipboard.is_empty() {
+                        self.insight_modal.text_input.paste(&clipboard);
+                        // Save state for undo
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                        self.insight_modal.draft_text = self.insight_modal.text_input.text.clone();
+                    }
+                }
+            }
+            Some(8) => {
+                if self.chat_info_dialog.is_editing_title {
+                    let clipboard = crate::clipboard::get_text();
+                    self.clipboard_text = clipboard.clone();
+                    let current_text = self.chat_info_dialog.title_input.text.clone();
+                    if !clipboard.is_empty() {
+                        self.chat_info_dialog.title_input.paste(&clipboard);
+                        // Save state for undo
+                        self.undo_history.push(current_text);
+                        self.redo_history.clear();
+                        if self.undo_history.len() > 50 {
+                            self.undo_history.remove(0);
+                        }
+                        self.chat_info_dialog.draft_title = self.chat_info_dialog.title_input.text.clone();
+                    }
+                }
+            }
+            Some(5) => {
+                // Notepad - paste
+                if let Some(ref mut notepad) = self.notepad_window {
+                    let clipboard = crate::clipboard::get_text();
+                    self.clipboard_text = clipboard.clone();
+                    if !clipboard.is_empty() {
+                        notepad.editor.paste(&clipboard);
+                    }
+                }
+            }
+            _ => {}
+        }
+
     }
 
     /// Centralized router for text editor operations
@@ -3947,7 +6491,7 @@ impl App {
                 }
             }
             Some(3) => {
-                if let Some(ref mut settings) = self.settings_window {
+                if let Some(settings) = self.settings_window.get_mut().as_mut() {
                     f(&mut settings.hf_token_input as &mut dyn TextEditor);
                     self.settings_state.hf_token = settings.hf_token_input.text.clone();
                     // Update cursor animation for settings HF token input
@@ -3957,7 +6501,7 @@ impl App {
                 }
             }
             Some(4) => {
-                if let Some(ref mut settings) = self.settings_window {
+                if let Some(settings) = self.settings_window.get_mut().as_mut() {
                     f(&mut settings.model_id_input as &mut dyn TextEditor);
                     self.settings_state.model_id = settings.model_id_input.text.clone();
                     // Update cursor animation for settings model ID input
@@ -3967,7 +6511,7 @@ impl App {
                 }
             }
             Some(6) => {
-                if let Some(ref mut settings) = self.settings_window {
+                if let Some(settings) = self.settings_window.get_mut().as_mut() {
                     f(&mut settings.openai_model_input as &mut dyn TextEditor);
                     self.settings_state.openai_model = settings.openai_model_input.text.clone();
                     self.cursor_target_position = settings.openai_model_input.get_cursor_position();
@@ -3984,11 +6528,10 @@ impl App {
                     self.cursor_visible = true;
                 }
             }
-            Some(6) => {
+            Some(14) => {
                 if self.insight_modal.is_editing_title {
                     f(&mut self.insight_modal.title_input as &mut dyn TextEditor);
                     self.insight_modal.draft_title = self.insight_modal.title_input.text.clone();
-                    // Update cursor animation for insight modal title
                     self.cursor_target_position = self.insight_modal.title_input.get_cursor_position();
                     self.cursor_blink_timer = 0.0;
                     self.cursor_visible = true;
@@ -4052,6 +6595,22 @@ impl App {
                     self.cursor_visible = true;
                 }
             }
+            Some(22) => {
+                if self.system_prompts_modal.is_open {
+                    f(&mut self.system_prompts_modal.name_input as &mut dyn TextEditor);
+                    self.cursor_target_position = self.system_prompts_modal.name_input.get_cursor_position();
+                    self.cursor_blink_timer = 0.0;
+                    self.cursor_visible = true;
+                }
+            }
+            Some(23) => {
+                if self.system_prompts_modal.is_open {
+                    f(&mut self.system_prompts_modal.content_input as &mut dyn TextEditor);
+                    self.cursor_target_position = self.system_prompts_modal.content_input.get_cursor_position();
+                    self.cursor_blink_timer = 0.0;
+                    self.cursor_visible = true;
+                }
+            }
             Some(11) => { // Global search input
                 f(&mut self.global_search_modal.search_input as &mut dyn TextEditor);
                 self.cursor_target_position = self.global_search_modal.search_input.get_cursor_position();
@@ -4067,6 +6626,7 @@ impl App {
                         title: p.title.clone(),
                         authors: None,
                         year: p.year,
+                        exists: p.exists,
                     }).collect()
                 } else {
                     Vec::new()
@@ -4116,6 +6676,13 @@ impl App {
                 .max(self.sidebar_edge_glow_target_intensity);
         }
         
+        if let Some(settings) = self.settings_window.get_mut().as_mut() {
+            settings.theme_dropdown.update(dt);
+            if settings.theme_dropdown.is_open {
+                settings.theme_dropdown.update_layout();
+            }
+        }
+
         // Cursor blinking (0.5 second cycle)
         self.cursor_blink_timer += dt;
         if self.cursor_blink_timer >= 0.5 {
@@ -4136,49 +6703,80 @@ impl App {
             dt,
             self.chat_state.conversations.len(),
             documents.len(),
+            self.library_window.as_ref().map(|w| w.collections.len()).unwrap_or(0),
             self.insights_state.insights.len(),
             &self.chat_state.conversations,
             &documents,
+            &self.library_window.as_ref().map(|w| w.collections.iter().map(|c| c.id).collect::<Vec<i32>>()).unwrap_or_default(),
             &self.insights_state.insights,
         );
         self.sidebar.update_layout(
             self.header.size.y,
             &self.chat_state.conversations,
             &documents,
+            &self.library_window.as_ref().map(|w| w.collections.iter().map(|c| c.id).collect::<Vec<i32>>()).unwrap_or_default(),
             &self.insights_state.insights,
         );
         let conversations_height = 10.0 + (self.chat_state.conversations.len() as f32 * 40.0) + 10.0;
         self.sidebar.conversations_list.set_content_height(conversations_height);
         let documents_height = 10.0 + (documents.len() as f32 * 40.0) + 10.0;
         self.sidebar.documents_list.set_content_height(documents_height);
+        let collections_height = 10.0 + (self.library_window.as_ref().map(|w| w.collections.len()).unwrap_or(0) as f32 * 40.0) + 10.0;
+        self.sidebar.collections_list.set_content_height(collections_height);
         let insights_height = 10.0 + (self.insights_state.insights.len() as f32 * 35.0) + 10.0;
         self.sidebar.insights_panel.insights_list.set_content_height(insights_height);
         
-        // Update chat window layout if sidebar width changed (keep same width and center when sidebar closed)
+        // Update chat window layout if sidebar width changed. Card width = min(800, viewport), centered.
         if let Some(ref mut chat) = self.chat_window {
             let chat_y = self.header.size.y;
             let chat_height = self.viewport_size.y - self.header.size.y;
             let open_content_width = self.viewport_size.x - SidebarWindow::OPEN_WIDTH;
             let (chat_x, chat_width) = if self.sidebar.is_open {
-                (self.sidebar.current_width, self.viewport_size.x - self.sidebar.current_width)
+                let available = self.viewport_size.x - self.sidebar.current_width;
+                let w = 800.0f32.min(available);
+                (self.sidebar.current_width + (available - w) * 0.5, w)
             } else {
-                ((self.viewport_size.x - open_content_width) / 2.0, open_content_width)
+                let w = 800.0f32.min(open_content_width);
+                ((self.viewport_size.x - w) * 0.5, w)
             };
+            chat.graph_viewport_full_bleed = self.graph_state.constellation_view_active();
             chat.position = Vec2::new(chat_x, chat_y);
             chat.size = Vec2::new(chat_width, chat_height);
             chat.update_layout();
+            if self.graph_state.constellation_view_active() {
+                let old_center = chat.constellation_view.viewport_center();
+                let scale = chat.constellation_view.scale_animated;
+                chat.constellation_view.position = Vec2::ZERO;
+                chat.constellation_view.size = self.viewport_size;
+                let new_center = chat.constellation_view.viewport_center();
+                let delta = (new_center - old_center) / scale;
+                chat.constellation_view.camera_position += delta;
+                chat.constellation_view.camera_position_animated += delta;
+                let header_h = self.header.size.y;
+                let sidebar_w = if self.sidebar.is_open {
+                    self.sidebar.current_width
+                } else {
+                    0.0
+                };
+                let w = (self.viewport_size.x - sidebar_w).max(0.0);
+                let h = (chat.composer_top_y - header_h).max(0.0);
+                chat.constellation_interactive_rect =
+                    crate::ui::core::Rect::new(sidebar_w, header_h, w, h);
+            } else {
+                chat.constellation_interactive_rect = crate::ui::core::Rect::new(0.0, 0.0, 0.0, 0.0);
+            }
             if chat.editing_message_idx.is_some() {
                 let measure = |text: &str, size: f32| -> Vec2 {
                     Vec2::new(text.len() as f32 * size * 0.66, size)
                 };
-                if self.graph_state.graph_id.is_some() {
+                if self.graph_state.constellation_view_active() {
                     chat.update_edit_textarea_rect_constellation(measure, &self.graph_state);
                 } else {
                     chat.update_edit_textarea_rect(measure);
                 }
             }
             if chat.adding_note_msg_idx.is_some() || chat.editing_note.is_some() {
-                if self.graph_state.graph_id.is_some() {
+                if self.graph_state.constellation_view_active() {
                     let measure = |text: &str, size: f32| -> Vec2 {
                         Vec2::new(text.len() as f32 * size * 0.66, size)
                     };
@@ -4189,55 +6787,28 @@ impl App {
             chat.message_list.update(dt);
             chat.input_field.update(dt);
             chat.context_pool_dropdown.update(dt);
+            chat.system_prompt_dropdown.update(dt);
+            chat.sync_system_prompt_dropdown(&self.settings_state.system_prompts);
             chat.constellation_view.update(dt);
 
-            // Constellation physics: fixed-step integration with idle cutoff to keep shards from overlapping.
-            if self.graph_state.graph_id.is_some() {
-                // Run physics primarily while in Chat tab; keep a short settling window after graph changes.
-                self.physics_idle_timer += dt;
-                const PHYSICS_FPS: f32 = 30.0;
-                const PHYSICS_DT: f32 = 1.0 / PHYSICS_FPS;
-                const MAX_STEPS_PER_FRAME: u32 = 4;
-                const IDLE_TIMEOUT: f32 = 3.0;
-                const VELOCITY_EPS: f32 = 0.01;
-
-                let velocity_sum = self.graph_state.total_velocity_magnitude();
-                let active_tab_is_chat = self.ui_state.active_tab == crate::ui::tab_bar::Tab::Chat;
-                let should_run_physics = active_tab_is_chat
-                    && (self.physics_settle_frames > 0
-                        || self.physics_idle_timer < IDLE_TIMEOUT
-                        || velocity_sum > VELOCITY_EPS);
-
-                if should_run_physics {
-                    self.physics_dt_accumulator += dt;
-                    let mut steps: u32 = 0;
-                    while self.physics_dt_accumulator >= PHYSICS_DT && steps < MAX_STEPS_PER_FRAME {
-                        self.graph_state.step_physics(PHYSICS_DT);
-                        self.physics_dt_accumulator -= PHYSICS_DT;
-                        steps += 1;
-                    }
-                    if self.physics_settle_frames > 0 {
-                        self.physics_settle_frames -= 1;
-                    }
-                } else {
-                    self.physics_dt_accumulator = 0.0;
-                    self.graph_state.zero_velocities_if_settled(VELOCITY_EPS);
-                }
-            }
-
-            // Smooth scroll: lerp constellation scroll offsets toward targets
+            // Smooth scroll: lerp constellation scroll offsets toward targets (2D per bubble)
             {
+                use crate::ui::chat_window::BubbleScroll;
                 const LERP_SPEED: f32 = 12.0;
                 let t = (LERP_SPEED * dt).min(1.0);
                 let targets = chat.constellation_scroll_targets.borrow();
                 let mut offsets = chat.constellation_scroll_offsets.borrow_mut();
-                for (id, &(ut, at)) in targets.iter() {
-                    let (uo, ao) = offsets.get(id).copied().unwrap_or((0.0, 0.0));
-                    offsets.insert(id.clone(), (uo + (ut - uo) * t, ao + (at - ao) * t));
+                for (id, target) in targets.iter() {
+                    let current = offsets.get(id).copied().unwrap_or(BubbleScroll::default());
+                    let lerped = BubbleScroll {
+                        user: current.user + (target.user - current.user) * t,
+                        assistant: current.assistant + (target.assistant - current.assistant) * t,
+                    };
+                    offsets.insert(id.clone(), lerped);
                 }
             }
 
-            // Throttled layout persistence (every 2s) when graph is loaded, regardless of active tab
+            // Throttled layout persistence (every 2s): save manually-dragged positions and manual sizes.
             if self.graph_state.graph_id.is_some() {
                 self.layout_save_timer += dt;
                 if self.layout_save_timer >= 2.0 {
@@ -4245,20 +6816,29 @@ impl App {
                     if let Some(ref graph_id) = self.graph_state.graph_id {
                         let positions: std::collections::HashMap<String, glam::Vec2> = self
                             .graph_state
-                            .nodes
+                            .manual_positions
                             .iter()
-                            .map(|(id, n)| (id.clone(), n.position))
+                            .filter_map(|id| {
+                                self.graph_state.nodes.get(id).map(|n| (id.clone(), n.position))
+                            })
                             .collect();
-                        let _ = crate::persistence::GraphLayoutPersistence::save_positions(graph_id, &positions);
+                        let sizes: std::collections::HashMap<String, glam::Vec2> = self.graph_state.manual_sizes.clone();
+                        let _ = crate::persistence::GraphLayoutPersistence::save_positions(graph_id, &positions, &sizes);
                     }
                 }
             } else {
                 self.layout_save_timer = 0.0;
             }
 
-            // Load collections when chat window is first shown
+            // Load collections on app update so Library/Chat have collection data.
             if !self.collections_loaded {
                 self.load_collections();
+            }
+
+            // Load papers independently of mention triggers so the Library tab
+            // can show already-ingested papers immediately.
+            if !self.papers_loaded {
+                self.load_papers();
             }
         }
 
@@ -4299,7 +6879,7 @@ impl App {
         }
         
         // Update settings window layout
-        if let Some(ref mut settings) = self.settings_window {
+        if let Some(settings) = self.settings_window.get_mut().as_mut() {
             let settings_y = self.header.size.y;
             let settings_width = self.viewport_size.x - self.sidebar.current_width;
             let settings_height = self.viewport_size.y - self.header.size.y;
@@ -4313,7 +6893,7 @@ impl App {
         }
         
         // Update settings window inputs
-        if let Some(ref mut settings) = self.settings_window {
+        if let Some(settings) = self.settings_window.get_mut().as_mut() {
             settings.hf_token_input.update(dt);
             settings.model_id_input.update(dt);
             settings.openai_model_input.update(dt);
@@ -4325,13 +6905,25 @@ impl App {
             self.shard_modal.user_input.update(dt);
             self.shard_modal.assistant_input.update(dt);
         }
+        if self.system_prompts_modal.is_open {
+            self.system_prompts_modal.update_layout(self.viewport_size);
+            self.system_prompts_modal.name_input.update(dt);
+            self.system_prompts_modal.content_input.update(dt);
+        }
         if self.insight_modal.is_open {
             self.insight_modal.update_layout(self.viewport_size);
             self.insight_modal.title_input.update(dt);
             self.insight_modal.text_input.update(dt);
         }
+        if self.ingest_import_failures_modal.is_open {
+            self.ingest_import_failures_modal.update_layout(self.viewport_size);
+        }
         if self.pdf_modal.is_open {
             self.pdf_modal.update_layout(self.viewport_size);
+        }
+        if self.collection_modal.is_open {
+            self.collection_modal.update_layout(self.viewport_size);
+            self.collection_modal.search_input.update(dt);
         }
         if self.chat_info_dialog.is_open {
             self.chat_info_dialog.update_layout(self.viewport_size);
@@ -4377,7 +6969,7 @@ impl App {
 
         // Constellation view: camera and scale lerp
         if let Some(chat) = &self.chat_window {
-            if self.graph_state.graph_id.is_some() {
+            if self.graph_state.constellation_view_active() {
                 let v = &chat.constellation_view;
                 if (v.camera_position_animated - v.camera_position).length() > LERP_EPS {
                     return true;
@@ -4385,27 +6977,21 @@ impl App {
                 if (v.scale_animated - v.scale).abs() > SCALE_EPS {
                     return true;
                 }
-                // Constellation scroll offsets lerping toward targets
+                // Constellation scroll offsets lerping toward targets (2D per bubble)
+                use crate::ui::chat_window::BubbleScroll;
                 let targets = chat.constellation_scroll_targets.borrow();
                 let offsets = chat.constellation_scroll_offsets.borrow();
-                for (id, &(ut, at)) in targets.iter() {
-                    let (uo, ao) = offsets.get(id).copied().unwrap_or((0.0, 0.0));
-                    if (uo - ut).abs() > LERP_EPS || (ao - at).abs() > LERP_EPS {
+                for (id, target) in targets.iter() {
+                    let current = offsets.get(id).copied().unwrap_or(BubbleScroll::default());
+                    if (current.user - target.user).length() > LERP_EPS
+                        || (current.assistant - target.assistant).length() > LERP_EPS
+                    {
                         return true;
                     }
                 }
             }
         }
 
-        // Constellation physics: keep redrawing while nodes are moving or within settle window.
-        if self.graph_state.graph_id.is_some() {
-            if self.physics_settle_frames > 0 {
-                return true;
-            }
-            if self.graph_state.total_velocity_magnitude() > 0.01 {
-                return true;
-            }
-        }
 
         false
     }
@@ -4422,6 +7008,7 @@ impl App {
         const MAX_DIRTY_AREA_RATIO: f32 = 0.8;
 
         if self.shard_modal.is_open
+            || self.system_prompts_modal.is_open
             || self.insight_modal.is_open
             || self.pdf_modal.is_open
             || self.chat_info_dialog.is_open
@@ -4487,27 +7074,27 @@ impl App {
         }
 
         if let Some(chat) = &self.chat_window {
-            if self.graph_state.graph_id.is_some() {
+            if self.graph_state.constellation_view_active() {
                 let v = &chat.constellation_view;
                 let camera_moving = (v.camera_position_animated - v.camera_position).length() > 0.5;
                 let scale_moving = (v.scale_animated - v.scale).abs() > 0.001;
                 let scroll_moving = {
+                    use crate::ui::chat_window::BubbleScroll;
                     let targets = chat.constellation_scroll_targets.borrow();
                     let offsets = chat.constellation_scroll_offsets.borrow();
                     let mut any = false;
-                    for (id, &(ut, at)) in targets.iter() {
-                        let (uo, ao) = offsets.get(id).copied().unwrap_or((0.0, 0.0));
-                        if (uo - ut).abs() > 0.5 || (ao - at).abs() > 0.5 {
+                    for (id, target) in targets.iter() {
+                        let current = offsets.get(id).copied().unwrap_or(BubbleScroll::default());
+                        if (current.user - target.user).length() > 0.5
+                            || (current.assistant - target.assistant).length() > 0.5
+                        {
                             any = true;
                             break;
                         }
                     }
                     any
                 };
-                if camera_moving || scale_moving || scroll_moving
-                    || self.physics_settle_frames > 0
-                    || self.graph_state.total_velocity_magnitude() > 0.03
-                {
+                if camera_moving || scale_moving || scroll_moving {
                     let r = Rect::new(
                         chat.constellation_view.position.x,
                         chat.constellation_view.position.y,
@@ -4536,13 +7123,24 @@ impl App {
         self.sidebar.delete_conversation_button.on_hover(self.mouse_pos);
         self.sidebar.new_document_button.on_hover(self.mouse_pos);
         self.sidebar.delete_document_button.on_hover(self.mouse_pos);
+        self.sidebar.settings_button.on_hover(self.mouse_pos);
+
+        // Update settings panel hover
+        if self.sidebar.settings_panel_open {
+            self.sidebar.settings_panel_hovered_item =
+                self.sidebar.get_settings_panel_item_at(self.mouse_pos);
+        } else {
+            self.sidebar.settings_panel_hovered_item = None;
+        }
         
         // Update sidebar hover states for list items
         let document_ids = DocumentPersistence::list_documents().unwrap_or_default();
+        let collection_ids = self.library_window.as_ref().map(|w| w.collections.iter().map(|c| c.id).collect::<Vec<i32>>()).unwrap_or_default();
         self.sidebar.update_hover_state(
             self.mouse_pos,
             &self.chat_state.conversations,
             &document_ids,
+            &collection_ids,
             &self.insights_state.insights,
         );
         
@@ -4564,9 +7162,15 @@ impl App {
         // Update ingest window buttons
         if let Some(ref mut ingest) = self.ingest_window {
             if self.ui_state.active_tab == Tab::Data {
+                ingest.submit_button.on_hover(self.mouse_pos);
+                ingest.bib_upload_button.on_hover(self.mouse_pos);
+                ingest.browse_button.on_hover(self.mouse_pos);
                 ingest.ingest_button.on_hover(self.mouse_pos);
+                if ingest.show_view_failures_button {
+                    ingest.view_failures_button.on_hover(self.mouse_pos);
+                }
+            }
         }
-    }
     }
     
     /// Update hover state (mouse enter/leave tracking)
@@ -4608,6 +7212,9 @@ impl App {
         if self.shard_modal.is_open && self.shard_modal.contains(pos) {
             return Some("shard_modal".to_string());
         }
+        if self.system_prompts_modal.is_open && self.system_prompts_modal.contains(pos) {
+            return Some("system_prompts_modal".to_string());
+        }
         if self.insight_modal.is_open && self.insight_modal.contains(pos) {
             return Some("insight_modal".to_string());
         }
@@ -4643,7 +7250,8 @@ impl App {
                 }
             }
             Tab::Settings => {
-                if let Some(ref settings) = self.settings_window {
+                let g = self.settings_window.borrow();
+                if let Some(settings) = g.as_ref() {
                     if settings.contains(pos) {
                         return Some("settings_window".to_string());
                     }
@@ -4668,9 +7276,53 @@ impl App {
     
     /// Handle mouse drag (during drag operation)
     fn on_mouse_drag(&mut self, position: Vec2) {
+        // Shard move: apply screen delta as world delta to node position
+        if let Some((ref id, last_pos)) = self.shard_move_drag {
+            if let Some(ref mut chat) = self.chat_window {
+                let scale = chat.constellation_view.scale_animated;
+                let delta = position - last_pos;
+                if let Some(node) = self.graph_state.get_node_mut(id) {
+                    node.position += glam::Vec2::new(delta.x / scale, delta.y / scale);
+                }
+                // Mark as manually positioned so the tree layout preserves this placement.
+                self.graph_state.manual_positions.insert(id.clone());
+                self.shard_move_drag = Some((id.clone(), position));
+            }
+            return;
+        }
+        // Shard resize: grow/shrink from bottom-right corner.
+        // Height is capped at the shard's own content height so users shrink below fit,
+        // but never pull past useful content.
+        if let Some((ref id, init_size, init_pos)) = self.shard_resize_drag {
+            let new_size = if let Some(ref chat) = self.chat_window {
+                let scale = chat.constellation_view.scale_animated;
+                let delta = position - init_pos;
+                let dw = delta.x / scale;
+                let dh = delta.y / scale;
+                let (min_w, max_w) =
+                    crate::state::graph::GraphState::shard_manual_width_bounds(self.viewport_size.x);
+                let min_h = crate::state::graph::GraphState::shard_manual_min_height();
+                if let Some(node) = self.graph_state.get_node_mut(id) {
+                    let max_h = node.content_height.max(min_h);
+                    let w = (init_size.x + dw).clamp(min_w, max_w);
+                    let h = (init_size.y + dh).clamp(min_h, max_h);
+                    let s = glam::Vec2::new(w, h);
+                    node.size = s;
+                    Some(s)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(s) = new_size {
+                self.graph_state.manual_sizes.insert(id.clone(), s);
+            }
+            return;
+        }
         // Constellation pan: drag in viewport moves camera
         if self.ui_state.active_tab == Tab::Chat
-            && self.graph_state.graph_id.is_some()
+            && self.graph_state.constellation_view_active()
             && self.chat_window.is_some()
         {
             let chat = self.chat_window.as_mut().unwrap();
@@ -4678,7 +7330,6 @@ impl App {
                 let delta = position - start;
                 chat.constellation_view.pan(delta);
                 chat.constellation_view.pan_drag_start = Some(position);
-                self.physics_idle_timer = 0.0;
                 return;
             }
         }
@@ -4734,12 +7385,8 @@ impl App {
     }
     
     /// Handle key release
-    pub fn on_key_released(&mut self, key_code: KeyCode) {
-        // Check for shortcut matches on key release
-        if let Some(shortcut_id) = self.shortcut_registry.find(self.modifiers, key_code) {
-            self.on_shortcut_triggered(shortcut_id);
-        }
-        // TODO: Handle key release for toggle states and key combinations
+    pub fn on_key_released(&mut self, _key_code: KeyCode) {
+        // Shortcuts are triggered on key press (in on_keyboard), not on release.
     }
     
     /// Handle shortcut triggered
@@ -4779,7 +7426,9 @@ impl App {
                 KeyCode::KeyB => {
                     // Toggle sidebar
                     if shortcut.modifiers.contains(ModifiersState::SUPER) || shortcut.modifiers.contains(ModifiersState::CONTROL) {
-                        self.ui_state.toggle_sidebar();
+                        self.sidebar.toggle();
+                        self.ui_state.sidebar_open = self.sidebar.is_open;
+                        self.bump_layout_generation();
                     }
                 }
                 KeyCode::Enter => {
@@ -4791,33 +7440,37 @@ impl App {
                             let shortcut_send_openai_model = self.settings_state.openai_model_for_send();
                             let mut shortcut_send_pending: Option<(String, crate::api::models::GraphSendRequest, String)> = None;
                             if let Some(ref mut chat) = self.chat_window {
-                                let text = chat.input_field.text.trim().to_string();
-                                if !text.is_empty() && self.graph_state.graph_id.is_some() {
-                                    let graph_id = self.graph_state.graph_id.clone().unwrap();
-                                    let leaf_id = self.graph_state.current_leaf_id.clone().unwrap_or_default();
-                                    let request = crate::api::models::GraphSendRequest {
-                                        current_leaf_id: leaf_id,
-                                        user_draft: text.clone(),
-                                        provider: shortcut_send_provider.clone(),
-                                        model_id: shortcut_send_model_id.clone(),
-                                        openai_model: shortcut_send_openai_model.clone(),
-                                        temperature: None,
-                                        max_tokens: None,
-                                        model_token_limit: None,
-                                    };
-                                    let user_msg = crate::ui::chat_window::ChatMessage::from_legacy(
-                                        crate::ui::chat_window::MessageRole::User,
-                                        text.clone(),
-                                        Vec::new(),
-                                        Vec::new(),
-                                    );
-                                    chat.add_message(user_msg.clone());
-                                    self.chat_state.add_message_to_current(user_msg);
-                                    shortcut_send_pending = Some((graph_id, request, text));
-                                    chat.input_field.text.clear();
-                                    chat.input_field.cursor_position = 0;
-                                } else if !text.is_empty() {
-                                    self.show_error_toast("Conversation not ready. Please wait for it to load.".to_string());
+                                if let Some((user_draft, system_prompt, mentions)) =
+                                    chat.send_message(&self.settings_state.system_prompts)
+                                {
+                                    if self.graph_state.graph_id.is_some() {
+                                        let graph_id = self.graph_state.graph_id.clone().unwrap();
+                                        let leaf_id = self.graph_state.current_leaf_id.clone().unwrap_or_default();
+                                        let request = crate::api::models::GraphSendRequest {
+                                            current_leaf_id: leaf_id,
+                                            user_draft: user_draft.clone(),
+                                            provider: shortcut_send_provider.clone(),
+                                            model_id: shortcut_send_model_id.clone(),
+                                            openai_model: shortcut_send_openai_model.clone(),
+                                            temperature: None,
+                                            max_tokens: None,
+                                            model_token_limit: None,
+                                            system_prompt,
+                                            mentions,
+                                        };
+                                        let user_msg = crate::ui::chat_window::ChatMessage::from_legacy(
+                                            crate::ui::chat_window::MessageRole::User,
+                                            user_draft.clone(),
+                                            Vec::new(),
+                                            Vec::new(),
+                                        );
+                                        chat.add_message(user_msg.clone());
+                                        self.chat_state.add_message_to_current(user_msg);
+                                        shortcut_send_pending = Some((graph_id, request, user_draft));
+                                        chat.system_prompt_dropdown.close();
+                                    } else {
+                                        self.show_error_toast("Conversation not ready. Please wait for it to load.".to_string());
+                                    }
                                 }
                             }
                             if let Some((graph_id, request, text)) = shortcut_send_pending {
@@ -4942,7 +7595,7 @@ impl App {
                 }
             }
             Tab::Settings => {
-                if self.settings_window.is_some() {
+                if self.settings_window.borrow().is_some() {
                     focusable.push("hf_token_input".to_string());
                     focusable.push("model_id_input".to_string());
                     focusable.push("openai_model_input".to_string());
@@ -5027,19 +7680,19 @@ impl App {
                 }
             }
             "hf_token_input" => {
-                if let Some(ref mut settings) = self.settings_window {
+                if let Some(settings) = self.settings_window.get_mut().as_mut() {
                     settings.hf_token_input.on_focus();
                     self.focused_input = Some(3);
                 }
             }
             "model_id_input" => {
-                if let Some(ref mut settings) = self.settings_window {
+                if let Some(settings) = self.settings_window.get_mut().as_mut() {
                     settings.model_id_input.on_focus();
                     self.focused_input = Some(4);
                 }
             }
             "openai_model_input" => {
-                if let Some(ref mut settings) = self.settings_window {
+                if let Some(settings) = self.settings_window.get_mut().as_mut() {
                     settings.openai_model_input.on_focus();
                     self.focused_input = Some(6);
                 }
@@ -5074,17 +7727,17 @@ impl App {
                 }
             }
             "hf_token_input" => {
-                if let Some(ref mut settings) = self.settings_window {
+                if let Some(settings) = self.settings_window.get_mut().as_mut() {
                     settings.hf_token_input.on_blur();
                 }
             }
             "model_id_input" => {
-                if let Some(ref mut settings) = self.settings_window {
+                if let Some(settings) = self.settings_window.get_mut().as_mut() {
                     settings.model_id_input.on_blur();
                 }
             }
             "openai_model_input" => {
-                if let Some(ref mut settings) = self.settings_window {
+                if let Some(settings) = self.settings_window.get_mut().as_mut() {
                     settings.openai_model_input.on_blur();
                 }
             }
@@ -5232,47 +7885,8 @@ impl App {
                         .map(|n| glam::Vec2::new(n.position.x, n.position.y + n.size.y + SPAWN_GAP))
                         .unwrap_or(glam::Vec2::ZERO);
                     self.graph_state.add_node(new_shard, new_pos);
-                    // New shard added: keep physics running briefly so layout can relax and avoid overlaps.
-                    self.physics_settle_frames = 60;
-                    self.physics_idle_timer = 0.0;
-                    self.graph_state.current_leaf_id = Some(new_leaf_id.clone());
-                    if let Some(ref mut chat) = self.chat_window {
-                        chat.messages = self.graph_state.node_ids_bfs_order()
-                            .into_iter()
-                            .filter_map(|id| self.graph_state.get_node(&id))
-                            .flat_map(|node| {
-                                let id = node.shard.id.clone();
-                                let contexts = node.shard.contexts.clone();
-                                let mut msgs = Vec::new();
-                                if let Some(ref u) = node.shard.user_content {
-                                    if !u.is_empty() {
-                                        msgs.push(crate::ui::chat_window::ChatMessage {
-                                            shard_id: Some(id.clone()),
-                                            role: crate::ui::chat_window::MessageRole::User,
-                                            content: u.clone(),
-                                            contexts: contexts.clone(),
-                                            citations: Vec::new(),
-                                            notes: Vec::new(),
-                                        });
-                                    }
-                                }
-                                if let Some(ref a) = node.shard.assistant_content {
-                                    if !a.is_empty() {
-                                        msgs.push(crate::ui::chat_window::ChatMessage {
-                                            shard_id: Some(id.clone()),
-                                            role: crate::ui::chat_window::MessageRole::Assistant,
-                                            content: a.clone(),
-                                            contexts: contexts.clone(),
-                                            citations: Vec::new(),
-                                            notes: node.shard.notes.clone(),
-                                        });
-                                    }
-                                }
-                                msgs
-                            })
-                            .collect();
-                        self.chat_state.set_current_messages(chat.messages.clone());
-                    }
+                    self.graph_state.set_current_leaf(new_leaf_id.clone());
+                    self.apply_graph_messages_to_chat_and_state();
                     self.save_chat_state();
                     let center_on = self.graph_state.get_node(&new_leaf_id).map(|n| n.position + n.size * 0.5);
                     if let (Some(center_pos), Some(ref mut chat)) = (center_on, self.chat_window.as_mut()) {
@@ -5284,6 +7898,86 @@ impl App {
                     self.show_error_toast(format!("Send failed: {}", e));
                 }
             }
+        }
+    }
+
+    fn citation_from_graph_value(value: &serde_json::Value) -> Citation {
+        Citation {
+            text: value.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            source: value.get("source").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            title: value.get("title").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            year: value.get("year").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            section: value.get("section").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            page: value.get("page").and_then(|v| v.as_u64()).map(|p| p as u32),
+        }
+    }
+
+    fn rebuild_chat_messages_from_graph(&self) -> Vec<ChatMessage> {
+        self.graph_state
+            .node_ids_bfs_order()
+            .into_iter()
+            .filter_map(|id| self.graph_state.get_node(&id))
+            .flat_map(|node| {
+                let id = node.shard.id.clone();
+                let contexts = node.shard.contexts.clone();
+                let citations: Vec<Citation> = node
+                    .shard
+                    .citations
+                    .iter()
+                    .map(Self::citation_from_graph_value)
+                    .collect();
+                let mut msgs = Vec::new();
+                if let Some(ref u) = node.shard.user_content {
+                    if !u.is_empty() {
+                        msgs.push(ChatMessage {
+                            shard_id: Some(id.clone()),
+                            role: MessageRole::User,
+                            content: u.clone(),
+                            contexts: contexts.clone(),
+                            citations: Vec::new(),
+                            notes: Vec::new(),
+                        });
+                    }
+                }
+                if let Some(ref a) = node.shard.assistant_content {
+                    if !a.is_empty() {
+                        msgs.push(ChatMessage {
+                            shard_id: Some(id),
+                            role: MessageRole::Assistant,
+                            content: a.clone(),
+                            contexts,
+                            citations,
+                            notes: node.shard.notes.clone(),
+                        });
+                    }
+                }
+                msgs
+            })
+            .collect()
+    }
+
+    fn apply_graph_messages_to_chat_and_state(&mut self) {
+        let messages = self.rebuild_chat_messages_from_graph();
+        if let Some(ref mut chat) = self.chat_window {
+            chat.messages = messages.clone();
+        }
+        self.chat_state.set_current_messages(messages);
+    }
+
+    fn set_shard_visibility_and_sync(&mut self, shard_id: &str, visible: bool) {
+        if let Some(node) = self.graph_state.get_node_mut(shard_id) {
+            node.shard.visible = visible;
+            node.shard.user_visible = visible;
+            node.shard.assistant_visible = visible;
+            self.graph_state.bump_content_version();
+        }
+        if let Some(graph_id) = self.graph_state.graph_id.clone() {
+            let base_url = self.api_client.base_url.clone();
+            let shard_id_owned = shard_id.to_string();
+            tokio::spawn(async move {
+                let api_client = crate::api::ApiClient::new(Some(base_url));
+                let _ = api_client.patch_shard_visibility(&graph_id, &shard_id_owned, visible).await;
+            });
         }
     }
 
@@ -5305,9 +7999,6 @@ impl App {
                         response.current_leaf_id,
                         shards,
                     );
-                    // New graph loaded: run physics for a short settling window so branches spread out.
-                    self.physics_settle_frames = 90;
-                    self.physics_idle_timer = 0.0;
                     if let Some(ref conv_id) = self.chat_state.current_conversation_id {
                         if let Some(conv) = self.chat_state.conversations.iter_mut().find(|c| c.id == *conv_id) {
                             if conv.graph_id.is_none() {
@@ -5316,43 +8007,7 @@ impl App {
                         }
                     }
                     // Rebuild chat.messages from graph so shard_id and order match constellation nodes.
-                    if let Some(ref mut chat) = self.chat_window {
-                        chat.messages = self.graph_state.node_ids_bfs_order()
-                            .into_iter()
-                            .filter_map(|id| self.graph_state.get_node(&id))
-                            .flat_map(|node| {
-                                let id = node.shard.id.clone();
-                                let contexts = node.shard.contexts.clone();
-                                let mut msgs = Vec::new();
-                                if let Some(ref u) = node.shard.user_content {
-                                    if !u.is_empty() {
-                                        msgs.push(crate::ui::chat_window::ChatMessage {
-                                            shard_id: Some(id.clone()),
-                                            role: crate::ui::chat_window::MessageRole::User,
-                                            content: u.clone(),
-                                            contexts: contexts.clone(),
-                                            citations: Vec::new(),
-                                            notes: Vec::new(),
-                                        });
-                                    }
-                                }
-                                if let Some(ref a) = node.shard.assistant_content {
-                                    if !a.is_empty() {
-                                        msgs.push(crate::ui::chat_window::ChatMessage {
-                                            shard_id: Some(id.clone()),
-                                            role: crate::ui::chat_window::MessageRole::Assistant,
-                                            content: a.clone(),
-                                            contexts: contexts.clone(),
-                                            citations: Vec::new(),
-                                            notes: node.shard.notes.clone(),
-                                        });
-                                    }
-                                }
-                                msgs
-                            })
-                            .collect();
-                        self.chat_state.set_current_messages(chat.messages.clone());
-                    }
+                    self.apply_graph_messages_to_chat_and_state();
                 }
                 Err(e) => {
                     self.show_error_toast(format!("Graph load failed: {}", e));
@@ -5519,6 +8174,57 @@ impl App {
         self.toast_manager.show(message, crate::ui::toast::ToastType::Info, self.viewport_size);
     }
 
+    /// Dispatch a constellation settings panel action by row index.
+    /// Index matches SETTINGS_ACTIONS order in sidebar_content.rs:
+    ///   0 = Reset graph layout
+    ///   1 = Fit to view
+    ///   2 = Reset zoom to 100%
+    ///   3 = Clear muted messages
+    ///   4 = Collapse all citations
+    fn dispatch_constellation_settings_action(&mut self, action_idx: usize) {
+        match action_idx {
+            0 => {
+                // Reset graph layout: clear manual positions/sizes and re-run tree layout
+                self.graph_state.manual_positions.clear();
+                self.graph_state.manual_sizes.clear();
+                self.graph_state.layout_dirty = true;
+                if let Some(ref mut chat) = self.chat_window {
+                    if let Some((min, max)) = self.graph_state.compute_bbox() {
+                        chat.constellation_view.fit_in_view(min, max, 40.0);
+                    }
+                }
+            }
+            1 => {
+                // Fit to view
+                if let Some(ref mut chat) = self.chat_window {
+                    if let Some((min, max)) = self.graph_state.compute_bbox() {
+                        chat.constellation_view.fit_in_view(min, max, 40.0);
+                    }
+                }
+            }
+            2 => {
+                // Reset zoom to 100%
+                if let Some(ref mut chat) = self.chat_window {
+                    chat.constellation_view.reset_zoom_to_normal();
+                }
+            }
+            3 => {
+                // Clear muted messages
+                if let Some(ref mut chat) = self.chat_window {
+                    chat.muted_shard_ids.clear();
+                }
+            }
+            4 => {
+                // Collapse all citations
+                if let Some(ref mut chat) = self.chat_window {
+                    chat.citations_expanded.clear();
+                    chat.citations_expanded_shards.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn load_collections(&mut self) {
         if self.collections_loaded {
             return; // Already loaded or loading
@@ -5560,6 +8266,25 @@ impl App {
         });
 
         self.collections_loaded = true;
+    }
+
+    fn refresh_library_data(&mut self) {
+        self.papers_loaded = false;
+        self.collections_loaded = false;
+        self.load_collections();
+        self.load_papers();
+    }
+
+    /// Sync chat context pool dropdown, library sidebar selection, and server retrieval scope.
+    fn propagate_context_pool_selection(&mut self, collection_id: Option<i32>) {
+        if let Some(ref mut chat) = self.chat_window {
+            chat.selected_collection_id = collection_id;
+            chat.context_pool_dropdown.set_selected_by_id(collection_id);
+        }
+        if let Some(ref mut library) = self.library_window {
+            library.select_collection(collection_id);
+        }
+        self.set_context_pool(collection_id);
     }
 
     pub fn set_context_pool(&mut self, collection_id: Option<i32>) {
@@ -5610,12 +8335,14 @@ impl App {
                         chat.context_pool_dropdown.items.push(crate::ui::DropdownItem {
                             id: None,
                             label: "All papers".to_string(),
+                            slash_name: None,
                         });
 
                         for collection in &collections {
                             chat.context_pool_dropdown.items.push(crate::ui::DropdownItem {
                                 id: Some(collection.id),
                                 label: collection.name.clone(),
+                                slash_name: None,
                             });
                         }
                         // Sync selected_index with selected_collection_id after all items are added
@@ -5625,11 +8352,21 @@ impl App {
                     // Update library window collections list
                     if let Some(ref mut library) = self.library_window {
                         let library_collections: Vec<crate::ui::library_window::LibraryCollection> = collections.iter().map(|c| {
+                            let papers: Vec<crate::ui::library_window::Paper> = c.papers.iter().map(|p| {
+                                crate::ui::library_window::Paper {
+                                    id: p.id,
+                                    filename: p.filename.clone(),
+                                    title: p.title.clone(),
+                                    authors: p.authors.clone(),
+                                    year: p.year,
+                                    exists: p.exists,
+                                }
+                            }).collect();
                             crate::ui::library_window::LibraryCollection {
                                 id: c.id,
                                 name: c.name.clone(),
-                                paper_count: 0, // TODO: Get actual paper count from API
-                                papers: Vec::new(),
+                                paper_count: c.paper_count.max(papers.len() as i32),
+                                papers,
                             }
                         }).collect();
                         library.set_collections(library_collections);
@@ -5675,35 +8412,92 @@ impl App {
         }
     }
 
+    pub fn open_bibtex_picker_and_import(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("BibTeX Files", &["bib"])
+            .add_filter("All Files", &["*"])
+            .set_title("Select BibTeX file with ArXiv entries")
+            .pick_file()
+        {
+            if let Some(ref mut ingest) = self.ingest_window {
+                if ingest.is_ingesting {
+                    return;
+                }
+                ingest.import_summary_line.clear();
+                ingest.show_view_failures_button = false;
+                ingest.failure_lines.clear();
+                let base_url = self.api_client.base_url.clone();
+                let sender = self.ingest_response_sender.clone();
+                ingest.is_ingesting = true;
+                ingest.status_text = format!("Importing ArXiv IDs from: {}", path.display());
+                ingest.progress = 0.0;
+
+                tokio::spawn(async move {
+                    match crate::api::ApiClient::new(Some(base_url.clone())).import_arxiv_bibtex(&path).await {
+                        Ok(resp) => {
+                            let _ = sender.send(Ok(resp.task_id));
+                        }
+                        Err(e) => {
+                            let _ = sender.send(Err(format!("Failed to import BibTeX: {:?}", e)));
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     pub fn start_ingestion(&mut self) {
         if let Some(ref mut ingest) = self.ingest_window {
             if ingest.is_ingesting {
                 return; // Already ingesting
             }
 
-            let pdf_dir = if ingest.pdf_dir_input.text.is_empty() {
+            ingest.import_summary_line.clear();
+            ingest.show_view_failures_button = false;
+            ingest.failure_lines.clear();
+
+            let raw_input = ingest.pdf_dir_input.text.clone();
+            let arxiv_ids = extract_arxiv_ids_from_text(&raw_input);
+            let pdf_dir = if raw_input.is_empty() {
                 "data/papers".to_string()
             } else {
-                ingest.pdf_dir_input.text.clone()
+                raw_input.clone()
             };
 
             let base_url = self.api_client.base_url.clone();
             let sender = self.ingest_response_sender.clone();
 
             ingest.is_ingesting = true;
-            ingest.status_text = format!("Starting ingestion from: {}", pdf_dir);
+            if !arxiv_ids.is_empty() {
+                ingest.status_text = format!("Importing {} unique ArXiv IDs...", arxiv_ids.len());
+            } else {
+                ingest.status_text = format!("Starting ingestion from: {}", pdf_dir);
+            }
             ingest.progress = 0.0;
 
-            tokio::spawn(async move {
-                match crate::api::ApiClient::new(Some(base_url.clone())).ingest_pdfs(&pdf_dir).await {
-                    Ok(task_id) => {
-                        let _ = sender.send(Ok(task_id));
+            if !arxiv_ids.is_empty() {
+                tokio::spawn(async move {
+                    match crate::api::ApiClient::new(Some(base_url.clone())).import_arxiv_text(&raw_input).await {
+                        Ok(resp) => {
+                            let _ = sender.send(Ok(resp.task_id));
+                        }
+                        Err(e) => {
+                            let _ = sender.send(Err(format!("Failed to import ArXiv papers: {:?}", e)));
+                        }
                     }
-                    Err(e) => {
-                        let _ = sender.send(Err(format!("Failed to start ingestion: {:?}", e)));
+                });
+            } else {
+                tokio::spawn(async move {
+                    match crate::api::ApiClient::new(Some(base_url.clone())).ingest_pdfs(&pdf_dir).await {
+                        Ok(task_id) => {
+                            let _ = sender.send(Ok(task_id));
+                        }
+                        Err(e) => {
+                            let _ = sender.send(Err(format!("Failed to start ingestion: {:?}", e)));
+                        }
                     }
-                }
-            });
+                });
+            }
         }
     }
 
@@ -5752,15 +8546,35 @@ impl App {
                         if let Some(state) = status.get("status").and_then(|v| v.as_str()) {
                             match state {
                                 "done" | "completed" => {
+                                    let parsed = parse_ingest_task_done(&status);
                                     ingest.is_ingesting = false;
                                     ingest.progress = 1.0;
-                                    ingest.status_text = "✅ Ingestion completed successfully!".to_string();
                                     self.current_ingest_task_id = None;
-                                    // Reload papers and collections
                                     self.papers_loaded = false;
                                     self.collections_loaded = false;
-                                    // Show success toast
-                                    self.show_success_toast("PDF ingestion completed!".to_string());
+                                    match &parsed {
+                                        Some(p) => {
+                                            ingest.status_text = p.status_text.clone();
+                                            ingest.import_summary_line = p.import_summary_line.clone();
+                                            ingest.failure_lines = p.failure_lines.clone();
+                                            ingest.show_view_failures_button = p.show_view_failures;
+                                        }
+                                        None => {
+                                            ingest.status_text =
+                                                "✅ Ingestion completed successfully!".to_string();
+                                            ingest.import_summary_line.clear();
+                                            ingest.show_view_failures_button = false;
+                                            ingest.failure_lines.clear();
+                                        }
+                                    }
+                                    if let Some(p) = parsed {
+                                        for t in p.info_toasts {
+                                            self.show_info_toast(t);
+                                        }
+                                        self.show_success_toast(p.success_toast);
+                                    } else {
+                                        self.show_success_toast("PDF ingestion completed!".to_string());
+                                    }
                                 }
                                 "error" | "failed" => {
                                     ingest.is_ingesting = false;
@@ -5905,10 +8719,6 @@ impl App {
     }
     
     pub fn load_pdf(&mut self, filename: &str) {
-        if self.pdf_modal.loading {
-            return; // Already loading
-        }
-        
         self.pdf_modal.loading = true;
         let base_url = self.api_client.base_url.clone();
         let client = self.api_client.client.clone();
@@ -5946,12 +8756,19 @@ impl App {
         while let Ok(result) = self.pdf_bytes_receiver.try_recv() {
             match result {
                 Ok(bytes) => {
-                    if let Err(e) = self.pdf_modal.load_pdf(bytes) {
-                        eprintln!("Failed to load PDF into renderer: {}", e);
-                        self.pdf_modal.set_error(format!("Failed to load PDF: {}", e));
-                        self.show_error_toast(format!("Failed to load PDF: {}", e));
+                    if self.pdf_modal.document_kind == DocumentKind::Pdf {
+                        if let Err(e) = self.pdf_modal.load_pdf(bytes) {
+                            eprintln!("Failed to load PDF into renderer: {}", e);
+                            self.pdf_modal.set_error(format!("Failed to load PDF: {}", e));
+                            self.show_error_toast(format!("Failed to load PDF: {}", e));
+                        } else {
+                            self.show_success_toast("PDF loaded successfully".to_string());
+                        }
+                    } else if self.pdf_modal.document_kind == DocumentKind::TextLike {
+                        let text = String::from_utf8_lossy(&bytes).to_string();
+                        self.pdf_modal.load_text_content(text);
                     } else {
-                        self.show_success_toast("PDF loaded successfully".to_string());
+                        self.pdf_modal.set_error("Unsupported preview format for this file.".to_string());
                     }
                 }
                 Err(e) => {
@@ -5961,6 +8778,11 @@ impl App {
                 }
             }
         }
+    }
+
+    pub fn open_document_preview(&mut self, filename: String) {
+        self.pdf_modal.open(filename.clone(), None);
+        self.load_pdf(&filename);
     }
 
     pub fn check_note_content_responses(&mut self) {
@@ -6023,9 +8845,10 @@ impl App {
 
     pub fn check_papers_responses(&mut self) {
         while let Ok(result) = self.papers_receiver.try_recv() {
-            if let Some(ref mut library) = self.library_window {
-                match result {
-                    Ok(papers) => {
+            match result {
+                Ok(papers) => {
+                    self.papers_cache = papers.clone();
+                    if let Some(ref mut library) = self.library_window {
                         let library_papers: Vec<crate::ui::library_window::Paper> = papers.iter().map(|p| {
                             crate::ui::library_window::Paper {
                                 id: p.id,
@@ -6033,14 +8856,23 @@ impl App {
                                 title: p.title.clone(),
                                 authors: None,
                                 year: p.year,
+                                exists: p.exists,
                             }
                         }).collect();
                         library.set_papers(library_papers);
                     }
-                    Err(e) => {
-                        eprintln!("Failed to load papers: {}", e);
-                    }
                 }
+                Err(e) => {
+                    eprintln!("Failed to load papers: {}", e);
+                }
+            }
+            if let Some(ref mut chat) = self.chat_window {
+                chat.sync_mention_popup_from_input(
+                    &self.papers_cache,
+                    &self.graph_state,
+                    &self.chat_state.conversations,
+                    &notepad_documents_for_mentions(),
+                );
             }
         }
     }
@@ -6068,6 +8900,7 @@ impl App {
             input.cursor_position = input.text.chars().count();
             input.clear_selection();
             input.ensure_cursor_valid();
+            input.clear_ghost_text();
         }
     }
     
@@ -6082,12 +8915,14 @@ impl App {
             input.cursor_position = input.text.chars().count();
             input.clear_selection();
             input.ensure_cursor_valid();
+            input.clear_ghost_text();
         }
     }
     
     fn copy_text(&mut self, input: &crate::ui::text_input::TextInput) {
         let selected = input.get_selected_text();
         if !selected.is_empty() {
+            crate::clipboard::set_text(&selected);
             self.clipboard_text = selected;
         }
     }
@@ -6096,6 +8931,7 @@ impl App {
         let selected = input.get_selected_text();
         let current_text = input.text.clone();
         if !selected.is_empty() {
+            crate::clipboard::set_text(&selected);
             self.clipboard_text = selected;
             input.delete_selection();
             // Save state after deletion
@@ -6104,7 +8940,8 @@ impl App {
     }
     
     fn paste_text(&mut self, input: &mut crate::ui::text_input::TextInput) {
-        let clipboard = self.clipboard_text.clone();
+        let clipboard = crate::clipboard::get_text();
+        self.clipboard_text = clipboard.clone();
         let current_text = input.text.clone();
         if !clipboard.is_empty() {
             input.paste(&clipboard);
