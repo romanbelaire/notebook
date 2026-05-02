@@ -1,6 +1,6 @@
 {
   "hf_token": "",
   "model_id": "",
-  "theme": "dark",
+  "theme": "standard",
   "api_base_url": "http://localhost:8000"
 }

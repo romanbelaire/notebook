@@ -11,11 +11,15 @@ cargo run
 
 ## PDF Preview Runtime Requirements
 
-PDF preview in the modal uses PDFium through `pdfium-render`.
+PDF preview uses PDFium via `pdfium-render`. The app loads **`pdfium.dll`** (Windows), `libpdfium.so` (Linux), or `libpdfium.dylib` (macOS) in this order:
 
-- Install a PDFium runtime library for your platform.
-- Ensure the PDFium shared library is available on `PATH` before launching `notebook-native-ui`.
-- If PDFium cannot be loaded, PDF preview fails loudly with a modal error explaining that PDFium binding failed.
+1. Path from env **`NOTEBOOK_PDFIUM_DLL`** (absolute path to the shared library).
+2. Next to **`notebook-native-ui.exe`** (same folder as the executable).
+3. **`native-ui/pdfium/`** (see `pdfium/README.md` for download/extract commands).
+4. Current working directory when you launch the process (expects `pdfium.dll` in the cwd).
+5. System library search (`PATH` on Windows).
+
+Prebuilt binaries: [bblanchon/pdfium-binaries releases](https://github.com/bblanchon/pdfium-binaries/releases) — see `native-ui/pdfium/README.md` for a one-shot Windows download/copy, or drop **`pdfium.dll`** next to the exe (`NOTEBOOK_PDFIUM_DLL` also works).
 
 ### Viewer Controls
 

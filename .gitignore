@@ -32,3 +32,8 @@ openai_api.txt
 
 whisk/
 node_modules
+
+# PDFium prebuilt libs (never commit binaries)
+native-ui/pdfium/*.dll
+native-ui/pdfium/*.so
+native-ui/pdfium/*.dylib
