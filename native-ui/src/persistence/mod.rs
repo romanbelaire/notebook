@@ -2,11 +2,15 @@ pub mod document;
 pub mod conversation;
 pub mod settings;
 pub mod graph_layout;
+pub mod pdf_annotations;
+pub mod pdf_reading_positions;
 
 pub use document::DocumentPersistence;
 pub use conversation::ConversationPersistence;
 pub use settings::SettingsPersistence;
 pub use graph_layout::GraphLayoutPersistence;
+pub use pdf_annotations::PdfAnnotationPersistence;
+pub use pdf_reading_positions::{PdfReadingPositionPersistence, ReadingPosition};
 
 use std::path::PathBuf;
 use std::fs;

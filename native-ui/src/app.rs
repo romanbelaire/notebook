@@ -1098,26 +1098,69 @@ impl App {
                 if self.pdf_modal.is_open {
                     if !self.pdf_modal.contains(self.mouse_pos) {
                         self.pdf_modal.close();
+                        self.focused_input = None;
                         return;
                     }
                     if self.pdf_modal.close_button.contains(self.mouse_pos) {
                         self.pdf_modal.close();
+                        self.focused_input = None;
                         return;
                     }
-                    if self.pdf_modal.prev_page_button.contains(self.mouse_pos) && self.pdf_modal.current_page > 1 {
+
+                    // ── TOC toggle ───────────────────────────────────────────
+                    if self.pdf_modal.toc_button.contains(self.mouse_pos) {
+                        self.pdf_modal.toc_open = !self.pdf_modal.toc_open;
+                        // Re-render at new content width.
+                        if let Err(e) = self.pdf_modal.render_current_page() {
+                            self.pdf_modal.set_error(format!("Re-render failed: {}", e));
+                        }
+                        return;
+                    }
+
+                    // ── Annotate toggle ──────────────────────────────────────
+                    if self.pdf_modal.annotate_button.contains(self.mouse_pos) {
+                        self.pdf_modal.annotation_mode = !self.pdf_modal.annotation_mode;
+                        if !self.pdf_modal.annotation_mode {
+                            self.pdf_modal.cancel_annotation();
+                        }
+                        return;
+                    }
+
+                    // ── TOC item clicks ──────────────────────────────────────
+                    if self.pdf_modal.toc_open {
+                        let toc_area = self.pdf_modal.toc_area();
+                        if toc_area.contains_point(self.mouse_pos) {
+                            let scroll = self.pdf_modal.toc_scroll.scroll_offset;
+                            let rel_y = self.mouse_pos.y - toc_area.y + scroll;
+                            let index = (rel_y / crate::ui::pdf_modal::TOC_ENTRY_HEIGHT) as usize;
+                            let entries = &self.pdf_modal.pdf_renderer.toc;
+                            if index < entries.len() {
+                                let page = entries[index].page;
+                                self.pdf_modal.goto_page(page);
+                            }
+                            return;
+                        }
+                    }
+
+                    // ── Search bar click ─────────────────────────────────────
+                    if self.pdf_modal.search_active {
+                        let bar = self.pdf_modal.search_bar_rect();
+                        if bar.contains_point(self.mouse_pos) {
+                            self.pdf_modal.search_input.on_focus();
+                            self.pdf_modal.search_input.on_mouse_down(self.mouse_pos, self.click_count);
+                            self.focused_input = Some(31);
+                            return;
+                        }
+                    }
+
+                    // ── Footer navigation ────────────────────────────────────
+                    if self.pdf_modal.prev_page_button.contains(self.mouse_pos) {
                         self.pdf_modal.prev_page();
                         return;
                     }
                     if self.pdf_modal.next_page_button.contains(self.mouse_pos) {
-                        if let Some(total) = self.pdf_modal.total_pages {
-                            if self.pdf_modal.current_page < total {
-                                self.pdf_modal.next_page();
-                                return;
-                            }
-                        } else {
-                            self.pdf_modal.next_page();
-                            return;
-                        }
+                        self.pdf_modal.next_page();
+                        return;
                     }
                     if self.pdf_modal.zoom_in_button.contains(self.mouse_pos) {
                         self.pdf_modal.zoom_in();
@@ -1131,6 +1174,62 @@ impl App {
                         self.pdf_modal.zoom_reset();
                         return;
                     }
+
+                    // ── Goto-page input click ────────────────────────────────
+                    {
+                        let goto_rect = crate::ui::core::Rect::from_pos_size(
+                            self.pdf_modal.goto_input.position,
+                            self.pdf_modal.goto_input.size,
+                        );
+                        // Also accept clicks on the page-counter text area (generous hit zone).
+                        let footer_y = self.pdf_modal.position.y + self.pdf_modal.size.y
+                            - crate::ui::pdf_modal::FOOTER_HEIGHT;
+                        let page_counter_zone = crate::ui::core::Rect::new(
+                            self.pdf_modal.position.x + 200.0,
+                            footer_y,
+                            300.0,
+                            crate::ui::pdf_modal::FOOTER_HEIGHT,
+                        );
+                        if goto_rect.contains_point(self.mouse_pos)
+                            || page_counter_zone.contains_point(self.mouse_pos)
+                        {
+                            let page_str = self.pdf_modal.current_page.to_string();
+                            self.pdf_modal.goto_input.text = page_str.clone();
+                            self.pdf_modal.goto_input.cursor_position = page_str.len();
+                            self.pdf_modal.goto_input.on_focus();
+                            self.pdf_modal.goto_active = true;
+                            self.focused_input = Some(30);
+                            return;
+                        }
+                    }
+
+                    // ── Content area: annotation drag or note-input commit ───
+                    let content_area = self.pdf_modal.content_area();
+                    if content_area.contains_point(self.mouse_pos) {
+                        if self.pdf_modal.note_active {
+                            // Click on note input
+                            if self.pdf_modal.note_input.contains(self.mouse_pos) {
+                                self.pdf_modal.note_input.on_focus();
+                                self.pdf_modal.note_input.on_mouse_down(self.mouse_pos, self.click_count);
+                                self.focused_input = Some(32);
+                                return;
+                            }
+                        } else if self.pdf_modal.annotation_mode {
+                            self.pdf_modal.begin_annotation_drag(self.mouse_pos);
+                            self.focused_input = None;
+                            return;
+                        }
+                    }
+
+                    // Deselect goto / search inputs on click elsewhere
+                    if self.pdf_modal.goto_active {
+                        self.pdf_modal.goto_active = false;
+                        self.pdf_modal.goto_input.on_blur();
+                        if self.focused_input == Some(30) {
+                            self.focused_input = None;
+                        }
+                    }
+
                     return;
                 }
 
@@ -3540,6 +3639,18 @@ impl App {
     
     /// Handle drag end
     pub fn on_mouse_drag_end(&mut self, position: Vec2) {
+        // Finalise PDF annotation drag
+        if self.pdf_modal.is_open
+            && self.pdf_modal.annotation_mode
+            && self.pdf_modal.annotation_drag_start.is_some()
+        {
+            self.pdf_modal.update_annotation_drag(position);
+            if self.pdf_modal.finish_annotation_drag() {
+                self.pdf_modal.note_input.on_focus();
+                self.focused_input = Some(32);
+            }
+        }
+
         if let Some(_button) = self.drag_button {
             // Route drag end to appropriate component
             // For now, handle text selection in editors
@@ -3805,6 +3916,42 @@ impl App {
             || self.modifiers.contains(winit::keyboard::ModifiersState::CONTROL);
         let shift = self.modifiers.contains(winit::keyboard::ModifiersState::SHIFT);
 
+        // ── PDF modal: scroll / zoom ─────────────────────────────────────────
+        if self.pdf_modal.is_open && self.pdf_modal.contains(self.mouse_pos) {
+            // TOC panel: scroll the TOC list
+            if self.pdf_modal.toc_open
+                && self.pdf_modal.toc_area().contains_point(self.mouse_pos)
+            {
+                self.pdf_modal.toc_scroll.scroll(-scroll_amount);
+                return;
+            }
+
+            if ctrl {
+                if scroll_amount > 0.0 {
+                    self.pdf_modal.zoom_in();
+                } else {
+                    self.pdf_modal.zoom_out();
+                }
+            } else if shift {
+                // Horizontal scroll
+                if let Some(ref r) = self.pdf_modal.rendered_page {
+                    let content = self.pdf_modal.content_area();
+                    let max_x = (r.width as f32 - content.width).max(0.0);
+                    self.pdf_modal.scroll_x =
+                        (self.pdf_modal.scroll_x - scroll_amount_x).clamp(0.0, max_x);
+                }
+            } else {
+                // Vertical scroll
+                if let Some(ref r) = self.pdf_modal.rendered_page {
+                    let content = self.pdf_modal.content_area();
+                    let max_y = (r.height as f32 - content.height).max(0.0);
+                    self.pdf_modal.scroll_y =
+                        (self.pdf_modal.scroll_y - scroll_amount).clamp(0.0, max_y);
+                }
+            }
+            return;
+        }
+
         // Handle scrolling for sidebar conversations and documents
         if self.sidebar.hit_test(self.mouse_pos) {
             if self.sidebar.conversations_list.contains(self.mouse_pos - self.sidebar.position) {
@@ -4036,6 +4183,35 @@ impl App {
                         return; // Consume Tab key
                     }
                     KeyCode::Enter => {
+                    // PDF modal Enter handling
+                    if self.pdf_modal.is_open {
+                        if self.focused_input == Some(30) && self.pdf_modal.goto_active {
+                            // Commit goto-page
+                            if let Ok(page) = self.pdf_modal.goto_input.text.parse::<u32>() {
+                                self.pdf_modal.goto_page(page);
+                            }
+                            self.pdf_modal.goto_active = false;
+                            self.pdf_modal.goto_input.on_blur();
+                            self.focused_input = None;
+                            return;
+                        }
+                        if self.focused_input == Some(31) && self.pdf_modal.search_active {
+                            let shift = self.modifiers.contains(ModifiersState::SHIFT);
+                            if self.pdf_modal.search_matches.is_empty() {
+                                self.pdf_modal.search_run();
+                            } else if shift {
+                                self.pdf_modal.search_prev();
+                            } else {
+                                self.pdf_modal.search_next();
+                            }
+                            return;
+                        }
+                        if self.focused_input == Some(32) && self.pdf_modal.note_active {
+                            self.pdf_modal.commit_annotation();
+                            self.focused_input = None;
+                            return;
+                        }
+                    }
                     // Handle insight modal save
                     if self.insight_modal.is_open && (self.insight_modal.is_editing_title || self.insight_modal.is_editing_text) {
                         if let Some(ref insight) = self.insight_modal.insight {
@@ -4425,7 +4601,24 @@ impl App {
                     }
                     
                     if self.pdf_modal.is_open {
+                        if self.pdf_modal.note_active {
+                            self.pdf_modal.cancel_annotation();
+                            self.focused_input = None;
+                            return;
+                        }
+                        if self.pdf_modal.goto_active {
+                            self.pdf_modal.goto_active = false;
+                            self.pdf_modal.goto_input.on_blur();
+                            self.focused_input = None;
+                            return;
+                        }
+                        if self.pdf_modal.search_active {
+                            self.pdf_modal.close_search();
+                            self.focused_input = None;
+                            return;
+                        }
                         self.pdf_modal.close();
+                        self.focused_input = None;
                         return;
                     }
                     
@@ -4534,6 +4727,16 @@ impl App {
                     let shift_pressed = self.modifiers.contains(ModifiersState::SHIFT);
                     let ctrl_pressed = self.modifiers.contains(ModifiersState::CONTROL);
 
+                    // PDF modal: prev page (when no text input focused)
+                    if self.pdf_modal.is_open
+                        && self.focused_input != Some(30)
+                        && self.focused_input != Some(31)
+                        && self.focused_input != Some(32)
+                    {
+                        self.pdf_modal.prev_page();
+                        return;
+                    }
+
                     // Ctrl+Left: Toggle sidebar (global, regardless of input focus)
                     if ctrl_pressed && !shift_pressed {
                         self.sidebar.toggle();
@@ -4565,6 +4768,15 @@ impl App {
                     });
                 }
                     KeyCode::ArrowRight => {
+                    // PDF modal: next page (when no text input focused)
+                    if self.pdf_modal.is_open
+                        && self.focused_input != Some(30)
+                        && self.focused_input != Some(31)
+                        && self.focused_input != Some(32)
+                    {
+                        self.pdf_modal.next_page();
+                        return;
+                    }
                     let shift_pressed = self.modifiers.contains(ModifiersState::SHIFT);
                     let ctrl_pressed = self.modifiers.contains(ModifiersState::CONTROL);
 
@@ -4593,6 +4805,15 @@ impl App {
                     KeyCode::Home => {
                     let shift_pressed = self.modifiers.contains(ModifiersState::SHIFT);
                     let alt_pressed = self.modifiers.contains(ModifiersState::ALT);
+                    // PDF modal: go to first page
+                    if self.pdf_modal.is_open
+                        && self.focused_input != Some(30)
+                        && self.focused_input != Some(31)
+                        && self.focused_input != Some(32)
+                    {
+                        self.pdf_modal.goto_page(1);
+                        return;
+                    }
                     // Alt+Home: center camera on active node (constellation)
                     if alt_pressed && self.ui_state.active_tab == Tab::Chat && self.graph_state.constellation_view_active() {
                         if let Some(ref leaf) = self.graph_state.current_leaf_id {
@@ -4613,6 +4834,15 @@ impl App {
                 }
                     KeyCode::KeyF => {
                     let alt_pressed = self.modifiers.contains(ModifiersState::ALT);
+                    let ctrl_pressed = self.modifiers.contains(ModifiersState::CONTROL)
+                        || self.modifiers.contains(ModifiersState::SUPER);
+                    // Ctrl+F in PDF modal → open search
+                    if ctrl_pressed && self.pdf_modal.is_open {
+                        self.pdf_modal.search_active = true;
+                        self.pdf_modal.search_input.on_focus();
+                        self.focused_input = Some(31);
+                        return;
+                    }
                     // Alt+F: fit graph in view (constellation)
                     if alt_pressed && self.ui_state.active_tab == Tab::Chat && self.graph_state.constellation_view_active() {
                         if let Some(chat) = self.chat_window.as_mut() {
@@ -4625,6 +4855,17 @@ impl App {
                 }
                     KeyCode::End => {
                     let shift_pressed = self.modifiers.contains(ModifiersState::SHIFT);
+                    // PDF modal: go to last page
+                    if self.pdf_modal.is_open
+                        && self.focused_input != Some(30)
+                        && self.focused_input != Some(31)
+                        && self.focused_input != Some(32)
+                    {
+                        if let Some(total) = self.pdf_modal.total_pages {
+                            self.pdf_modal.goto_page(total);
+                        }
+                        return;
+                    }
                     // Use router for End key
                     self.route_to_focused_editor(|editor| {
                         editor.on_end(shift_pressed);
@@ -5281,6 +5522,14 @@ impl App {
                     });
                 }
                 KeyCode::ArrowUp => {
+                    if self.pdf_modal.is_open
+                        && self.focused_input != Some(30)
+                        && self.focused_input != Some(31)
+                        && self.focused_input != Some(32)
+                    {
+                        self.pdf_modal.prev_page();
+                        return;
+                    }
                     if self.focused_input == Some(0) {
                         if let Some(ref mut chat) = self.chat_window {
                             if chat.mention_popup_open && !chat.mention_rows.is_empty() {
@@ -5324,6 +5573,14 @@ impl App {
                     });
                 }
                 KeyCode::ArrowDown => {
+                    if self.pdf_modal.is_open
+                        && self.focused_input != Some(30)
+                        && self.focused_input != Some(31)
+                        && self.focused_input != Some(32)
+                    {
+                        self.pdf_modal.next_page();
+                        return;
+                    }
                     if self.focused_input == Some(0) {
                         if let Some(ref mut chat) = self.chat_window {
                             if chat.mention_popup_open && !chat.mention_rows.is_empty() {
@@ -6653,6 +6910,35 @@ impl App {
                     self.cursor_visible = true;
                 }
             }
+            Some(30) => { // PDF modal goto-page input
+                if self.pdf_modal.is_open && self.pdf_modal.goto_active {
+                    f(&mut self.pdf_modal.goto_input as &mut dyn TextEditor);
+                    self.cursor_target_position = self.pdf_modal.goto_input.get_cursor_position();
+                    self.cursor_blink_timer = 0.0;
+                    self.cursor_visible = true;
+                }
+            }
+            Some(31) => { // PDF modal search input
+                if self.pdf_modal.is_open && self.pdf_modal.search_active {
+                    let prev_text = self.pdf_modal.search_input.text.clone();
+                    f(&mut self.pdf_modal.search_input as &mut dyn TextEditor);
+                    self.cursor_target_position = self.pdf_modal.search_input.get_cursor_position();
+                    self.cursor_blink_timer = 0.0;
+                    self.cursor_visible = true;
+                    // Re-run search if query changed
+                    if self.pdf_modal.search_input.text != prev_text {
+                        self.pdf_modal.search_run();
+                    }
+                }
+            }
+            Some(32) => { // PDF modal annotation note input
+                if self.pdf_modal.is_open && self.pdf_modal.note_active {
+                    f(&mut self.pdf_modal.note_input as &mut dyn TextEditor);
+                    self.cursor_target_position = self.pdf_modal.note_input.get_cursor_position();
+                    self.cursor_blink_timer = 0.0;
+                    self.cursor_visible = true;
+                }
+            }
             _ => {}
         }
     }
@@ -6920,6 +7206,16 @@ impl App {
         }
         if self.pdf_modal.is_open {
             self.pdf_modal.update_layout(self.viewport_size);
+            self.pdf_modal.toc_scroll.update(dt);
+            if self.pdf_modal.goto_active {
+                self.pdf_modal.goto_input.update(dt);
+            }
+            if self.pdf_modal.search_active {
+                self.pdf_modal.search_input.update(dt);
+            }
+            if self.pdf_modal.note_active {
+                self.pdf_modal.note_input.update(dt);
+            }
         }
         if self.collection_modal.is_open {
             self.collection_modal.update_layout(self.viewport_size);
@@ -7276,6 +7572,15 @@ impl App {
     
     /// Handle mouse drag (during drag operation)
     fn on_mouse_drag(&mut self, position: Vec2) {
+        // PDF modal annotation drag
+        if self.pdf_modal.is_open
+            && self.pdf_modal.annotation_mode
+            && self.pdf_modal.annotation_drag_start.is_some()
+        {
+            self.pdf_modal.update_annotation_drag(position);
+            return;
+        }
+
         // Shard move: apply screen delta as world delta to node position
         if let Some((ref id, last_pos)) = self.shard_move_drag {
             if let Some(ref mut chat) = self.chat_window {
