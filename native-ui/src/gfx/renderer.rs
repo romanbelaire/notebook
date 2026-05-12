@@ -3503,41 +3503,7 @@ impl Renderer {
                 .cloned()
                 .collect();
             if !layer_image_draws.is_empty() {
-                let mut image_bind_groups: Vec<(ImageDrawCommand, wgpu::Buffer, wgpu::BindGroup)> =
-                    Vec::new();
-                for draw in &layer_image_draws {
-                    let Some(entry) = self.image_texture_cache.get(&draw.cache_key) else {
-                        continue;
-                    };
-                    let uv_data: [u8; 16] = bytemuck::cast([0.0f32, 0.0f32, 1.0f32, 1.0f32]);
-                    let uv_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("pdf_blit_uv"),
-                        size: 16,
-                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    });
-                    self.queue.write_buffer(&uv_buffer, 0, &uv_data);
-                    let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("pdf_image_bind"),
-                        layout: &self.blit_rect_bind_group_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(&entry.view),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::Sampler(&self.vello_sampler),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: uv_buffer.as_entire_binding(),
-                            },
-                        ],
-                    });
-                    image_bind_groups.push((draw.clone(), uv_buffer, bind_group));
-                }
-                if !image_bind_groups.is_empty() {
+                if !layer_image_draws.is_empty() {
                     let mut image_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("pdf_image_blit"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3553,19 +3519,65 @@ impl Renderer {
                         occlusion_query_set: None,
                     });
                     image_pass.set_pipeline(&self.blit_rect_pipeline);
-                    for (draw, _uv_buffer, bind_group) in &image_bind_groups {
+                    for draw in &layer_image_draws {
+                        let Some(entry) = self.image_texture_cache.get(&draw.cache_key) else {
+                            continue;
+                        };
                         let (x, y, w, h) = draw.dest_rect;
                         if w <= 0.0 || h <= 0.0 {
                             continue;
                         }
-                        let vp_x = x.max(0.0).round() as u32;
-                        let vp_y = y.max(0.0).round() as u32;
-                        let vp_w = w.round() as u32;
-                        let vp_h = h.round() as u32;
+                        let screen_w = self.config.width as f32;
+                        let screen_h = self.config.height as f32;
+                        let Some((clip_left, clip_top, clip_right, clip_bottom)) =
+                            dest_rect_clip_against_bounds(x, y, w, h, 0.0, 0.0, screen_w, screen_h)
+                        else {
+                            continue;
+                        };
+                        let visible_w = (w - clip_left - clip_right).max(0.0);
+                        let visible_h = (h - clip_top - clip_bottom).max(0.0);
+                        let vp_x = (x + clip_left).max(0.0).round() as u32;
+                        let vp_y = (y + clip_top).max(0.0).round() as u32;
+                        let vp_w =
+                            (visible_w.round() as u32).min(self.config.width.saturating_sub(vp_x));
+                        let vp_h =
+                            (visible_h.round() as u32).min(self.config.height.saturating_sub(vp_y));
                         if vp_w == 0 || vp_h == 0 {
                             continue;
                         }
-                        image_pass.set_bind_group(0, bind_group, &[]);
+
+                        let u_min = clip_left / w;
+                        let v_min = clip_top / h;
+                        let u_max = 1.0 - (clip_right / w);
+                        let v_max = 1.0 - (clip_bottom / h);
+                        let uv_data: [u8; 16] = bytemuck::cast([u_min, v_min, u_max, v_max]);
+                        let uv_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("pdf_blit_uv"),
+                            size: 16,
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
+                        self.queue.write_buffer(&uv_buffer, 0, &uv_data);
+                        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("pdf_image_bind"),
+                            layout: &self.blit_rect_bind_group_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::TextureView(&entry.view),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::Sampler(&self.vello_sampler),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: uv_buffer.as_entire_binding(),
+                                },
+                            ],
+                        });
+
+                        image_pass.set_bind_group(0, &bind_group, &[]);
                         image_pass.set_viewport(
                             vp_x as f32,
                             vp_y as f32,
@@ -3575,12 +3587,14 @@ impl Renderer {
                             1.0,
                         );
                         if let Some(scissor) = draw.scissor {
-                            image_pass.set_scissor_rect(
-                                scissor.x,
-                                scissor.y,
-                                scissor.width,
-                                scissor.height,
-                            );
+                            let sx = scissor.x.min(self.config.width);
+                            let sy = scissor.y.min(self.config.height);
+                            let sw = scissor.width.min(self.config.width.saturating_sub(sx));
+                            let sh = scissor.height.min(self.config.height.saturating_sub(sy));
+                            if sw == 0 || sh == 0 {
+                                continue;
+                            }
+                            image_pass.set_scissor_rect(sx, sy, sw, sh);
                         } else {
                             image_pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
                         }

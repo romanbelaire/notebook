@@ -17,9 +17,10 @@ __pycache__/
 # Local data
 db/
 data/
+dev_docs/
 native-ui/data/
 notes/
-
+examples/
 # Misc
 *.log
 .DS_Store

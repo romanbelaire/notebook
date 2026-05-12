@@ -8,6 +8,7 @@ pub mod chat;
 pub mod glow;
 pub mod modals;
 pub mod toasts;
+pub mod slate;
 pub mod library;
 pub mod data;
 pub mod settings;

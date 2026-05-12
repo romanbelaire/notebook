@@ -1,10 +1,11 @@
-use crate::ui::{SubWindow, HeaderWindow, SidebarWindow, ChatWindow, LibraryWindow, IngestWindow, SettingsWindow, NotepadWindow, InsightModal, PdfModal, ChatInfoDialog, ToastManager, NotepadModal, TextEditor, GlobalSearchModal, ShardModal, IngestImportFailuresModal, SystemPromptsModal, CollectionModal, DocumentKind};
+use crate::ui::{SubWindow, HeaderWindow, SidebarWindow, ChatWindow, LibraryWindow, IngestWindow, SettingsWindow, NotepadWindow, InsightModal, PdfModal, ChatInfoDialog, ToastManager, NotepadModal, TextEditor, GlobalSearchModal, ShardModal, IngestImportFailuresModal, SystemPromptsModal, CollectionModal, DocumentKind, SlateState};
 use crate::ui::tab_bar::Tab;
 use crate::ui::chat_window::{ChatMessage, Citation, MessageRole};
 use crate::state::{ChatState, GraphState, UIState, SettingsState, InsightsState};
 use crate::api::ApiClient;
 use crate::api::models::Collection;
-use crate::persistence::{ConversationPersistence, SettingsPersistence};
+use crate::persistence::{ConversationPersistence, KnowledgeGraphStore, SettingsPersistence};
+use crate::knowledge::model::{GraphRef, RefKind, shard_external_id};
 use glam::Vec2;
 use winit::event::{ElementState, MouseButton};
 use winit::event_loop::EventLoopProxy;
@@ -142,7 +143,14 @@ pub struct App {
     pub last_click_time: std::time::Instant,
     pub last_click_position: Vec2,
     pub click_count: u32,  // 1 = single, 2 = double, 3 = triple
+    /// Local SQLite-backed knowledge graph (events + edges).
+    pub knowledge_graph: KnowledgeGraphStore,
+    /// Paste board (Slate): application-managed stash list.
+    pub slate: SlateState,
+    slate_stash_shortcut_id: crate::ui::shortcuts::ShortcutId,
     // Clipboard state
+    /// When set, last in-app copy came from this ref (e.g. constellation shard copy) for `content_transfer` on paste.
+    clipboard_copy_source_ref: Option<GraphRef>,
     pub clipboard_text: String,
     pub undo_history: Vec<String>,  // History of text states for undo
     pub redo_history: Vec<String>,  // History for redo
@@ -526,6 +534,30 @@ impl App {
             chat_state.conversations.iter().find(|c| c.id == *cid).and_then(|c| c.graph_id.clone())
         });
 
+        let knowledge_graph =
+            KnowledgeGraphStore::open().expect("knowledge graph SQLite open failed");
+
+        let (shortcut_registry, slate_stash_shortcut_id) = {
+            let mut registry = crate::ui::shortcuts::ShortcutRegistry::new();
+            use winit::keyboard::{KeyCode, ModifiersState};
+            registry.register(ModifiersState::SUPER, KeyCode::KeyN, "New conversation (Mac)".to_string());
+            registry.register(ModifiersState::CONTROL, KeyCode::KeyN, "New conversation (Win/Linux)".to_string());
+            registry.register(ModifiersState::SUPER, KeyCode::KeyK, "Global search (Mac)".to_string());
+            registry.register(ModifiersState::CONTROL, KeyCode::KeyK, "Global search (Win/Linux)".to_string());
+            registry.register(ModifiersState::SUPER, KeyCode::Comma, "Open settings (Mac)".to_string());
+            registry.register(ModifiersState::CONTROL, KeyCode::Comma, "Open settings (Win/Linux)".to_string());
+            registry.register(ModifiersState::SUPER, KeyCode::KeyB, "Toggle sidebar (Mac)".to_string());
+            registry.register(ModifiersState::CONTROL, KeyCode::KeyB, "Toggle sidebar (Win/Linux)".to_string());
+            registry.register(ModifiersState::SUPER, KeyCode::Enter, "Send message (Mac)".to_string());
+            registry.register(ModifiersState::CONTROL, KeyCode::Enter, "Send message (Win/Linux)".to_string());
+            let slate_stash_shortcut_id = registry.register(
+                ModifiersState::CONTROL.union(ModifiersState::ALT),
+                KeyCode::KeyV,
+                "Stash selection to Slate".to_string(),
+            );
+            (registry, slate_stash_shortcut_id)
+        };
+
         let app = Self {
             windows: Vec::new(),  // No demo windows
             header,
@@ -605,6 +637,10 @@ impl App {
             last_click_time: std::time::Instant::now(),
             last_click_position: Vec2::ZERO,
             click_count: 0,
+            knowledge_graph,
+            slate: SlateState::new(),
+            slate_stash_shortcut_id,
+            clipboard_copy_source_ref: None,
             clipboard_text: String::new(),
             undo_history: Vec::new(),
             redo_history: Vec::new(),
@@ -619,36 +655,7 @@ impl App {
             file_drag_active: false,
             file_drag_paths: Vec::new(),
             file_drag_position: Vec2::ZERO,
-            shortcut_registry: {
-                let mut registry = crate::ui::shortcuts::ShortcutRegistry::new();
-                use winit::keyboard::{KeyCode, ModifiersState};
-                
-                // Register keyboard shortcuts
-                // Note: On macOS, SUPER is Command; on Windows/Linux, CONTROL is Ctrl
-                // We register both variants for cross-platform support
-                
-                // Cmd/Ctrl+N: New conversation
-                registry.register(ModifiersState::SUPER, KeyCode::KeyN, "New conversation (Mac)".to_string());
-                registry.register(ModifiersState::CONTROL, KeyCode::KeyN, "New conversation (Win/Linux)".to_string());
-                
-                // Cmd/Ctrl+K: Global search
-                registry.register(ModifiersState::SUPER, KeyCode::KeyK, "Global search (Mac)".to_string());
-                registry.register(ModifiersState::CONTROL, KeyCode::KeyK, "Global search (Win/Linux)".to_string());
-                
-                // Cmd/Ctrl+,: Settings
-                registry.register(ModifiersState::SUPER, KeyCode::Comma, "Open settings (Mac)".to_string());
-                registry.register(ModifiersState::CONTROL, KeyCode::Comma, "Open settings (Win/Linux)".to_string());
-                
-                // Cmd/Ctrl+B: Toggle sidebar
-                registry.register(ModifiersState::SUPER, KeyCode::KeyB, "Toggle sidebar (Mac)".to_string());
-                registry.register(ModifiersState::CONTROL, KeyCode::KeyB, "Toggle sidebar (Win/Linux)".to_string());
-                
-                // Cmd/Ctrl+Enter: Send message
-                registry.register(ModifiersState::SUPER, KeyCode::Enter, "Send message (Mac)".to_string());
-                registry.register(ModifiersState::CONTROL, KeyCode::Enter, "Send message (Win/Linux)".to_string());
-                
-                registry
-            },
+            shortcut_registry,
             pressed_keys: std::collections::HashSet::new(),
             active_touches: std::collections::HashMap::new(),
             focus_state: crate::ui::events::FocusState::default(),
@@ -674,6 +681,7 @@ impl App {
                 use crate::gfx::components::background::BACKGROUND_VIEWPORT;
                 use crate::gfx::components::glow::GLOW_VIEWPORT;
                 use crate::gfx::components::toasts::TOASTS_VIEWPORT;
+                use crate::gfx::components::slate::SLATE_VIEWPORT;
                 let mut root = Root::new(viewport);
                 
                 // Background / glow / toasts are Renderables (z 0, 5, 90) so Root batches align with the main tree.
@@ -688,6 +696,7 @@ impl App {
                 root.add_child(Box::new(NotepadComponent::new()));
                 root.add_child(Box::new(SidebarComponent::new()));
                 root.add_child(Box::new(SidebarContentComponent::new()));
+                root.add_child(Box::new(SLATE_VIEWPORT));
                 root.add_child(Box::new(TOASTS_VIEWPORT));
                 root.add_child(Box::new(HeaderComponent::new())); // Header last (highest z-order)
                 
@@ -710,6 +719,121 @@ impl App {
     /// Call when viewport, sidebar open/width, or active tab has changed so root layout is re-run next frame.
     fn bump_layout_generation(&mut self) {
         self.layout_generation = self.layout_generation.wrapping_add(1);
+    }
+
+    /// Stash current selection (or focused field text) onto Slate; records `SlatePushEvent` in the knowledge graph.
+    fn stash_selection_to_slate(&mut self) {
+        let preview = match self.focused_input {
+            Some(0) => self.chat_window.as_ref().map(|c| {
+                let s = c.input_field.get_selected_text();
+                if !s.is_empty() {
+                    s
+                } else {
+                    c.input_field.text.clone()
+                }
+            }),
+            Some(5) => self
+                .notepad_window
+                .as_ref()
+                .map(|n| n.editor.get_selected_text()),
+            _ => None,
+        };
+        let preview = preview
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(crate::clipboard::get_text);
+        if preview.trim().is_empty() {
+            self.show_error_toast("Nothing to stash".to_string());
+            return;
+        }
+        let preview_for_storage = if preview.len() > 4096 {
+            preview[..4096].to_string()
+        } else {
+            preview.clone()
+        };
+        let preview_len = preview_for_storage.len() as u32;
+        let preview_ui = if preview_for_storage.len() > 120 {
+            format!("{}…", &preview_for_storage[..120])
+        } else {
+            preview_for_storage.clone()
+        };
+        let id = self.slate.push_preview(preview_ui);
+        match self.knowledge_graph.record_slate_push_event(&id, preview_len) {
+            Ok(_) => {}
+            Err(e) => log::warn!("slate push KG record: {}", e),
+        }
+        self.show_success_toast(format!("Slate: {} item(s)", self.slate.entries.len()));
+    }
+
+    fn record_knowledge_compile_send(&mut self, graph_id: &str, request: &crate::api::models::GraphSendRequest) {
+        match self
+            .knowledge_graph
+            .record_compile_context_attach(graph_id, &request.mentions)
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => {}
+            Err(e) => log::warn!("knowledge graph compile context record: {}", e),
+        }
+    }
+
+    /// Link a notepad document block to a knowledge node via `contains` edges (document → segment → node).
+    pub fn kg_record_contains_knowledge_under_block(
+        &mut self,
+        document_id: &str,
+        block_id: &str,
+        knowledge_node_id: &str,
+    ) {
+        match self.knowledge_graph.record_contains_knowledge_under_block(
+            document_id,
+            block_id,
+            knowledge_node_id,
+        ) {
+            Ok(_) => {}
+            Err(e) => log::warn!("knowledge graph contains record: {}", e),
+        }
+    }
+
+    /// Attach multiple constellation shards as provenance for one knowledge node (`generated_from` edges).
+    pub fn kg_attach_shards_to_knowledge_node(
+        &mut self,
+        knowledge_node_id: &str,
+        shard_ids: &[String],
+    ) {
+        let Some(gid) = self.graph_state.graph_id.clone() else {
+            log::warn!("kg_attach_shards_to_knowledge_node: no graph_id");
+            return;
+        };
+        match self
+            .knowledge_graph
+            .attach_shards_to_knowledge_node(knowledge_node_id, &gid, shard_ids)
+        {
+            Ok(_) => {}
+            Err(e) => log::warn!("knowledge graph shard attach: {}", e),
+        }
+    }
+
+    fn kg_record_clipboard_paste_to_graph(&mut self) {
+        let Some(gid) = self.graph_state.graph_id.clone() else {
+            return;
+        };
+        let Some(from) = self.clipboard_copy_source_ref.take() else {
+            return;
+        };
+        let to = GraphRef::new(RefKind::Graph, gid);
+        match self.knowledge_graph.record_content_transfer(from, to, None) {
+            Ok(_) => {}
+            Err(e) => log::warn!("knowledge graph content_transfer (graph): {}", e),
+        }
+    }
+
+    fn kg_record_clipboard_paste_to_document(&mut self, document_id: &str) {
+        let Some(from) = self.clipboard_copy_source_ref.take() else {
+            return;
+        };
+        let to = GraphRef::new(RefKind::Document, document_id.to_string());
+        match self.knowledge_graph.record_content_transfer(from, to, None) {
+            Ok(_) => {}
+            Err(e) => log::warn!("knowledge graph content_transfer (document): {}", e),
+        }
     }
 
     pub fn resize(&mut self, size: (u32, u32)) {
@@ -909,6 +1033,15 @@ impl App {
                                                 let text = node.shard.clipboard_plain_text();
                                                 crate::clipboard::set_text(&text);
                                                 self.clipboard_text = text;
+                                                let gid = self
+                                                    .graph_state
+                                                    .graph_id
+                                                    .clone()
+                                                    .expect("constellation shard copy requires graph_id");
+                                                self.clipboard_copy_source_ref = Some(GraphRef::new(
+                                                    RefKind::Shard,
+                                                    shard_external_id(&gid, node_id),
+                                                ));
                                             }
                                             5 => {
                                                 if let Some(ref mut cw) = self.chat_window {
@@ -2396,6 +2529,7 @@ impl App {
                 }
                 if let Some((graph_id, request, text)) = send_pending {
                     log::info!("chat send: POST /graph/{}/send", graph_id);
+                    self.record_knowledge_compile_send(&graph_id, &request);
                     self.save_chat_state();
                     let client = self.api_client.client.clone();
                     let base_url = self.api_client.base_url.clone();
@@ -4519,6 +4653,7 @@ impl App {
                         }
                     }
                     if let Some((graph_id, request, text)) = enter_send_pending {
+                        self.record_knowledge_compile_send(&graph_id, &request);
                         self.save_chat_state();
                         let client = self.api_client.client.clone();
                         let base_url = self.api_client.base_url.clone();
@@ -4779,6 +4914,13 @@ impl App {
                     }
                     let shift_pressed = self.modifiers.contains(ModifiersState::SHIFT);
                     let ctrl_pressed = self.modifiers.contains(ModifiersState::CONTROL);
+
+                    // Ctrl+Right: Toggle Slate paste board (global, regardless of input focus)
+                    if ctrl_pressed && !shift_pressed {
+                        self.slate.visible = !self.slate.visible;
+                        self.bump_layout_generation();
+                        return;
+                    }
 
                     // Bare right arrow: next sibling in constellation
                     if !ctrl_pressed && !shift_pressed && self.ui_state.active_tab == Tab::Chat && self.graph_state.constellation_view_active() && self.focused_input.is_none() {
@@ -6208,6 +6350,7 @@ impl App {
     }
 
     pub fn clipboard_apply_copy(&mut self) {
+        self.clipboard_copy_source_ref = None;
         match self.focused_input {
             Some(0) => {
                 if let Some(ref chat) = self.chat_window {
@@ -6424,6 +6567,7 @@ impl App {
                         self.cursor_target_position = chat.input_field.cursor_position;
                         self.cursor_blink_timer = 0.0;
                         self.cursor_visible = true;
+                        self.kg_record_clipboard_paste_to_graph();
                     }
                 }
             }
@@ -6701,10 +6845,16 @@ impl App {
             Some(5) => {
                 // Notepad - paste
                 if let Some(ref mut notepad) = self.notepad_window {
+                    let doc_id = notepad
+                        .editor
+                        .document_id
+                        .clone()
+                        .expect("notepad paste requires open document");
                     let clipboard = crate::clipboard::get_text();
                     self.clipboard_text = clipboard.clone();
                     if !clipboard.is_empty() {
                         notepad.editor.paste(&clipboard);
+                        self.kg_record_clipboard_paste_to_document(&doc_id);
                     }
                 }
             }
@@ -7697,6 +7847,11 @@ impl App {
     /// Handle shortcut triggered
     fn on_shortcut_triggered(&mut self, shortcut_id: crate::ui::shortcuts::ShortcutId) {
         use winit::keyboard::{KeyCode, ModifiersState};
+
+        if shortcut_id == self.slate_stash_shortcut_id {
+            self.stash_selection_to_slate();
+            return;
+        }
         
         // Find the shortcut to get its key
         let shortcut = self.shortcut_registry.all()
@@ -7779,6 +7934,7 @@ impl App {
                                 }
                             }
                             if let Some((graph_id, request, text)) = shortcut_send_pending {
+                                self.record_knowledge_compile_send(&graph_id, &request);
                                 self.save_chat_state();
                                 let client = self.api_client.client.clone();
                                 let base_url = self.api_client.base_url.clone();

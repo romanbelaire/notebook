@@ -8,6 +8,7 @@ mod api;
 mod utils;
 mod stylus;
 mod persistence;
+mod knowledge;
 
 
 use crate::app::App;

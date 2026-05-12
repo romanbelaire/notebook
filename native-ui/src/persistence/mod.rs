@@ -4,6 +4,7 @@ pub mod settings;
 pub mod graph_layout;
 pub mod pdf_annotations;
 pub mod pdf_reading_positions;
+pub mod knowledge_graph;
 
 pub use document::DocumentPersistence;
 pub use conversation::ConversationPersistence;
@@ -11,6 +12,7 @@ pub use settings::SettingsPersistence;
 pub use graph_layout::GraphLayoutPersistence;
 pub use pdf_annotations::PdfAnnotationPersistence;
 pub use pdf_reading_positions::{PdfReadingPositionPersistence, ReadingPosition};
+pub use knowledge_graph::KnowledgeGraphStore;
 
 use std::path::PathBuf;
 use std::fs;

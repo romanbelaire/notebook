@@ -34,6 +34,7 @@ pub mod system_prompts_modal;
 pub mod icons;
 pub mod toolbar;
 pub mod shadow;
+pub mod slate;
 
 pub use window::SubWindow;
 pub use button::{Button, ButtonState};
@@ -64,4 +65,5 @@ pub use system_prompts_modal::SystemPromptsModal;
 pub use toolbar::{Toolbar, ToolbarButton};
 pub use components::VStack;
 pub use shadow::{BorderHighlightSpec, InnerShadowSpec, ShadowSpec, SurfaceHighlightSpec};
+pub use slate::SlateState;
 
